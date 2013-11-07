@@ -2,6 +2,8 @@
  Snapshots
 ===========
 
+.. index:: Ceph Block Device; snapshots
+
 A snapshot is a read-only copy of the state of an image at a particular point in
 time. One of the advanced features of Ceph block devices is that you can create
 snapshots of the images to retain a history of an image's state. Ceph also
@@ -136,6 +138,8 @@ For example::
 	rbd --pool rbd snap purge foo
 	rbd snap purge rbd/foo
 
+
+.. index:: Ceph Block Device; snapshot layering
 
 Layering
 ========
@@ -283,13 +287,13 @@ Listing Children of a Snapshot
 
 To list the children of a snapshot, execute the following::
 
-	rbd --pool {pool-name} snap children --image {image-name} --snap {snap-name}
-	rbd snap children {pool-name}/{image-name}@{snapshot-name}
+	rbd --pool {pool-name} children --image {image-name} --snap {snap-name}
+	rbd children {pool-name}/{image-name}@{snapshot-name}
 
 For example::
 
-	rbd --pool rbd snap children --image my-image --snap my-snapshot
-	rbd snap children rbd/my-image@my-snapshot
+	rbd --pool rbd children --image my-image --snap my-snapshot
+	rbd children rbd/my-image@my-snapshot
 
 
 Flattening a Cloned Image

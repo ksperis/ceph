@@ -1,12 +1,47 @@
 from nose.tools import eq_ as eq, assert_raises
-from rados import (Rados, Object, ObjectExists, ObjectNotFound,
+from rados import (Rados, Error, Object, ObjectExists, ObjectNotFound,
                    ANONYMOUS_AUID, ADMIN_AUID)
 import threading
+import json
+import errno
+
+def test_rados_init_error():
+    assert_raises(Error, Rados, conffile='', rados_id='admin',
+                  name='client.admin')
+    assert_raises(Error, Rados, conffile='', name='invalid')
+    assert_raises(Error, Rados, conffile='', name='bad.invalid')
+
+def test_rados_init_type_error():
+    assert_raises(TypeError, Rados, rados_id=u'admin')
+    assert_raises(TypeError, Rados, rados_id=u'')
+    assert_raises(TypeError, Rados, name=u'client.admin')
+    assert_raises(TypeError, Rados, name=u'')
+    assert_raises(TypeError, Rados, conffile=u'blah')
+    assert_raises(TypeError, Rados, conffile=u'')
+    assert_raises(TypeError, Rados, clusternaem=u'blah')
+    assert_raises(TypeError, Rados, clustername=u'')
+
+def test_rados_init():
+    with Rados(conffile='', rados_id='admin'):
+        pass
+    with Rados(conffile='', name='client.admin'):
+        pass
+    with Rados(conffile='', name='client.admin'):
+        pass
+    with Rados(conffile='', name='client.admin'):
+        pass
+
+def test_ioctx_context_manager():
+    with Rados(conffile='', rados_id='admin') as conn:
+        with conn.open_ioctx('data') as ioctx:
+            pass
 
 class TestRados(object):
 
     def setUp(self):
         self.rados = Rados(conffile='')
+        self.rados.conf_parse_env('FOO_DOES_NOT_EXIST_BLAHBLAH')
+        self.rados.conf_parse_env()
         self.rados.connect()
 
     def tearDown(self):
@@ -112,6 +147,18 @@ class TestIoctx(object):
             eq(self.ioctx.get_xattr('abc', key), value)
         stored_xattrs = {}
         for key, value in self.ioctx.get_xattrs('abc'):
+            stored_xattrs[key] = value
+        eq(stored_xattrs, xattrs)
+
+    def test_obj_xattrs(self):
+        xattrs = dict(a='1', b='2', c='3', d='a\0b', e='\0')
+        self.ioctx.write('abc', '')
+        obj = list(self.ioctx.list_objects())[0]
+        for key, value in xattrs.iteritems():
+            obj.set_xattr(key, value)
+            eq(obj.get_xattr(key), value)
+        stored_xattrs = {}
+        for key, value in obj.get_xattrs():
             stored_xattrs[key] = value
         eq(stored_xattrs, xattrs)
 
@@ -271,3 +318,58 @@ class TestObject(object):
         self.object.seek(0)
         eq(self.object.read(3), 'bar')
         eq(self.object.read(3), 'baz')
+
+class TestMonCommand(object):
+
+    def setUp(self):
+        self.rados = Rados(conffile='')
+        self.rados.connect()
+
+    def tearDown(self):
+        self.rados.shutdown()
+
+    def test_monmap_dump(self):
+
+        # check for success and some plain output with epoch in it
+        cmd = {"prefix":"mon dump"}
+        ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+        eq(ret, 0)
+        assert len(buf) > 0
+        assert('epoch' in buf)
+
+        # JSON, and grab current epoch
+        cmd['format'] = 'json'
+        ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+        eq(ret, 0)
+        assert len(buf) > 0
+        d = json.loads(buf)
+        assert('epoch' in d)
+        epoch = d['epoch']
+
+        # assume epoch + 1000 does not exist; test for ENOENT
+        cmd['epoch'] = epoch + 1000
+        ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+        eq(ret, -errno.ENOENT)
+        eq(len(buf), 0)
+        del cmd['epoch']
+
+        # send to specific target by name
+        target = d['mons'][0]['name']
+        print target
+        ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30,
+                                                target=target)
+        eq(ret, 0)
+        assert len(buf) > 0
+        d = json.loads(buf)
+        assert('epoch' in d)
+
+        # and by rank
+        target = d['mons'][0]['rank']
+        print target
+        ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30,
+                                                target=target)
+        eq(ret, 0)
+        assert len(buf) > 0
+        d = json.loads(buf)
+        assert('epoch' in d)
+

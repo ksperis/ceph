@@ -280,15 +280,17 @@ static const char *get_acl_header(RGWEnv *env,
 static int parse_grantee_str(RGWRados *store, string& grantee_str,
         const struct s3_acl_header *perm, ACLGrant& grant)
 {
-  string id_type, id_val;
+  string id_type, id_val_quoted;
   int rgw_perm = perm->rgw_perm;
   int ret;
 
   RGWUserInfo info;
 
-  ret = parse_key_value(grantee_str, id_type, id_val);
+  ret = parse_key_value(grantee_str, id_type, id_val_quoted);
   if (ret < 0)
     return ret;
+
+  string id_val = rgw_trim_quotes(id_val_quoted);
 
   if (strcasecmp(id_type.c_str(), "emailAddress") == 0) {
     ret = rgw_get_user_info_by_email(store, id_val, info);
@@ -429,11 +431,9 @@ static const s3_acl_header acl_header_perms[] = {
 int RGWAccessControlPolicy_S3::create_from_headers(RGWRados *store, RGWEnv *env, ACLOwner& _owner)
 {
   std::list<ACLGrant> grants;
-  int ret;
 
   for (const struct s3_acl_header *p = acl_header_perms; p->rgw_perm; p++) {
-    ret = parse_acl_header(store, env, p, grants);
-    if (ret < 0)
+    if (parse_acl_header(store, env, p, grants) < 0)
       return false;
   }
 

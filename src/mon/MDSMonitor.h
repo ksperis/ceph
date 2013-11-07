@@ -69,13 +69,12 @@ class MDSMonitor : public PaxosService {
 
   // service methods
   void create_initial();
-  void update_from_paxos();
+  void update_from_paxos(bool *need_bootstrap);
   void create_pending(); 
   void encode_pending(MonitorDBStore::Transaction *t);
   // we don't require full versions; don't encode any.
   virtual void encode_full(MonitorDBStore::Transaction *t) { }
 
-  bool service_should_trim() { return false; }
   void encode_trim(MonitorDBStore::Transaction *t) { }
 
   void update_logger();
@@ -99,8 +98,6 @@ class MDSMonitor : public PaxosService {
 		  list<pair<health_status_t,string> > *detail) const;
   int fail_mds(std::ostream &ss, const std::string &arg);
   void fail_mds_gid(uint64_t gid);
-
-  int cluster_fail(std::ostream &ss);
 
   bool preprocess_command(MMonCommand *m);
   bool prepare_command(MMonCommand *m);

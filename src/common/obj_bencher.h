@@ -16,6 +16,7 @@
 
 #include "common/config.h"
 #include "common/Cond.h"
+#include "common/ceph_context.h"
 
 struct bench_interval_data {
   double min_bandwidth;
@@ -51,6 +52,8 @@ const int OP_RAND_READ = 3;
 
 class ObjBencher {
   bool show_time;
+public:
+  CephContext *cct;
 protected:
   Mutex lock;
 
@@ -60,7 +63,7 @@ protected:
 
   int fetch_bench_metadata(const std::string& metadata_file, int* object_size, int* num_objects, int* prevPid);
 
-  int write_bench(int secondsToRun, int concurrentios);
+  int write_bench(int secondsToRun, int maxObjects, int concurrentios);
   int seq_read_bench(int secondsToRun, int concurrentios, int num_objects, int writePid);
 
   int clean_up(int num_objects, int prevPid, int concurrentios);
@@ -89,9 +92,11 @@ protected:
   ostream& out(ostream& os);
   ostream& out(ostream& os, utime_t& t);
 public:
-  ObjBencher() : show_time(false), lock("ObjBencher::lock") {}
+  ObjBencher(CephContext *cct_) : show_time(false), cct(cct_), lock("ObjBencher::lock") {}
   virtual ~ObjBencher() {}
-  int aio_bench(int operation, int secondsToRun, int concurrentios, int op_size, bool cleanup);
+  int aio_bench(
+    int operation, int secondsToRun, int maxObjectsToCreate,
+    int concurrentios, int op_size, bool cleanup);
   int clean_up(const std::string& prefix, int concurrentios);
 
   void set_show_time(bool dt) {

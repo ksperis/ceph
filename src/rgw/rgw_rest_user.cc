@@ -17,7 +17,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "get_user_info"; }
+  virtual const string name() { return "get_user_info"; }
 };
 
 void RGWOp_User_Info::execute()
@@ -44,7 +44,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "create_user"; }
+  virtual const string name() { return "create_user"; }
 };
 
 void RGWOp_User_Create::execute()
@@ -59,6 +59,7 @@ void RGWOp_User_Create::execute()
 
   bool gen_key;
   bool suspended;
+  bool system;
 
   uint32_t max_buckets;
   int32_t key_type = KEY_TYPE_UNDEFINED;
@@ -75,6 +76,13 @@ void RGWOp_User_Create::execute()
   RESTArgs::get_bool(s, "generate-key", true, &gen_key);
   RESTArgs::get_bool(s, "suspended", false, &suspended);
   RESTArgs::get_uint32(s, "max-buckets", RGW_DEFAULT_MAX_BUCKETS, &max_buckets);
+  RESTArgs::get_bool(s, "system", false, &system);
+
+  if (!s->user.system && system) {
+    ldout(s->cct, 0) << "cannot set system flag by non-system user" << dendl;
+    http_ret = -EINVAL;
+    return;
+  }
 
   // FIXME: don't do double argument checking
   if (!uid.empty())
@@ -107,8 +115,11 @@ void RGWOp_User_Create::execute()
   if (max_buckets != RGW_DEFAULT_MAX_BUCKETS)
     op_state.set_max_buckets(max_buckets);
 
-  if (s->args.exists("suspended"))
+  if (s->info.args.exists("suspended"))
     op_state.set_suspension(suspended);
+
+  if (s->info.args.exists("system"))
+    op_state.set_system(system);
 
   if (gen_key)
     op_state.set_generate_key();
@@ -127,7 +138,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "modify_user"; }
+  virtual const string name() { return "modify_user"; }
 };
 
 void RGWOp_User_Modify::execute()
@@ -142,6 +153,7 @@ void RGWOp_User_Modify::execute()
 
   bool gen_key;
   bool suspended;
+  bool system;
 
   uint32_t max_buckets;
   int32_t key_type = KEY_TYPE_UNDEFINED;
@@ -158,6 +170,14 @@ void RGWOp_User_Modify::execute()
   RESTArgs::get_bool(s, "suspended", false, &suspended);
   RESTArgs::get_uint32(s, "max-buckets", RGW_DEFAULT_MAX_BUCKETS, &max_buckets);
   RESTArgs::get_string(s, "key-type", key_type_str, &key_type_str);
+
+  RESTArgs::get_bool(s, "system", false, &system);
+
+  if (!s->user.system && system) {
+    ldout(s->cct, 0) << "cannot set system flag by non-system user" << dendl;
+    http_ret = -EINVAL;
+    return;
+  }
 
   if (!uid.empty())
     op_state.set_user_id(uid);
@@ -192,8 +212,11 @@ void RGWOp_User_Modify::execute()
     op_state.set_key_type(key_type);
   }
 
-  if (s->args.exists("suspended"))
+  if (s->info.args.exists("suspended"))
     op_state.set_suspension(suspended);
+
+  if (s->info.args.exists("system"))
+    op_state.set_system(system);
 
   http_ret = RGWUserAdminOp_User::modify(store, op_state, flusher);
 }
@@ -209,7 +232,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_user"; }
+  virtual const string name() { return "remove_user"; }
 };
 
 void RGWOp_User_Remove::execute()
@@ -242,7 +265,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "create_subuser"; }
+  virtual const string name() { return "create_subuser"; }
 };
 
 void RGWOp_Subuser_Create::execute()
@@ -311,7 +334,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "modify_subuser"; }
+  virtual const string name() { return "modify_subuser"; }
 };
 
 void RGWOp_Subuser_Modify::execute()
@@ -376,7 +399,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_subuser"; }
+  virtual const string name() { return "remove_subuser"; }
 };
 
 void RGWOp_Subuser_Remove::execute()
@@ -415,7 +438,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "create_access_key"; }
+  virtual const string name() { return "create_access_key"; }
 };
 
 void RGWOp_Key_Create::execute()
@@ -477,7 +500,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_access_key"; }
+  virtual const string name() { return "remove_access_key"; }
 };
 
 void RGWOp_Key_Remove::execute()
@@ -529,7 +552,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "add_user_caps"; }
+  virtual const string name() { return "add_user_caps"; }
 };
 
 void RGWOp_Caps_Add::execute()
@@ -563,7 +586,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_user_caps"; }
+  virtual const string name() { return "remove_user_caps"; }
 };
 
 void RGWOp_Caps_Remove::execute()
@@ -593,13 +616,13 @@ RGWOp *RGWHandler_User::op_get()
 
 RGWOp *RGWHandler_User::op_put()
 {
-  if (s->args.sub_resource_exists("subuser"))
+  if (s->info.args.sub_resource_exists("subuser"))
     return new RGWOp_Subuser_Create;
 
-  if (s->args.sub_resource_exists("key"))
+  if (s->info.args.sub_resource_exists("key"))
     return new RGWOp_Key_Create;
 
-  if (s->args.sub_resource_exists("caps"))
+  if (s->info.args.sub_resource_exists("caps"))
     return new RGWOp_Caps_Add;
 
   return new RGWOp_User_Create;
@@ -607,7 +630,7 @@ RGWOp *RGWHandler_User::op_put()
 
 RGWOp *RGWHandler_User::op_post()
 {
-  if (s->args.sub_resource_exists("subuser"))
+  if (s->info.args.sub_resource_exists("subuser"))
     return new RGWOp_Subuser_Modify;
 
   return new RGWOp_User_Modify;
@@ -615,13 +638,13 @@ RGWOp *RGWHandler_User::op_post()
 
 RGWOp *RGWHandler_User::op_delete()
 {
-  if (s->args.sub_resource_exists("subuser"))
+  if (s->info.args.sub_resource_exists("subuser"))
     return new RGWOp_Subuser_Remove;
 
-  if (s->args.sub_resource_exists("key"))
+  if (s->info.args.sub_resource_exists("key"))
     return new RGWOp_Key_Remove;
 
-  if (s->args.sub_resource_exists("caps"))
+  if (s->info.args.sub_resource_exists("caps"))
     return new RGWOp_Caps_Remove;
 
   return new RGWOp_User_Remove;

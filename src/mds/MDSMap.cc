@@ -100,7 +100,7 @@ void MDSMap::dump(Formatter *f) const
   f->open_object_section("up");
   for (map<int32_t,uint64_t>::const_iterator p = up.begin(); p != up.end(); ++p) {
     char s[10];
-    sprintf(s, "%d", p->first);
+    sprintf(s, "mds_%d", p->first);
     f->dump_int(s, p->second);
   }
   f->close_section();
@@ -115,7 +115,7 @@ void MDSMap::dump(Formatter *f) const
   f->open_object_section("info");
   for (map<uint64_t,mds_info_t>::const_iterator p = mds_info.begin(); p != mds_info.end(); ++p) {
     char s[10];
-    sprintf(s, "%llu", (long long unsigned)p->first);
+    sprintf(s, "gid_%llu", (long long unsigned)p->first);
     f->open_object_section(s);
     p->second.dump(f);
     f->close_section();
@@ -202,11 +202,22 @@ void MDSMap::print(ostream& out)
 
 
 
-void MDSMap::print_summary(ostream& out) 
+void MDSMap::print_summary(Formatter *f, ostream *out)
 {
   map<int,string> by_rank;
   map<string,int> by_state;
 
+  if (f) {
+    f->dump_unsigned("epoch", get_epoch());
+    f->dump_unsigned("up", up.size());
+    f->dump_unsigned("in", in.size());
+    f->dump_unsigned("max", max_mds);
+  } else {
+    *out << "e" << get_epoch() << ": " << up.size() << "/" << in.size() << "/" << max_mds << " up";
+  }
+
+  if (f)
+    f->open_array_section("by_rank");
   for (map<uint64_t,mds_info_t>::iterator p = mds_info.begin();
        p != mds_info.end();
        ++p) {
@@ -214,22 +225,42 @@ void MDSMap::print_summary(ostream& out)
     if (p->second.laggy())
       s += "(laggy or crashed)";
 
-    if (p->second.rank >= 0)
-      by_rank[p->second.rank] = p->second.name + "=" + s;
-    else
+    if (p->second.rank >= 0) {
+      if (f) {
+	f->open_object_section("mds");
+	f->dump_unsigned("rank", p->second.rank);
+	f->dump_string("name", p->second.name);
+	f->dump_string("status", s);
+	f->close_section();
+      } else {
+	by_rank[p->second.rank] = p->second.name + "=" + s;
+      }
+    } else {
       by_state[s]++;
+    }
+  }
+  if (f) {
+    f->close_section();
+  } else {
+    if (!by_rank.empty())
+      *out << " " << by_rank;
   }
 
-  out << "e" << get_epoch() << ": " << up.size() << "/" << in.size() << "/" << max_mds << " up";
+  for (map<string,int>::reverse_iterator p = by_state.rbegin(); p != by_state.rend(); ++p) {
+    if (f) {
+      f->dump_unsigned(p->first.c_str(), p->second);
+    } else {
+      *out << ", " << p->second << " " << p->first;
+    }
+  }
 
-  if (!by_rank.empty())
-    out << " " << by_rank;
-
-  for (map<string,int>::reverse_iterator p = by_state.rbegin(); p != by_state.rend(); ++p)
-    out << ", " << p->second << " " << p->first;
-  
-  if (!failed.empty())
-    out << ", " << failed.size() << " failed";
+  if (!failed.empty()) {
+    if (f) {
+      f->dump_unsigned("failed", failed.size());
+    } else {
+      *out << ", " << failed.size() << " failed";
+    }
+  }
   //if (stopped.size())
   //out << ", " << stopped.size() << " stopped";
 }

@@ -17,7 +17,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "get_bucket_info"; }
+  virtual const string name() { return "get_bucket_info"; }
 };
 
 void RGWOp_Bucket_Info::execute()
@@ -52,7 +52,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "get_policy"; }
+  virtual const string name() { return "get_policy"; }
 };
 
 void RGWOp_Get_Policy::execute()
@@ -82,7 +82,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "check_bucket_index"; }
+  virtual const string name() { return "check_bucket_index"; }
 };
 
 void RGWOp_Check_Bucket_Index::execute()
@@ -116,7 +116,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "link_bucket"; }
+  virtual const string name() { return "link_bucket"; }
 };
 
 void RGWOp_Bucket_Link::execute()
@@ -146,7 +146,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "unlink_bucket"; }
+  virtual const string name() { return "unlink_bucket"; }
 };
 
 void RGWOp_Bucket_Unlink::execute()
@@ -176,7 +176,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_bucket"; }
+  virtual const string name() { return "remove_bucket"; }
 };
 
 void RGWOp_Bucket_Remove::execute()
@@ -206,7 +206,7 @@ public:
 
   void execute();
 
-  virtual const char *name() { return "remove_object"; }
+  virtual const string name() { return "remove_object"; }
 };
 
 void RGWOp_Object_Remove::execute()
@@ -228,10 +228,10 @@ void RGWOp_Object_Remove::execute()
 RGWOp *RGWHandler_Bucket::op_get()
 {
 
-  if (s->args.sub_resource_exists("policy"))
+  if (s->info.args.sub_resource_exists("policy"))
     return new RGWOp_Get_Policy;
 
-  if (s->args.sub_resource_exists("index"))
+  if (s->info.args.sub_resource_exists("index"))
     return new RGWOp_Check_Bucket_Index;
 
   return new RGWOp_Bucket_Info;
@@ -249,7 +249,7 @@ RGWOp *RGWHandler_Bucket::op_post()
 
 RGWOp *RGWHandler_Bucket::op_delete()
 {
-  if (s->args.sub_resource_exists("object"))
+  if (s->info.args.sub_resource_exists("object"))
     return new RGWOp_Object_Remove;
 
   return new RGWOp_Bucket_Remove;

@@ -29,14 +29,14 @@ TYPEWITHSTRAYDATA(OSDMap::Incremental)
 #include "crush/CrushWrapper.h"
 TYPE(CrushWrapper)
 
-#include "osd/PG.h"
-TYPE(PG::OndiskLog)
-
 #include "osd/osd_types.h"
 TYPE(osd_reqid_t)
 TYPE(object_locator_t)
+TYPE(request_redirect_t)
 TYPE(pg_t)
 TYPE(coll_t)
+TYPE(pow2_hist_t)
+TYPE(filestore_perf_stat_t)
 TYPE(osd_stat_t)
 TYPE(OSDSuperblock)
 TYPE_FEATUREFUL(pool_snap_info_t)
@@ -48,12 +48,13 @@ TYPE_FEATUREFUL(pool_stat_t)
 TYPE(pg_history_t)
 TYPE(pg_info_t)
 TYPE(pg_interval_t)
-//TYPE(pg_query_t)
+TYPE_FEATUREFUL(pg_query_t)
 TYPE(pg_log_entry_t)
 TYPE(pg_log_t)
 TYPE(pg_missing_t::item)
 TYPE(pg_missing_t)
 TYPE(pg_ls_response_t)
+TYPE(object_copy_cursor_t)
 TYPE(pg_create_t)
 TYPE(watch_info_t)
 TYPE(object_info_t)
@@ -65,6 +66,9 @@ TYPE(ScrubMap)
 TYPE(osd_peer_stat_t)
 TYPE(clone_info)
 TYPE(obj_list_snap_response_t)
+TYPE(PullOp)
+TYPE(PushOp)
+TYPE(PushReplyOp)
 
 #include "os/ObjectStore.h"
 TYPE(ObjectStore::Transaction)
@@ -72,7 +76,7 @@ TYPE(ObjectStore::Transaction)
 #include "os/SequencerPosition.h"
 TYPE(SequencerPosition)
 
-#include "os/hobject.h"
+#include "common/hobject.h"
 TYPE(hobject_t)
 
 #include "mon/AuthMonitor.h"
@@ -82,12 +86,15 @@ TYPE(AuthMonitor::Incremental)
 TYPE(PGMap::Incremental)
 TYPE(PGMap)
 
+#include "mon/MonitorDBStore.h"
+TYPE(MonitorDBStore::Transaction)
+TYPE(MonitorDBStore::Op)
+
 #include "mon/MonMap.h"
 TYPE_FEATUREFUL(MonMap)
 
-#include "mon/MonCaps.h"
+#include "mon/MonCap.h"
 TYPE(MonCap)
-TYPE(MonCaps)
 
 #include "os/DBObjectMap.h"
 TYPE(DBObjectMap::_Header)
@@ -118,6 +125,7 @@ TYPE(dirfrag_load_vec_t)
 TYPE(mds_load_t)
 TYPE(cap_reconnect_t)
 TYPE(inode_backtrace_t)
+TYPE(inode_backpointer_t)
 
 #include "mds/MDSMap.h"
 TYPE_FEATUREFUL(MDSMap)
@@ -197,12 +205,28 @@ TYPE(rgw_bucket_dir_entry)
 TYPE(rgw_bucket_category_stats)
 TYPE(rgw_bucket_dir_header)
 TYPE(rgw_bucket_dir)
+TYPE(rgw_bucket_entry_ver)
 
 #include "cls/rgw/cls_rgw_ops.h"
 TYPE(rgw_cls_obj_prepare_op)
 TYPE(rgw_cls_obj_complete_op)
 TYPE(rgw_cls_list_op)
 TYPE(rgw_cls_list_ret)
+TYPE(cls_rgw_gc_defer_entry_op)
+TYPE(cls_rgw_gc_list_op)
+TYPE(cls_rgw_gc_list_ret)
+TYPE(cls_rgw_gc_obj_info)
+TYPE(cls_rgw_gc_remove_op)
+TYPE(cls_rgw_gc_set_entry_op)
+TYPE(cls_rgw_obj)
+TYPE(cls_rgw_obj_chain)
+TYPE(rgw_cls_tag_timeout_op)
+TYPE(cls_rgw_bi_log_list_op)
+TYPE(cls_rgw_bi_log_trim_op)
+TYPE(cls_rgw_bi_log_list_ret)
+
+#include "cls/rgw/cls_rgw_client.h"
+TYPE(rgw_bi_log_entry)
 
 #include "rgw/rgw_common.h"
 TYPE(RGWAccessKey);
@@ -235,6 +259,23 @@ TYPE(cls_lock_break_op)
 TYPE(cls_lock_get_info_op)
 TYPE(cls_lock_get_info_reply)
 TYPE(cls_lock_list_locks_reply)
+
+#include "cls/replica_log/cls_replica_log_types.h"
+TYPE(cls_replica_log_item_marker)
+TYPE(cls_replica_log_progress_marker)
+TYPE(cls_replica_log_bound)
+#include "cls/replica_log/cls_replica_log_ops.h"
+TYPE(cls_replica_log_delete_marker_op)
+TYPE(cls_replica_log_set_marker_op)
+TYPE(cls_replica_log_get_bounds_op)
+TYPE(cls_replica_log_get_bounds_ret)
+
+#include "cls/refcount/cls_refcount_ops.h"
+TYPE(cls_refcount_get_op)
+TYPE(cls_refcount_put_op)
+TYPE(cls_refcount_read_op)
+TYPE(cls_refcount_read_ret)
+TYPE(cls_refcount_set_op)
 
 
 // --- messages ---
@@ -360,6 +401,10 @@ MESSAGE(MMonMap)
 MESSAGE(MMonPaxos)
 #include "messages/MMonProbe.h"
 MESSAGE(MMonProbe)
+#include "messages/MMonScrub.h"
+MESSAGE(MMonScrub)
+#include "messages/MMonSync.h"
+MESSAGE(MMonSync)
 #include "messages/MMonSubscribe.h"
 MESSAGE(MMonSubscribe)
 #include "messages/MMonSubscribeAck.h"

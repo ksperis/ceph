@@ -19,6 +19,12 @@
 
 #include "os/LevelDBStore.h"
 
+#include "common/ceph_argparse.h"
+#include "global/global_init.h"
+#include "common/errno.h"
+#include "common/safe_io.h"
+#include "common/config.h"
+
 using namespace std;
 
 class StoreTool
@@ -27,7 +33,7 @@ class StoreTool
 
   public:
   StoreTool(const string &path) {
-    LevelDBStore *db_ptr = new LevelDBStore(path);
+    LevelDBStore *db_ptr = new LevelDBStore(g_ceph_context, path);
     assert(!db_ptr->open(std::cerr));
     db.reset(db_ptr);
   }
@@ -84,6 +90,17 @@ class StoreTool
     exists = false;
     return bufferlist();
   }
+
+  uint64_t get_size() {
+    map<string,uint64_t> extras;
+    uint64_t s = db->get_estimated_size(extras);
+    for (map<string,uint64_t>::iterator p = extras.begin();
+         p != extras.end(); ++p) {
+      std::cout << p->first << " - " << p->second << std::endl;
+    }
+    std::cout << "total: " << s << std::endl;
+    return s;
+  }
 };
 
 void usage(const char *pname)
@@ -95,18 +112,31 @@ void usage(const char *pname)
     << "  exists <prefix> [key]\n"
     << "  get <prefix> <key>\n"
     << "  verify <store path>\n"
+    << "  get-size\n"
     << std::endl;
 }
 
-int main(int argc, char *argv[])
+int main(int argc, const char *argv[])
 {
-  if (argc < 3) {
+  vector<const char*> args;
+  argv_to_vec(argc, argv, args);
+  env_to_vec(args);
+
+  global_init(
+      NULL, args,
+      CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  common_init_finish(g_ceph_context);
+
+
+  if (args.size() < 2) {
     usage(argv[0]);
     return 1;
   }
 
-  string path(argv[1]);
-  string cmd(argv[2]);
+  string path(args[0]);
+  string cmd(args[1]);
+
+  std::cout << "path: " << path << " cmd " << cmd << std::endl;
 
   StoreTool st(path);
 
@@ -155,6 +185,8 @@ int main(int argc, char *argv[])
 
   } else if (cmd == "verify") {
     assert(0);
+  } else if (cmd == "get-size") {
+    std::cout << "estimated store size: " << st.get_size() << std::endl;
   } else {
     std::cerr << "Unrecognized command: " << cmd << std::endl;
     return 1;

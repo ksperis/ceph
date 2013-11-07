@@ -15,7 +15,7 @@ public:
 
   int verify_permission() { return 0; }
   void execute();
-  virtual const char *name() { return "swift_auth_get"; }
+  virtual const string name() { return "swift_auth_get"; }
 };
 
 class RGWHandler_SWIFT_Auth : public RGWHandler {
@@ -37,7 +37,7 @@ public:
   RGWRESTMgr_SWIFT_Auth() {}
   virtual ~RGWRESTMgr_SWIFT_Auth() {}
 
-  virtual RGWRESTMgr *get_resource_mgr(struct req_state *s, const string& uri) {
+  virtual RGWRESTMgr *get_resource_mgr(struct req_state *s, const string& uri, string *out_uri) {
     return this;
   }
   virtual RGWHandler *get_handler(struct req_state *s) {

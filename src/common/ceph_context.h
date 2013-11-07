@@ -20,12 +20,13 @@
 
 #include "include/buffer.h"
 #include "include/atomic.h"
+#include "common/cmdparse.h"
 
 class AdminSocket;
 class CephContextServiceThread;
 class PerfCountersCollection;
 class md_config_obs_t;
-class md_config_t;
+struct md_config_t;
 class CephContextHook;
 class CryptoNone;
 class CryptoAES;
@@ -97,7 +98,8 @@ public:
   /**
    * process an admin socket command
    */
-  void do_command(std::string command, std::string args, bufferlist *out);
+  void do_command(std::string command, cmdmap_t& cmdmap, std::string format,
+		  bufferlist *out);
 
   /**
    * get a crypto handler

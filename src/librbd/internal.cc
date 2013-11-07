@@ -1,13 +1,15 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
+#include "include/int_types.h"
+
 #include <errno.h>
 #include <limits.h>
 
 #include "common/ceph_context.h"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "common/Throttle.h"
 #include "cls/lock/cls_lock_client.h"
-#include "include/inttypes.h"
 #include "include/stringify.h"
 
 #include "cls/rbd/cls_rbd.h"
@@ -151,22 +153,29 @@ namespace librbd {
     uint64_t period = ictx->get_stripe_period();
     uint64_t num_period = ((newsize + period - 1) / period);
     uint64_t delete_off = MIN(num_period * period, size);
-    uint64_t delete_start = num_period * ictx->get_stripe_count();     // first object we can delete free and clear
+    // first object we can delete free and clear
+    uint64_t delete_start = num_period * ictx->get_stripe_count();
     uint64_t num_objects = ictx->get_num_objects();
     uint64_t object_size = ictx->get_object_size();
 
     ldout(cct, 10) << "trim_image " << size << " -> " << newsize
 		   << " periods " << num_period
 		   << " discard to offset " << delete_off
-		   << " delete objects " << delete_start << " to " << (num_objects-1)
+		   << " delete objects " << delete_start
+		   << " to " << (num_objects-1)
 		   << dendl;
 
+    SimpleThrottle throttle(cct->_conf->rbd_concurrent_management_ops, true);
     if (delete_start < num_objects) {
       ldout(cct, 2) << "trim_image objects " << delete_start << " to "
 		    << (num_objects - 1) << dendl;
       for (uint64_t i = delete_start; i < num_objects; ++i) {
 	string oid = ictx->get_object_name(i);
-	ictx->data_ctx.remove(oid);
+	Context *req_comp = new C_SimpleThrottle(&throttle);
+	librados::AioCompletion *rados_completion =
+	  librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
+	ictx->data_ctx.aio_remove(oid, rados_completion);
+	rados_completion->release();
 	prog_ctx.update_progress((i - delete_start) * object_size,
 				 (num_objects - delete_start) * object_size);
       }
@@ -175,18 +184,29 @@ namespace librbd {
     // discard the weird boundary, if any
     if (delete_off > newsize) {
       vector<ObjectExtent> extents;
-      Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout, newsize, delete_off - newsize, extents);
+      Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout,
+			       newsize, delete_off - newsize, 0, extents);
 
-      for (vector<ObjectExtent>::iterator p = extents.begin(); p != extents.end(); ++p) {
+      for (vector<ObjectExtent>::iterator p = extents.begin();
+	   p != extents.end(); ++p) {
 	ldout(ictx->cct, 20) << " ex " << *p << dendl;
+	Context *req_comp = new C_SimpleThrottle(&throttle);
+	librados::AioCompletion *rados_completion =
+	  librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
 	if (p->offset == 0) {
-	  ictx->data_ctx.remove(p->oid.name);
+	  ictx->data_ctx.aio_remove(p->oid.name, rados_completion);
 	} else {
 	  librados::ObjectWriteOperation op;
 	  op.truncate(p->offset);
-	  ictx->data_ctx.operate(p->oid.name, &op);
+	  ictx->data_ctx.aio_operate(p->oid.name, rados_completion, &op);
 	}
+	rados_completion->release();
       }
+    }
+    int r = throttle.wait_for_ret();
+    if (r < 0) {
+      lderr(cct) << "warning: failed to remove some object(s): "
+		 << cpp_strerror(r) << dendl;
     }
   }
 
@@ -207,12 +227,6 @@ namespace librbd {
 
     memcpy(info, bl.c_str(), r);
     return 0;
-  }
-
-  uint64_t rbd_assign_bid(IoCtx& io_ctx)
-  {
-    Rados rados(io_ctx);
-    return rados.get_instance_id();
   }
 
   int read_header_bl(IoCtx& io_ctx, const string& header_oid,
@@ -312,16 +326,29 @@ namespace librbd {
   {
     uint64_t numseg = ictx->get_num_objects();
     uint64_t bsize = ictx->get_object_size();
+    int r;
+    CephContext *cct = ictx->cct;
+    SimpleThrottle throttle(cct->_conf->rbd_concurrent_management_ops, true);
 
     for (uint64_t i = 0; i < numseg; i++) {
-      int r;
       string oid = ictx->get_object_name(i);
-      r = ictx->data_ctx.selfmanaged_snap_rollback(oid, snap_id);
-      ldout(ictx->cct, 10) << "selfmanaged_snap_rollback on " << oid << " to "
-			   << snap_id << " returned " << r << dendl;
+      Context *req_comp = new C_SimpleThrottle(&throttle);
+      librados::AioCompletion *rados_completion =
+	librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
+      librados::ObjectWriteOperation op;
+      op.selfmanaged_snap_rollback(snap_id);
+      ictx->data_ctx.aio_operate(oid, rados_completion, &op);
+      ldout(cct, 10) << "scheduling selfmanaged_snap_rollback on "
+		     << oid << " to " << snap_id << dendl;
+      rados_completion->release();
       prog_ctx.update_progress(i * bsize, numseg * bsize);
-      if (r < 0 && r != -ENOENT)
-	return r;
+    }
+
+    r = throttle.wait_for_ret();
+    if (r < 0) {
+      ldout(cct, 10) << "failed to rollback at least one object: "
+		     << cpp_strerror(r) << dendl;
+      return r;
     }
     return 0;
   }
@@ -840,7 +867,8 @@ reprotect_and_return_err:
       return -EDOM;
     }
 
-    uint64_t bid = rbd_assign_bid(io_ctx);
+    Rados rados(io_ctx);
+    uint64_t bid = rados.get_instance_id();
 
     // if striping is enabled, use possibly custom defaults
     if (!old_format && (features & RBD_FEATURE_STRIPINGV2) &&
@@ -1871,10 +1899,54 @@ reprotect_and_return_err:
     return r;
   }
 
+  class C_CopyWrite : public Context {
+  public:
+    C_CopyWrite(SimpleThrottle *throttle, bufferlist *bl)
+      : m_throttle(throttle), m_bl(bl) {}
+    virtual void finish(int r) {
+      delete m_bl;
+      m_throttle->end_op(r);
+    }
+  private:
+    SimpleThrottle *m_throttle;
+    bufferlist *m_bl;
+  };
+
+  class C_CopyRead : public Context {
+  public:
+    C_CopyRead(SimpleThrottle *throttle, ImageCtx *dest, uint64_t offset,
+	       bufferlist *bl)
+      : m_throttle(throttle), m_dest(dest), m_offset(offset), m_bl(bl) {
+      m_throttle->start_op();
+    }
+    virtual void finish(int r) {
+      if (r < 0) {
+	lderr(m_dest->cct) << "error reading from source image at offset "
+			   << m_offset << ": " << cpp_strerror(r) << dendl;
+	delete m_bl;
+	m_throttle->end_op(r);
+	return;
+      }
+      assert(m_bl->length() == (size_t)r);
+      Context *ctx = new C_CopyWrite(m_throttle, m_bl);
+      AioCompletion *comp = aio_create_completion_internal(ctx, rbd_ctx_cb);
+      r = aio_write(m_dest, m_offset, m_bl->length(), m_bl->c_str(), comp);
+      if (r < 0) {
+	ctx->complete(r);
+	comp->release();
+	lderr(m_dest->cct) << "error writing to destination image at offset "
+			   << m_offset << ": " << cpp_strerror(r) << dendl;
+      }
+    }
+  private:
+    SimpleThrottle *m_throttle;
+    ImageCtx *m_dest;
+    uint64_t m_offset;
+    bufferlist *m_bl;
+  };
+
   int copy(ImageCtx *src, ImageCtx *dest, ProgressContext &prog_ctx)
   {
-    CopyProgressCtx cp(prog_ctx);
-
     src->md_lock.get_read();
     src->snap_lock.get_read();
     uint64_t src_size = src->get_image_size(src->snap_id);
@@ -1887,22 +1959,37 @@ reprotect_and_return_err:
     dest->snap_lock.put_read();
     dest->md_lock.put_read();
 
+    CephContext *cct = src->cct;
     if (dest_size < src_size) {
-      lderr(src->cct) << " src size " << src_size << " != dest size " << dest_size << dendl;
+      lderr(cct) << " src size " << src_size << " >= dest size "
+		 << dest_size << dendl;
       return -EINVAL;
     }
-
-    cp.destictx = dest;
-    cp.src_size = src_size;
-
-    int64_t r = read_iterate(src, 0, src_size, do_copy_extent, &cp);
-
-    if (r >= 0) {
-      // don't return total bytes read, which may not fit in an int
-      r = 0;
-      prog_ctx.update_progress(cp.src_size, cp.src_size);
+    int r;
+    SimpleThrottle throttle(cct->_conf->rbd_concurrent_management_ops, false);
+    uint64_t period = src->get_stripe_period();
+    for (uint64_t offset = 0; offset < src_size; offset += period) {
+      uint64_t len = min(period, src_size - offset);
+      bufferlist *bl = new bufferlist();
+      Context *ctx = new C_CopyRead(&throttle, dest, offset, bl);
+      AioCompletion *comp = aio_create_completion_internal(ctx, rbd_ctx_cb);
+      r = aio_read(src, offset, len, NULL, bl, comp);
+      if (r < 0) {
+	ctx->complete(r);
+	comp->release();
+	throttle.wait_for_ret();
+	lderr(cct) << "could not read from source image from "
+		   << offset << " to " << offset + len << ": "
+		   << cpp_strerror(r) << dendl;
+	return r;
+      }
+      prog_ctx.update_progress(offset, src_size);
     }
-    return (int)r;
+
+    r = throttle.wait_for_ret();
+    if (r >= 0)
+      prog_ctx.update_progress(src_size, src_size);
+    return r;
   }
 
   // common snap_set functionality for snap_set and open_image
@@ -1999,7 +2086,8 @@ reprotect_and_return_err:
   // 'flatten' child image by copying all parent's blocks
   int flatten(ImageCtx *ictx, ProgressContext &prog_ctx)
   {
-    ldout(ictx->cct, 20) << "flatten" << dendl;
+    CephContext *cct = ictx->cct;
+    ldout(cct, 20) << "flatten" << dendl;
 
     if (ictx->read_only)
       return -EROFS;
@@ -2007,7 +2095,7 @@ reprotect_and_return_err:
     int r;
     // ictx_check also updates parent data
     if ((r = ictx_check(ictx)) < 0) {
-      lderr(ictx->cct) << "ictx_check failed" << dendl;
+      lderr(cct) << "ictx_check failed" << dendl;
       return r;
     }
 
@@ -2016,6 +2104,7 @@ reprotect_and_return_err:
     uint64_t overlap;
     uint64_t overlap_periods;
     uint64_t overlap_objects;
+    ::SnapContext snapc;
 
     {
       RWLock::RLocker l(ictx->md_lock);
@@ -2024,14 +2113,15 @@ reprotect_and_return_err:
 
       // can't flatten a non-clone
       if (ictx->parent_md.spec.pool_id == -1) {
-	lderr(ictx->cct) << "image has no parent" << dendl;
+	lderr(cct) << "image has no parent" << dendl;
 	return -EINVAL;
       }
       if (ictx->snap_id != CEPH_NOSNAP || ictx->read_only) {
-	lderr(ictx->cct) << "snapshots cannot be flattened" << dendl;
+	lderr(cct) << "snapshots cannot be flattened" << dendl;
 	return -EROFS;
       }
 
+      snapc = ictx->snapc;
       assert(ictx->parent != NULL);
       assert(ictx->parent_md.overlap <= ictx->size);
 
@@ -2042,48 +2132,52 @@ reprotect_and_return_err:
       overlap_objects = overlap_periods * ictx->get_stripe_count();
     }
 
-    char *buf = new char[object_size];
+    SimpleThrottle throttle(cct->_conf->rbd_concurrent_management_ops, false);
 
     for (uint64_t ono = 0; ono < overlap_objects; ono++) {
-      prog_ctx.update_progress(ono, overlap_objects);
+      {
+	RWLock::RLocker l(ictx->parent_lock);
+	// stop early if the parent went away - it just means
+	// another flatten finished first, so this one is useless.
+	if (!ictx->parent) {
+	  r = 0;
+	  goto err;
+	}
+      }
 
       // map child object onto the parent
       vector<pair<uint64_t,uint64_t> > objectx;
-      Striper::extent_to_file(ictx->cct, &ictx->layout,
+      Striper::extent_to_file(cct, &ictx->layout,
 			    ono, 0, object_size,
 			    objectx);
       uint64_t object_overlap = ictx->prune_parent_extents(objectx, overlap);
       assert(object_overlap <= object_size);
 
-      RWLock::RLocker l(ictx->parent_lock);
-      // stop early if the parent went away - it just means
-      // another flatten finished first, so this one is useless.
-      if (!ictx->parent) {
-	r = 0;
-	goto err;
-      }
-      if ((r = read(ictx->parent, objectx, buf, NULL)) < 0) {
-	lderr(ictx->cct) << "reading from parent failed" << dendl;
+      bufferlist bl;
+      string oid = ictx->get_object_name(ono);
+      Context *comp = new C_SimpleThrottle(&throttle);
+      AioWrite *req = new AioWrite(ictx, oid, ono, 0, objectx, object_overlap,
+				   bl, snapc, CEPH_NOSNAP, comp);
+      r = req->send();
+      if (r < 0) {
+	lderr(cct) << "failed to flatten object " << oid << dendl;
 	goto err;
       }
 
-      // for actual amount read, if data is all zero, don't bother with block
-      if (!buf_is_zero(buf, r)) {
-	bufferlist bl;
-	string oid = ictx->get_object_name(ono);
-	bl.append(buf, r);
-	r = cls_client::copyup(&ictx->data_ctx, oid, bl);
-	if (r < 0) {
-	  lderr(ictx->cct) << "failed to copy block to child" << dendl;
-	  goto err;
-	}
-      }
+      prog_ctx.update_progress(ono, overlap_objects);
+    }
+
+    r = throttle.wait_for_ret();
+    if (r < 0) {
+      lderr(cct) << "failed to flatten at least one object: "
+		 << cpp_strerror(r) << dendl;
+      goto err;
     }
 
     // remove parent from this (base) image
     r = cls_client::remove_parent(&ictx->md_ctx, ictx->header_oid);
     if (r < 0) {
-      lderr(ictx->cct) << "error removing parent" << dendl;
+      lderr(cct) << "error removing parent" << dendl;
       return r;
     }
 
@@ -2092,11 +2186,11 @@ reprotect_and_return_err:
     // will be removed when the last snap goes away)
     ictx->snap_lock.get_read();
     if (ictx->snaps.empty()) {
-      ldout(ictx->cct, 2) << "removing child from children list..." << dendl;
+      ldout(cct, 2) << "removing child from children list..." << dendl;
       int r = cls_client::remove_child(&ictx->md_ctx, RBD_CHILDREN,
 				       ictx->parent_md.spec, ictx->id);
       if (r < 0) {
-	lderr(ictx->cct) << "error removing child from children list" << dendl;
+	lderr(cct) << "error removing child from children list" << dendl;
 	ictx->snap_lock.put_read();
 	return r;
       }
@@ -2104,10 +2198,12 @@ reprotect_and_return_err:
     ictx->snap_lock.put_read();
     notify_change(ictx->md_ctx, ictx->header_oid, NULL, ictx);
 
-    ldout(ictx->cct, 20) << "finished flattening" << dendl;
+    ldout(cct, 20) << "finished flattening" << dendl;
+
+    return 0;
 
   err:
-    delete[] buf;
+    throttle.wait_for_ret();
     return r;
   }
 
@@ -2218,6 +2314,7 @@ reprotect_and_return_err:
     Context *ctx = reinterpret_cast<Context *>(arg);
     AioCompletion *comp = reinterpret_cast<AioCompletion *>(cb);
     ctx->complete(comp->get_return_value());
+    comp->release();
   }
 
   int64_t read_iterate(ImageCtx *ictx, uint64_t off, uint64_t len,
@@ -2268,7 +2365,6 @@ reprotect_and_return_err:
 	cond.Wait(mylock);
       mylock.Unlock();
 
-      c->release();
       if (ret < 0)
 	return ret;
 
@@ -2382,7 +2478,7 @@ reprotect_and_return_err:
       // map to extents
       map<object_t,vector<ObjectExtent> > object_extents;
       Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout,
-			       off, read_len, object_extents, 0);
+			       off, read_len, 0, object_extents, 0);
 
       // get snap info for each object
       for (map<object_t,vector<ObjectExtent> >::iterator p = object_extents.begin();
@@ -2504,7 +2600,6 @@ reprotect_and_return_err:
       cond.Wait(mylock);
     mylock.Unlock();
 
-    c->release();
     return ret;
   }
 
@@ -2539,7 +2634,6 @@ reprotect_and_return_err:
       cond.Wait(mylock);
     mylock.Unlock();
 
-    c->release();
     if (ret < 0)
       return ret;
 
@@ -2576,7 +2670,6 @@ reprotect_and_return_err:
       cond.Wait(mylock);
     mylock.Unlock();
 
-    c->release();
     if (ret < 0)
       return ret;
 
@@ -2753,7 +2846,7 @@ reprotect_and_return_err:
   {
     CephContext *cct = ictx->cct;
     ldout(cct, 20) << "aio_write " << ictx << " off = " << off << " len = "
-		   << len << " buf = " << &buf << dendl;
+		   << len << " buf = " << (void*)buf << dendl;
 
     if (!len)
       return 0;
@@ -2783,7 +2876,7 @@ reprotect_and_return_err:
 
     // map
     vector<ObjectExtent> extents;
-    Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout, off, mylen, extents);
+    Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout, off, mylen, 0, extents);
 
     c->get();
     c->init_time(ictx, AIO_TYPE_WRITE);
@@ -2863,7 +2956,7 @@ reprotect_and_return_err:
 
     // map
     vector<ObjectExtent> extents;
-    Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout, off, len, extents);
+    Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout, off, len, 0, extents);
 
     c->get();
     c->init_time(ictx, AIO_TYPE_DISCARD);
@@ -2959,7 +3052,7 @@ reprotect_and_return_err:
 	return r;
 
       Striper::file_to_extents(ictx->cct, ictx->format_string, &ictx->layout,
-			       p->first, len, object_extents, buffer_ofs);
+			       p->first, len, 0, object_extents, buffer_ofs);
       buffer_ofs += len;
     }
 

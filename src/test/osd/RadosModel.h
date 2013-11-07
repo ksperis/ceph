@@ -1,4 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+#include "include/int_types.h"
+
 #include "common/Mutex.h"
 #include "common/Cond.h"
 #include "include/rados/librados.hpp"
@@ -15,7 +17,6 @@
 #include <time.h>
 #include "Object.h"
 #include "TestOpStat.h"
-#include "inttypes.h"
 #include "test/librados/test.h"
 
 #ifndef RADOSMODEL_H
@@ -48,7 +49,8 @@ enum TestOpType {
   TEST_OP_SETATTR,
   TEST_OP_RMATTR,
   TEST_OP_TMAPPUT,
-  TEST_OP_WATCH
+  TEST_OP_WATCH,
+  TEST_OP_COPY_FROM
 };
 
 class TestWatchContext : public librados::WatchCtx {
@@ -396,6 +398,27 @@ public:
     pool_obj_cont[current_snap].insert(pair<string,ObjectDesc>(oid, new_obj));
   }
 
+  void update_object_full(const string &oid, const ObjectDesc &contents)
+  {
+    pool_obj_cont.rbegin()->second.erase(oid);
+    pool_obj_cont.rbegin()->second.insert(pair<string,ObjectDesc>(oid, contents));
+  }
+
+  void update_object_version(const string &oid, uint64_t version)
+  {
+    for (map<int, map<string,ObjectDesc> >::reverse_iterator i = 
+	   pool_obj_cont.rbegin();
+	 i != pool_obj_cont.rend();
+	 ++i) {
+      map<string,ObjectDesc>::iterator j = i->second.find(oid);
+      if (j != i->second.end()) {
+	j->second.version = version;
+	cout << __func__ << " oid " << oid << " is version " << version << std::endl;
+	break;
+      }
+    }
+  }
+
   void remove_object(const string &oid)
   {
     assert(!get_watch_context(oid));
@@ -624,6 +647,7 @@ public:
       assert(0);
     }
     done = true;
+    context->update_object_version(oid, comp->get_version());
     context->oid_in_use.erase(oid);
     context->oid_not_in_use.insert(oid);
     context->kick();
@@ -714,6 +738,7 @@ public:
       assert(0);
     }
     done = true;
+    context->update_object_version(oid, comp->get_version());
     context->oid_in_use.erase(oid);
     context->oid_not_in_use.insert(oid);
     context->kick();
@@ -825,6 +850,7 @@ public:
     assert(!done);
     waiting_on--;
     if (waiting_on == 0) {
+      uint64_t version = 0;
       for (set<librados::AioCompletion *>::iterator i = waiting.begin();
 	   i != waiting.end();
 	   ) {
@@ -833,10 +859,13 @@ public:
 	  cerr << "Error: oid " << oid << " write returned error code "
 	       << err << std::endl;
 	}
+	if ((*i)->get_version64() > version)
+	  version = (*i)->get_version64();
 	(*i)->release();
 	waiting.erase(i++);
       }
       
+      context->update_object_version(oid, version);
       context->oid_in_use.erase(oid);
       context->oid_not_in_use.insert(oid);
       context->kick();
@@ -1027,6 +1056,7 @@ public:
     context->oid_in_use.erase(oid);
     context->oid_not_in_use.insert(oid);
     assert(completion->is_complete());
+    uint64_t version = completion->get_version64();
     if (int err = completion->get_return_value()) {
       if (!(err == -ENOENT && old_value.deleted())) {
 	cerr << "Error: oid " << oid << " read returned error code "
@@ -1074,6 +1104,11 @@ public:
 	cerr << "oid: " << oid << " xattrs.size() is " << xattrs.size()
 	     << " and old is " << old_value.attrs.size() << std::endl;
 	assert(xattrs.size() == old_value.attrs.size());
+      }
+      if (version != old_value.version) {
+	cerr << "oid: " << oid << " version is " << version
+	     << " and expected " << old_value.version << std::endl;
+	assert(version == old_value.version);
       }
       for (map<string, bufferlist>::iterator omap_iter = omap.begin();
 	   omap_iter != omap.end();
@@ -1279,13 +1314,17 @@ class RollbackOp : public TestOp {
 public:
   string oid;
   int roll_back_to;
+  bool done;
+  librados::ObjectWriteOperation op;
+  librados::AioCompletion *comp;
+
   RollbackOp(RadosTestContext *context,
 	     const string &_oid,
 	     int snap,
 	     TestOpStat *stat = 0) :
     TestOp(context, stat),
     oid(_oid),
-    roll_back_to(snap)
+    roll_back_to(snap), done(false)
   {}
 
   void _begin()
@@ -1311,19 +1350,34 @@ public:
     context->state_lock.Unlock();
     assert(!context->io_ctx.selfmanaged_snap_set_write_ctx(context->seq, snapset));
 
-	
-    int r = context->io_ctx.selfmanaged_snap_rollback(context->prefix+oid, 
-						      snap);
-    if (r) {
-      cerr << "r is " << r << std::endl;
+    op.selfmanaged_snap_rollback(snap);
+
+    pair<TestOp*, TestOp::CallbackInfo*> *cb_arg =
+      new pair<TestOp*, TestOp::CallbackInfo*>(this,
+					       new TestOp::CallbackInfo(0));
+    comp = context->rados.aio_create_completion((void*) cb_arg, &write_callback,
+						NULL);
+    context->io_ctx.aio_operate(context->prefix+oid, comp, &op);
+  }
+
+  void _finish(CallbackInfo *info)
+  {
+    Mutex::Locker l(context->state_lock);
+    int r;
+    if ((r = comp->get_return_value())) {
+      cerr << "err " << r << std::endl;
       assert(0);
     }
+    done = true;
+    context->update_object_version(oid, comp->get_version());
+    context->oid_in_use.erase(oid);
+    context->oid_not_in_use.insert(oid);
+    context->kick();
+  }
 
-    {
-      Mutex::Locker l(context->state_lock);
-      context->oid_in_use.erase(oid);
-      context->oid_not_in_use.insert(oid);
-    }
+  bool finished()
+  {
+    return done;
   }
 
   string getType()
@@ -1331,5 +1385,90 @@ public:
     return "RollBackOp";
   }
 };
+
+class CopyFromOp : public TestOp {
+public:
+  string oid, oid_src;
+  ObjectDesc src_value;
+  librados::ObjectWriteOperation op;
+  librados::AioCompletion *comp;
+  int snap;
+  bool done;
+  tid_t tid;
+  CopyFromOp(RadosTestContext *context,
+	     const string &oid,
+	     const string &oid_src,
+	     TestOpStat *stat)
+    : TestOp(context, stat), oid(oid), oid_src(oid_src),
+      src_value(&context->cont_gen),
+      comp(NULL), done(false), tid(0)
+  {}
+
+  void _begin()
+  {
+    ContDesc cont;
+    {
+      Mutex::Locker l(context->state_lock);
+      cont = ContDesc(context->seq_num, context->current_snap,
+		      context->seq_num, "");
+      context->oid_in_use.insert(oid);
+      context->oid_not_in_use.erase(oid);
+      context->oid_in_use.insert(oid_src);
+      context->oid_not_in_use.erase(oid_src);
+    }
+
+    // choose source snap
+    if (0 && !(rand() % 4) && !context->snaps.empty()) {
+      snap = rand_choose(context->snaps)->first;
+    } else {
+      snap = -1;
+    }
+    context->find_object(oid_src, &src_value, snap);
+
+    string src = context->prefix+oid_src;
+    op.copy_from(src.c_str(), context->io_ctx, src_value.version);
+
+    pair<TestOp*, TestOp::CallbackInfo*> *cb_arg =
+      new pair<TestOp*, TestOp::CallbackInfo*>(this,
+					       new TestOp::CallbackInfo(0));
+    comp = context->rados.aio_create_completion((void*) cb_arg, &write_callback,
+						NULL);
+    tid = context->io_ctx.aio_operate(context->prefix+oid, comp, &op);
+  }
+
+  void _finish(CallbackInfo *info)
+  {
+    Mutex::Locker l(context->state_lock);
+    done = true;
+    int r;
+    assert(comp->is_complete());
+    cout << "finishing copy_from tid " << tid << " to " << context->prefix + oid << std::endl;
+    if ((r = comp->get_return_value())) {
+      if (!(r == -ENOENT && src_value.deleted())) {
+	cerr << "Error: oid " << oid << " copy_from " << oid_src << " returned error code "
+	     << r << std::endl;
+      }
+    } else {
+      context->update_object_full(oid, src_value);
+      context->update_object_version(oid, comp->get_version());
+    }
+    context->oid_in_use.erase(oid);
+    context->oid_not_in_use.insert(oid);
+    context->oid_in_use.erase(oid_src);
+    context->oid_not_in_use.insert(oid_src);
+    context->kick();
+  }
+
+  bool finished()
+  {
+    return done;
+  }
+
+  string getType()
+  {
+    return "TmapPutOp";
+  }
+};
+
 
 #endif

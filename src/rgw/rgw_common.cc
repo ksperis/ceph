@@ -13,6 +13,7 @@
 #include "common/Clock.h"
 #include "common/Formatter.h"
 #include "common/perf_counters.h"
+#include "common/strtol.h"
 #include "include/str_list.h"
 #include "auth/Crypto.h"
 
@@ -92,12 +93,41 @@ is_err() const
 }
 
 
-req_state::req_state(CephContext *_cct, struct RGWEnv *e) : cct(_cct), cio(NULL), op(OP_UNKNOWN),
-							    bucket_cors(NULL), has_acl_header(false),
-                                                            os_auth_token(NULL), env(e)
+req_info::req_info(CephContext *cct, class RGWEnv *e) : env(e) {
+  method = env->get("REQUEST_METHOD");
+  script_uri = env->get("SCRIPT_URI", cct->_conf->rgw_script_uri.c_str());
+  request_uri = env->get("REQUEST_URI", cct->_conf->rgw_request_uri.c_str());
+  int pos = request_uri.find('?');
+  if (pos >= 0) {
+    request_params = request_uri.substr(pos + 1);
+    request_uri = request_uri.substr(0, pos);
+  }
+  host = env->get("HTTP_HOST");
+}
+
+void req_info::rebuild_from(req_info& src)
 {
-  enable_ops_log = env->conf->enable_ops_log;
-  enable_usage_log = env->conf->enable_usage_log;
+  method = src.method;
+  script_uri = src.script_uri;
+  if (src.effective_uri.empty()) {
+    request_uri = src.request_uri;
+  } else {
+    request_uri = src.effective_uri;
+  }
+  effective_uri.clear();
+  host = src.host;
+
+  x_meta_map = src.x_meta_map;
+  x_meta_map.erase("x-amz-date");
+}
+
+
+req_state::req_state(CephContext *_cct, class RGWEnv *e) : cct(_cct), cio(NULL), op(OP_UNKNOWN),
+							   has_acl_header(false),
+                                                           os_auth_token(NULL), info(_cct, e)
+{
+  enable_ops_log = e->conf->enable_ops_log;
+  enable_usage_log = e->conf->enable_usage_log;
   content_started = false;
   format = 0;
   formatter = NULL;
@@ -112,6 +142,8 @@ req_state::req_state(CephContext *_cct, struct RGWEnv *e) : cct(_cct), cio(NULL)
   obj_size = 0;
   prot_flags = 0;
 
+  system_request = false;
+
   os_auth_token = NULL;
   time = ceph_clock_now(cct);
   perm_mask = 0;
@@ -119,11 +151,10 @@ req_state::req_state(CephContext *_cct, struct RGWEnv *e) : cct(_cct), cio(NULL)
   object = NULL;
   bucket_name = NULL;
   has_bad_meta = false;
-  host = NULL;
-  method = NULL;
   length = NULL;
   copy_source = NULL;
   http_auth = NULL;
+  local_source = false;
 
   obj_ctx = NULL;
 }
@@ -131,10 +162,77 @@ req_state::req_state(CephContext *_cct, struct RGWEnv *e) : cct(_cct), cio(NULL)
 req_state::~req_state() {
   delete formatter;
   delete bucket_acl;
-  delete bucket_cors;
   delete object_acl;
   free((void *)object);
   free((void *)bucket_name);
+}
+
+struct str_len {
+  const char *str;
+  int len;
+};
+
+#define STR_LEN_ENTRY(s) { s, sizeof(s) - 1 }
+
+struct str_len meta_prefixes[] = { STR_LEN_ENTRY("HTTP_X_AMZ"),
+                                   STR_LEN_ENTRY("HTTP_X_GOOG"),
+                                   STR_LEN_ENTRY("HTTP_X_DHO"),
+                                   STR_LEN_ENTRY("HTTP_X_RGW"),
+                                   STR_LEN_ENTRY("HTTP_X_OBJECT"),
+                                   STR_LEN_ENTRY("HTTP_X_CONTAINER"),
+                                   {NULL, 0} };
+
+
+void req_info::init_meta_info(bool *found_bad_meta)
+{
+  x_meta_map.clear();
+
+  map<string, string>& m = env->get_map();
+  map<string, string>::iterator iter;
+  for (iter = m.begin(); iter != m.end(); ++iter) {
+    const char *prefix;
+    const string& header_name = iter->first;
+    const string& val = iter->second;
+    for (int prefix_num = 0; (prefix = meta_prefixes[prefix_num].str) != NULL; prefix_num++) {
+      int len = meta_prefixes[prefix_num].len;
+      const char *p = header_name.c_str();
+      if (strncmp(p, prefix, len) == 0) {
+        dout(10) << "meta>> " << p << dendl;
+        const char *name = p+len; /* skip the prefix */
+        int name_len = header_name.size() - len;
+
+        if (found_bad_meta && strncmp(name, "_META_", name_len) == 0)
+          *found_bad_meta = true;
+
+        char name_low[meta_prefixes[0].len + name_len + 1];
+        snprintf(name_low, meta_prefixes[0].len - 5 + name_len + 1, "%s%s", meta_prefixes[0].str + 5 /* skip HTTP_ */, name); // normalize meta prefix
+        int j;
+        for (j = 0; name_low[j]; j++) {
+          if (name_low[j] != '_')
+            name_low[j] = tolower(name_low[j]);
+          else
+            name_low[j] = '-';
+        }
+        name_low[j] = 0;
+
+        map<string, string>::iterator iter;
+        iter = x_meta_map.find(name_low);
+        if (iter != x_meta_map.end()) {
+          string old = iter->second;
+          int pos = old.find_last_not_of(" \t"); /* get rid of any whitespaces after the value */
+          old = old.substr(0, pos + 1);
+          old.append(",");
+          old.append(val);
+          x_meta_map[name_low] = old;
+        } else {
+          x_meta_map[name_low] = val;
+        }
+      }
+    }
+  }
+  for (iter = x_meta_map.begin(); iter != x_meta_map.end(); ++iter) {
+    dout(10) << "x>> " << iter->first << ":" << iter->second << dendl;
+  }
 }
 
 std::ostream& operator<<(std::ostream& oss, const rgw_err &err)
@@ -293,40 +391,6 @@ int parse_time(const char *time_str, time_t *time)
   return 0;
 }
 
-int parse_date(const string& date, uint64_t *epoch, string *out_date, string *out_time)
-{
-  struct tm tm;
-
-  memset(&tm, 0, sizeof(tm));
-
-  const char *p = strptime(date.c_str(), "%Y-%m-%d", &tm);
-  if (p) {
-    if (*p == ' ') {
-      p++;
-      if (!strptime(p, " %H:%M:%S", &tm))
-	return -EINVAL;
-    }
-  } else {
-    return -EINVAL;
-  }
-  time_t t = timegm(&tm);
-  if (epoch)
-    *epoch = (uint64_t)t;
-
-  if (out_date) {
-    char buf[32];
-    strftime(buf, sizeof(buf), "%F", &tm);
-    *out_date = buf;
-  }
-  if (out_time) {
-    char buf[32];
-    strftime(buf, sizeof(buf), "%T", &tm);
-    *out_time = buf;
-  }
-
-  return 0;
-}
-
 /*
  * calculate the sha1 value of a given msg and key
  */
@@ -447,9 +511,15 @@ int XMLArgs::parse()
     if (ret >= 0) {
       string& name = nv.get_name();
       string& val = nv.get_val();
-      val_map[name] = val;
+
+      if (name.compare(0, sizeof(RGW_SYS_PARAM_PREFIX) - 1, RGW_SYS_PARAM_PREFIX) == 0) {
+        sys_val_map[name] = val;
+      } else {
+        val_map[name] = val;
+      }
 
       if ((name.compare("acl") == 0) ||
+          (name.compare("cors") == 0) ||
           (name.compare("location") == 0) ||
           (name.compare("logging") == 0) ||
           (name.compare("delete") == 0) ||
@@ -466,9 +536,9 @@ int XMLArgs::parse()
            (name.compare("response-cache-control") == 0) ||
            (name.compare("response-content-disposition") == 0) ||
            (name.compare("response-content-encoding") == 0)) {
-	  sub_resources[name] = val;
-	  has_resp_modifier = true;
-	}
+          sub_resources[name] = val;
+          has_resp_modifier = true;
+        }
       } else if  ((name.compare("subuser") == 0) ||
           (name.compare("key") == 0) ||
           (name.compare("caps") == 0) ||
@@ -638,15 +708,62 @@ bool url_decode(string& src_str, string& dest_str)
   return true;
 }
 
-static struct {
-  const char *type_name;
-  uint32_t perm;
-} cap_names[] = { {"*",     RGW_CAP_ALL},
-                  {"read",  RGW_CAP_READ},
-		  {"write", RGW_CAP_WRITE},
-		  {NULL, 0} };
+string rgw_trim_whitespace(const string& src)
+{
+  if (src.empty()) {
+    return string();
+  }
 
-int RGWUserCaps::parse_cap_perm(const string& str, uint32_t *perm)
+  int start = 0;
+  for (; start != (int)src.size(); start++) {
+    if (!isspace(src[start]))
+      break;
+  }
+
+  int end = src.size() - 1;
+  if (end <= start) {
+    return string();
+  }
+
+  for (; end > start; end--) {
+    if (!isspace(src[end]))
+      break;
+  }
+
+  return src.substr(start, end - start + 1);
+}
+
+string rgw_trim_quotes(const string& val)
+{
+  string s = rgw_trim_whitespace(val);
+  if (s.size() < 2)
+    return s;
+
+  int start = 0;
+  int end = s.size() - 1;
+  int quotes_count = 0;
+
+  if (s[start] == '"') {
+    start++;
+    quotes_count++;
+  }
+  if (s[end] == '"') {
+    end--;
+    quotes_count++;
+  }
+  if (quotes_count == 2) {
+    return s.substr(start, end - start + 1);
+  }
+  return s;
+}
+
+struct rgw_name_to_flag {
+  const char *type_name;
+  uint32_t flag;
+};
+
+static int parse_list_of_flags(struct rgw_name_to_flag *mapping,
+                               const string& str, uint32_t *perm)
 {
   list<string> strs;
   get_str_list(str, strs);
@@ -654,14 +771,24 @@ int RGWUserCaps::parse_cap_perm(const string& str, uint32_t *perm)
   uint32_t v = 0;
   for (iter = strs.begin(); iter != strs.end(); ++iter) {
     string& s = *iter;
-    for (int i = 0; cap_names[i].type_name; i++) {
-      if (s.compare(cap_names[i].type_name) == 0)
-        v |= cap_names[i].perm;
+    for (int i = 0; mapping[i].type_name; i++) {
+      if (s.compare(mapping[i].type_name) == 0)
+        v |= mapping[i].flag;
     }
   }
 
   *perm = v;
   return 0;
+}
+
+static struct rgw_name_to_flag cap_names[] = { {"*",     RGW_CAP_ALL},
+                  {"read",  RGW_CAP_READ},
+		  {"write", RGW_CAP_WRITE},
+		  {NULL, 0} };
+
+int RGWUserCaps::parse_cap_perm(const string& str, uint32_t *perm)
+{
+  return parse_list_of_flags(cap_names, str, perm);
 }
 
 int RGWUserCaps::get_cap(const string& cap, string& type, uint32_t *pperm)
@@ -726,9 +853,8 @@ int RGWUserCaps::remove_cap(const string& cap)
 int RGWUserCaps::add_from_string(const string& str)
 {
   int start = 0;
-  int end;
   do {
-    end = str.find(';', start);
+    int end = str.find(';', start);
     if (end < 0)
       end = str.size();
 
@@ -745,9 +871,8 @@ int RGWUserCaps::add_from_string(const string& str)
 int RGWUserCaps::remove_from_string(const string& str)
 {
   int start = 0;
-  int end;
   do {
-    end = str.find(';', start);
+    int end = str.find(';', start);
     if (end < 0)
       end = str.size();
 
@@ -777,12 +902,12 @@ void RGWUserCaps::dump(Formatter *f, const char *name) const
     uint32_t perm = iter->second;
     string perm_str;
     for (int i=0; cap_names[i].type_name; i++) {
-      if ((perm & cap_names[i].perm) == cap_names[i].perm) {
+      if ((perm & cap_names[i].flag) == cap_names[i].flag) {
 	if (perm_str.size())
 	  perm_str.append(", ");
 
 	perm_str.append(cap_names[i].type_name);
-	perm &= ~cap_names[i].perm;
+	perm &= ~cap_names[i].flag;
       }
     }
     if (perm_str.empty())
@@ -831,5 +956,18 @@ int RGWUserCaps::check_cap(const string& cap, uint32_t perm)
   }
 
   return 0;
+}
+
+
+static struct rgw_name_to_flag op_type_mapping[] = { {"*",  RGW_OP_TYPE_ALL},
+                  {"read",  RGW_OP_TYPE_READ},
+		  {"write", RGW_OP_TYPE_WRITE},
+		  {"delete", RGW_OP_TYPE_DELETE},
+		  {NULL, 0} };
+
+
+int rgw_parse_op_type_list(const string& str, uint32_t *perm)
+{
+  return parse_list_of_flags(op_type_mapping, str, perm);
 }
 

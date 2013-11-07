@@ -28,7 +28,7 @@ using __gnu_cxx::hash_map;
 #include "mdstypes.h"
 
 class CInode;
-class MDRequest;
+struct MDRequest;
 
 #include "CInode.h"
 #include "Capability.h"
@@ -84,7 +84,7 @@ private:
 public:
   session_info_t info;                         ///< durable bits
 
-  Connection *connection;
+  ConnectionRef connection;
   xlist<Session*>::item item_session_list;
 
   list<Message*> preopen_out_queue;  ///< messages for client, queued before they connect

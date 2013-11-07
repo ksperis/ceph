@@ -1,13 +1,13 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 
-#include <iostream>
-#include <inttypes.h>
+#include "include/int_types.h"
 #include "include/buffer.h"
+
+#include <iostream>
 #include <set>
 #include <map>
 #include <string>
 #include <tr1/memory>
-
 #include <vector>
 
 #include "ObjectMap.h"
@@ -244,7 +244,7 @@ bool DBObjectMap::parse_hobject_key_v0(const string &in, coll_t *c,
   pg_t pg;
   if (c->is_pg_prefix(pg))
     pool = (int64_t)pg.pool();
-  (*hoid) = hobject_t(name, key, snap, hash, pool);
+  (*hoid) = hobject_t(name, key, snap, hash, pool, "");
   return true;
 }
 
@@ -621,11 +621,10 @@ int DBObjectMap::merge_new_complete(Header header,
   map<string, bufferlist> to_add;
 
   string begin, end;
-  int r = 0;
   while (i != new_complete.end()) {
     string new_begin = i->first;
     string new_end = i->second;
-    r = iter->in_complete_region(new_begin, &begin, &end);
+    int r = iter->in_complete_region(new_begin, &begin, &end);
     if (r < 0)
       return r;
     if (r) {
@@ -711,11 +710,10 @@ int DBObjectMap::rm_keys(const hobject_t &hoid,
     iter->seek_to_first();
     map<string, string> new_complete;
     map<string, bufferlist> to_write;
-    unsigned copied = 0;
     for(set<string>::const_iterator i = to_clear.begin();
 	i != to_clear.end();
       ) {
-      copied = 0;
+      unsigned copied = 0;
       iter->lower_bound(*i);
       ++i;
       if (!iter->valid())

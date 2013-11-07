@@ -14,6 +14,7 @@
 
 #define FUSE_USE_VERSION 26
 
+#include <fuse/fuse.h>
 #include <fuse/fuse_lowlevel.h>
 #include <signal.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include "common/safe_io.h"
 #include "include/types.h"
 #include "Client.h"
+#include "ioctl.h"
 #include "common/config.h"
 #include "include/assert.h"
 
@@ -328,7 +330,7 @@ static void fuse_ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
   if (r == 0) {
     fi->fh = (long)fh;
 #if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8)
-    if (g_conf->fuse_use_invalidate_cb)
+    if (cfuse->client->cct->_conf->fuse_use_invalidate_cb)
       fi->keep_cache = 1;
 #endif
     fuse_reply_open(req, fi);
@@ -367,6 +369,50 @@ static void fuse_ll_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
   // NOOP
   fuse_reply_err(req, 0);
 }
+
+#ifdef FUSE_IOCTL_COMPAT
+static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, struct fuse_file_info *fi,
+                          unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz)
+{
+  CephFuse::Handle *cfuse = (CephFuse::Handle *)fuse_req_userdata(req);
+
+  if (flags & FUSE_IOCTL_COMPAT) {
+    fuse_reply_err(req, ENOSYS);
+    return;
+  }
+
+  switch(cmd) {
+    case CEPH_IOC_GET_LAYOUT: {
+      struct ceph_file_layout layout;
+      struct ceph_ioctl_layout l;
+      Fh *fh = (Fh*)fi->fh;
+      cfuse->client->ll_describe_layout(fh, &layout);
+      l.stripe_unit = layout.fl_stripe_unit;
+      l.stripe_count = layout.fl_stripe_count;
+      l.object_size = layout.fl_object_size;
+      l.data_pool = layout.fl_pg_pool;
+      fuse_reply_ioctl(req, 0, &l, sizeof(struct ceph_ioctl_layout));
+    }
+    break;
+    default:
+      fuse_reply_err(req, EINVAL);
+  }
+}
+#endif
+
+#if FUSE_VERSION > FUSE_MAKE_VERSION(2, 9)
+
+static void fuse_ll_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
+                              off_t offset, off_t length,
+                              struct fuse_file_info *fi)
+{
+  CephFuse::Handle *cfuse = (CephFuse::Handle *)fuse_req_userdata(req);
+  Fh *fh = (Fh*)fi->fh;
+  int r = cfuse->client->ll_fallocate(fh, mode, offset, length);
+  fuse_reply_err(req, -r);
+}
+
+#endif
 
 static void fuse_ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
@@ -477,6 +523,7 @@ static void fuse_ll_statfs(fuse_req_t req, fuse_ino_t ino)
     fuse_reply_err(req, -r);
 }
 
+#if 0
 static int getgroups_cb(void *handle, uid_t uid, gid_t **sgids)
 {
 #ifdef HAVE_FUSE_GETGROUPS
@@ -489,7 +536,7 @@ static int getgroups_cb(void *handle, uid_t uid, gid_t **sgids)
     return 0;
   }
 
-  *sgids = malloc(c*sizeof(**sgids));
+  *sgids = (gid_t*)malloc(c*sizeof(**sgids));
   if (!*sgids) {
     return -ENOMEM;
   }
@@ -502,12 +549,13 @@ static int getgroups_cb(void *handle, uid_t uid, gid_t **sgids)
 #endif
   return 0;
 }
+#endif
 
 static void invalidate_cb(void *handle, vinodeno_t vino, int64_t off, int64_t len)
 {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8)
   CephFuse::Handle *cfuse = (CephFuse::Handle *)handle;
   fuse_ino_t fino = cfuse->make_fake_ino(vino.ino, vino.snapid);
-#if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8)
   fuse_lowlevel_notify_inval_inode(cfuse->ch, fino, off, len);
 #endif
 }
@@ -567,7 +615,22 @@ const static struct fuse_lowlevel_ops fuse_ll_oper = {
  create: fuse_ll_create,
  getlk: 0,
  setlk: 0,
- bmap: 0
+ bmap: 0,
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(2, 8)
+#ifdef FUSE_IOCTL_COMPAT
+ ioctl: fuse_ll_ioctl,
+#else
+ ioctl: 0,
+#endif
+ poll: 0,
+#if FUSE_VERSION > FUSE_MAKE_VERSION(2, 9)
+ write_buf: 0,
+ retrieve_reply: 0,
+ forget_multi: 0,
+ flock: 0,
+ fallocate: fuse_ll_fallocate
+#endif
+#endif
 };
 
 
@@ -610,24 +673,24 @@ int CephFuse::Handle::init(int argc, const char *argv[])
   newargv[newargc++] = argv[0];
   newargv[newargc++] = "-f";  // stay in foreground
 
-  if (g_conf->fuse_allow_other) {
+  if (client->cct->_conf->fuse_allow_other) {
     newargv[newargc++] = "-o";
     newargv[newargc++] = "allow_other";
   }
-  if (g_conf->fuse_default_permissions) {
+  if (client->cct->_conf->fuse_default_permissions) {
     newargv[newargc++] = "-o";
     newargv[newargc++] = "default_permissions";
   }
-  if (g_conf->fuse_big_writes) {
+  if (client->cct->_conf->fuse_big_writes) {
     newargv[newargc++] = "-o";
     newargv[newargc++] = "big_writes";
   }
-  if (g_conf->fuse_atomic_o_trunc) {
+  if (client->cct->_conf->fuse_atomic_o_trunc) {
     newargv[newargc++] = "-o";
     newargv[newargc++] = "atomic_o_trunc";
   }
 
-  if (g_conf->fuse_debug)
+  if (client->cct->_conf->fuse_debug)
     newargv[newargc++] = "-d";
 
   for (int argctr = 1; argctr < argc; argctr++)
@@ -667,9 +730,21 @@ int CephFuse::Handle::init(int argc, const char *argv[])
 
   fuse_session_add_chan(se, ch);
 
+  /*
+   * this is broken:
+   *
+   * - the cb needs the request handle to be useful; we should get the
+   *   gids in the method here in fuse_ll.c and pass the gid list in,
+   *   not use a callback.
+   * - the callback mallocs the list but it is not free()'d
+   *
+   * so disable it for now...
+
   client->ll_register_getgroups_cb(getgroups_cb, this);
 
-  if (g_conf->fuse_use_invalidate_cb)
+   */
+
+  if (client->cct->_conf->fuse_use_invalidate_cb)
     client->ll_register_ino_invalidate_cb(invalidate_cb, this);
 
 done:

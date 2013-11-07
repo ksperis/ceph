@@ -2,13 +2,19 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "common/config.h"
+#include "common/debug.h"
 
 #include "objclass/objclass.h"
 #include "osd/ReplicatedPG.h"
 
 #include "osd/ClassHandler.h"
 
+#include "auth/Crypto.h"
+#include "common/armor.h"
+
 static ClassHandler *ch;
+
+#define dout_subsys ceph_subsys_objclass
 
 void cls_initialize(ClassHandler *h)
 {
@@ -542,3 +548,78 @@ int cls_cxx_map_remove_key(cls_method_context_t hctx, const string &key)
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
 }
 
+int cls_gen_random_bytes(char *buf, int size)
+{
+  return get_random_bytes(buf, size);
+}
+
+int cls_gen_rand_base64(char *dest, int size) /* size should be the required string size + 1 */
+{
+  char buf[size];
+  char tmp_dest[size + 4]; /* so that there's space for the extra '=' characters, and some */
+  int ret;
+
+  ret = cls_gen_random_bytes(buf, sizeof(buf));
+  if (ret < 0) {
+    generic_derr << "cannot get random bytes: " << ret << dendl;
+    return -1;
+  }
+
+  ret = ceph_armor(tmp_dest, &tmp_dest[sizeof(tmp_dest)],
+		   (const char *)buf, ((const char *)buf) + ((size - 1) * 3 + 4 - 1) / 4);
+  if (ret < 0) {
+    generic_derr << "ceph_armor failed" << dendl;
+    return -1;
+  }
+  tmp_dest[ret] = '\0';
+  memcpy(dest, tmp_dest, size);
+  dest[size] = '\0';
+
+  return 0;
+}
+
+uint64_t cls_current_version(cls_method_context_t hctx)
+{
+  ReplicatedPG::OpContext *ctx = *(ReplicatedPG::OpContext **)hctx;
+
+  return ctx->pg->info.last_user_version;
+}
+
+
+int cls_current_subop_num(cls_method_context_t hctx)
+{
+  ReplicatedPG::OpContext *ctx = *(ReplicatedPG::OpContext **)hctx;
+
+  return ctx->current_osd_subop_num;
+}
+
+void cls_cxx_subop_version(cls_method_context_t hctx, string *s)
+{
+  if (!s)
+    return;
+
+  char buf[32];
+  uint64_t ver = cls_current_version(hctx);
+  int subop_num = cls_current_subop_num(hctx);
+  snprintf(buf, sizeof(buf), "%lld.%d", (long long)ver, subop_num);
+
+  *s = buf;
+}
+
+int cls_log(int level, const char *format, ...)
+{
+   int size = 256;
+   va_list ap;
+   while (1) {
+     char buf[size];
+     va_start(ap, format);
+     int n = vsnprintf(buf, size, format, ap);
+     va_end(ap);
+#define MAX_SIZE 8196
+     if ((n > -1 && n < size) || size > MAX_SIZE) {
+       dout(level) << buf << dendl;
+       return n;
+     }
+     size *= 2;
+   }
+}

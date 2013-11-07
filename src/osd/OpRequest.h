@@ -25,16 +25,18 @@
 #include "common/TrackedOp.h"
 #include "osd/osd_types.h"
 
-class OpRequest;
+struct OpRequest;
+class OpTracker;
 typedef std::tr1::shared_ptr<OpRequest> OpRequestRef;
 class OpHistory {
   set<pair<utime_t, OpRequestRef> > arrived;
   set<pair<double, OpRequestRef> > duration;
   void cleanup(utime_t now);
   bool shutdown;
+  OpTracker *tracker;
 
 public:
-  OpHistory() : shutdown(false) {}
+  OpHistory(OpTracker *tracker_) : shutdown(false), tracker(tracker_) {}
   ~OpHistory() {
     assert(arrived.empty());
     assert(duration.empty());
@@ -52,17 +54,24 @@ class OpTracker {
     void operator()(OpRequest *op);
   };
   friend class RemoveOnDelete;
+  friend class OpRequest;
+  friend class OpHistory;
   uint64_t seq;
   Mutex ops_in_flight_lock;
   xlist<OpRequest *> ops_in_flight;
   OpHistory history;
 
+protected:
+  CephContext *cct;
+
 public:
-  OpTracker() : seq(0), ops_in_flight_lock("OpTracker mutex") {}
-  void dump_ops_in_flight(std::ostream& ss);
-  void dump_historic_ops(std::ostream& ss);
+  OpTracker(CephContext *cct_) : seq(0), ops_in_flight_lock("OpTracker mutex"), history(this), cct(cct_) {}
+  void dump_ops_in_flight(Formatter *f);
+  void dump_historic_ops(Formatter *f);
   void register_inflight_op(xlist<OpRequest*>::item *i);
   void unregister_inflight_op(OpRequest *i);
+
+  void get_age_ms_histogram(pow2_hist_t *h);
 
   /**
    * Look for Ops which are too old, and insert warning
@@ -154,17 +163,7 @@ private:
   static const uint8_t flag_sub_op_sent = 1 << 4;
   static const uint8_t flag_commit_sent = 1 << 5;
 
-  OpRequest(Message *req, OpTracker *tracker) :
-    request(req), xitem(this),
-    rmw_flags(0),
-    warn_interval_multiplier(1),
-    lock("OpRequest::lock"),
-    tracker(tracker),
-    hit_flag_points(0), latest_flag_point(0),
-    seq(0) {
-    received_time = request->get_recv_stamp();
-    tracker->register_inflight_op(&xitem);
-  }
+  OpRequest(Message *req, OpTracker *tracker);
 public:
   ~OpRequest() {
     assert(request);

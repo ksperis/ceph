@@ -32,8 +32,7 @@ namespace librbd {
   void context_cb(rados_completion_t c, void *arg)
   {
     Context *con = reinterpret_cast<Context *>(arg);
-    con->finish(rados_aio_get_return_value(c));
-    delete con;
+    con->complete(rados_aio_get_return_value(c));
   }
 
   /**
@@ -100,8 +99,11 @@ namespace librbd {
     Context *req = new C_Request(m_ictx->cct, onfinish, &m_lock);
     librados::AioCompletion *rados_completion =
       librados::Rados::aio_create_completion(req, context_cb, NULL);
-    int r = m_ictx->data_ctx.aio_read(oid.name, rados_completion, pbl,
-				      len, off);
+    librados::ObjectReadOperation op;
+    op.read(off, len, pbl, NULL);
+    int flags = m_ictx->get_read_flags(snapid);
+    int r = m_ictx->data_ctx.aio_operate(oid.name, rados_completion, &op,
+					 snapid, flags, NULL);
     rados_completion->release();
     assert(r >= 0);
   }

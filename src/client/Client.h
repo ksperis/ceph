@@ -45,6 +45,7 @@ using namespace __gnu_cxx;
 #include "common/Finisher.h"
 
 #include "common/compiler_extensions.h"
+#include "common/cmdparse.h"
 
 #include "osdc/ObjectCacher.h"
 
@@ -58,13 +59,13 @@ class MClientRequest;
 class MClientSession;
 class MClientRequest;
 class MClientRequestForward;
-class MClientLease;
+struct MClientLease;
 class MClientCaps;
 class MClientCapRelease;
 
-class DirStat;
-class LeaseStat;
-class InodeStat;
+struct DirStat;
+struct LeaseStat;
+struct InodeStat;
 
 class Filer;
 class Objecter;
@@ -109,12 +110,12 @@ class Inode;
 struct Cap;
 class Dir;
 class Dentry;
-class SnapRealm;
-class Fh;
-class CapSnap;
+struct SnapRealm;
+struct Fh;
+struct CapSnap;
 
-class MetaSession;
-class MetaRequest;
+struct MetaSession;
+struct MetaRequest;
 
 
 typedef void (*client_ino_callback_t)(void *handle, vinodeno_t ino, int64_t off, int64_t len);
@@ -196,7 +197,8 @@ class Client : public Dispatcher {
     Client *m_client;
   public:
     CommandHook(Client *client);
-    bool call(std::string command, std::string args, bufferlist& out);
+    bool call(std::string command, cmdmap_t &cmdmap, std::string format,
+	      bufferlist& out);
   };
   CommandHook m_command_hook;
 
@@ -254,6 +256,8 @@ public:
 		   //MClientRequest *req, int uid, int gid,
 		   Inode **ptarget = 0, bool *pcreated = 0,
 		   int use_mds=-1, bufferlist *pdirbl=0);
+  void put_request(MetaRequest *request);
+
   int verify_reply_trace(int r, MetaRequest *request, MClientReply *reply,
 			 Inode **ptarget, bool *pcreated, int uid, int gid);
   void encode_cap_releases(MetaRequest *request, int mds);
@@ -341,6 +345,9 @@ protected:
   void wake_inode_waiters(MetaSession *s);
   void wait_on_list(list<Cond*>& ls);
   void signal_cond_list(list<Cond*>& ls);
+
+  void wait_on_context_list(list<Context*>& ls);
+  void signal_context_list(list<Context*>& ls);
 
   // -- metadata cache stuff
 
@@ -432,7 +439,7 @@ protected:
   void maybe_update_snaprealm(SnapRealm *realm, snapid_t snap_created, snapid_t snap_highwater, 
 			      vector<snapid_t>& snaps);
 
-  void handle_snap(class MClientSnap *m);
+  void handle_snap(struct MClientSnap *m);
   void handle_caps(class MClientCaps *m);
   void handle_cap_import(MetaSession *session, Inode *in, class MClientCaps *m);
   void handle_cap_export(MetaSession *session, Inode *in, class MClientCaps *m);
@@ -553,6 +560,7 @@ private:
   int _flush(Fh *fh);
   int _fsync(Fh *fh, bool syncdataonly);
   int _sync_fs();
+  int _fallocate(Fh *fh, int mode, int64_t offset, int64_t length);
 
   int get_or_create(Inode *dir, const char* name,
 		    Dentry **pdn, bool expect_null=false);
@@ -651,6 +659,7 @@ public:
   int ftruncate(int fd, loff_t size);
   int fsync(int fd, bool syncdataonly);
   int fstat(int fd, struct stat *stbuf);
+  int fallocate(int fd, int mode, loff_t offset, loff_t length);
 
   // full path xattr ops
   int getxattr(const char *path, const char *name, void *value, size_t size);
@@ -670,7 +679,8 @@ public:
   int lazyio_synchronize(int fd, loff_t offset, size_t count);
 
   // expose file layout
-  int describe_layout(int fd, ceph_file_layout* layout);
+  int describe_layout(const char *path, ceph_file_layout* layout);
+  int fdescribe_layout(int fd, ceph_file_layout* layout);
   int get_file_stripe_address(int fd, loff_t offset, vector<entity_addr_t>& address);
   int get_file_extent_osds(int fd, loff_t off, loff_t *len, vector<int>& osds);
   int get_osd_addr(int osd, entity_addr_t& addr);
@@ -712,12 +722,14 @@ public:
   int ll_rmdir(vinodeno_t vino, const char *name, int uid = -1, int gid = -1);
   int ll_rename(vinodeno_t parent, const char *name, vinodeno_t newparent, const char *newname, int uid = -1, int gid = -1);
   int ll_link(vinodeno_t vino, vinodeno_t newparent, const char *newname, struct stat *attr, int uid = -1, int gid = -1);
+  int ll_describe_layout(Fh *fh, ceph_file_layout* layout);
   int ll_open(vinodeno_t vino, int flags, Fh **fh, int uid = -1, int gid = -1);
   int ll_create(vinodeno_t parent, const char *name, mode_t mode, int flags, struct stat *attr, Fh **fh, int uid = -1, int gid = -1);
   int ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl);
   int ll_write(Fh *fh, loff_t off, loff_t len, const char *data);
   int ll_flush(Fh *fh);
   int ll_fsync(Fh *fh, bool syncdataonly);
+  int ll_fallocate(Fh *fh, int mode, loff_t offset, loff_t length);
   int ll_release(Fh *fh);
   int ll_statfs(vinodeno_t vino, struct statvfs *stbuf);
 

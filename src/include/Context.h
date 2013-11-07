@@ -23,6 +23,7 @@
 #include <set>
 
 #include <iostream>
+#include <tr1/memory>
 
 #define mydout(cct, v) lgeneric_subdout(cct, context, v)
 
@@ -33,10 +34,12 @@ class Context {
   Context(const Context& other);
   const Context& operator=(const Context& other);
 
+ protected:
+  virtual void finish(int r) = 0;
+
  public:
   Context() {}
   virtual ~Context() {}       // we want a virtual destructor!!!
-  virtual void finish(int r) = 0;
   virtual void complete(int r) {
     finish(r);
     delete this;
@@ -54,6 +57,25 @@ public:
   void finish(int r) {}
 };
 
+template <class T>
+struct Wrapper : public Context {
+  Context *to_run;
+  T val;
+  Wrapper(Context *to_run, T val) : to_run(to_run), val(val) {}
+  void finish(int r) {
+    if (to_run)
+      to_run->complete(r);
+  }
+};
+struct RunOnDelete {
+  Context *to_run;
+  RunOnDelete(Context *to_run) : to_run(to_run) {}
+  ~RunOnDelete() {
+    if (to_run)
+      to_run->complete(0);
+  }
+};
+typedef std::tr1::shared_ptr<RunOnDelete> RunOnDeleteRef;
 
 /*
  * finish and destroy a list of Contexts

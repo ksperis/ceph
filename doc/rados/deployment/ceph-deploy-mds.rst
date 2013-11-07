@@ -6,10 +6,11 @@ With ``ceph-deploy``, adding and removing metadata servers is a simple task. You
 just add or remove one or more metadata servers on the command line with one
 command.
 
-.. note:: CephFS is in production using 1 metadata server per cluster. You
-   **MUST** deploy at least one metadata server to use CephFS.
+.. important:: You must deploy at least one metadata server to use CephFS.
+    There is experimental support for running multiple metadata servers.
+    Do not run multiple metadata servers in production.
 
-See `MDS Config Reference`_ for details on configuring monitors.
+See `MDS Config Reference`_ for details on configuring metadata servers.
 
 
 Add a Metadata Server
@@ -26,15 +27,17 @@ multiple daemons on a single server.
 Remove a Metadata Server
 ========================
 
-If you have a metadata server in your cluster that you'd like to remove, you may use 
-the ``destroy`` option. :: 
+Coming soon...
 
-	ceph-deploy mds destroy {host-name}[:{daemon-name}] [{host-name}[:{daemon-name}] ...]
+.. If you have a metadata server in your cluster that you'd like to remove, you may use 
+.. the ``destroy`` option. :: 
 
-You may specify a daemon instance a name (optional) if you would like to destroy
-a particular daemon that runs on a single server with multiple MDS daemons.
+..	ceph-deploy mds destroy {host-name}[:{daemon-name}] [{host-name}[:{daemon-name}] ...]
 
-.. note:: Ensure that if you remove a metadata server, the remaining metadata
+.. You may specify a daemon instance a name (optional) if you would like to destroy
+.. a particular daemon that runs on a single server with multiple MDS daemons.
+ 
+.. .. note:: Ensure that if you remove a metadata server, the remaining metadata
    servers will be able to service requests from CephFS clients. If that is not
    possible, consider adding a metadata server before destroying the metadata 
    server you would like to take offline.

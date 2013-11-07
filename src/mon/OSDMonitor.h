@@ -45,6 +45,10 @@ struct failure_reporter_t {
 
   failure_reporter_t() : num_reports(0), msg(NULL) {}
   failure_reporter_t(utime_t s) : num_reports(1), failed_since(s), msg(NULL) {}
+  ~failure_reporter_t() {
+    // caller should have taken this message before removing the entry.
+    assert(!msg);
+  }
 };
 
 /// information about all failure reports for one osd
@@ -114,8 +118,6 @@ public:
   OSDMap osdmap;
 
 private:
-  map<epoch_t, list<PaxosServiceMessage*> > waiting_for_map;
-
   // [leader]
   OSDMap::Incremental pending_inc;
   map<int, failure_info_t> failure_info;
@@ -145,11 +147,33 @@ private:
 public:  
   void create_initial();
 private:
-  void update_from_paxos();
+  void update_from_paxos(bool *need_bootstrap);
   void create_pending();  // prepare a new pending
   void encode_pending(MonitorDBStore::Transaction *t);
-  virtual void encode_full(MonitorDBStore::Transaction *t);
   void on_active();
+  void on_shutdown();
+
+  /**
+   * we haven't delegated full version stashing to paxosservice for some time
+   * now, making this function useless in current context.
+   */
+  virtual void encode_full(MonitorDBStore::Transaction *t) { }
+  /**
+   * do not let paxosservice periodically stash full osdmaps, or we will break our
+   * locally-managed full maps.  (update_from_paxos loads the latest and writes them
+   * out going forward from there, but if we just synced that may mean we skip some.)
+   */
+  virtual bool should_stash_full() {
+    return false;
+  }
+
+  /**
+   * hook into trim to include the oldest full map in the trim transaction
+   *
+   * This ensures that anyone post-sync will have enough to rebuild their
+   * full osdmaps.
+   */
+  void encode_trim_extra(MonitorDBStore::Transaction *tx, version_t first);
 
   void update_msgr_features();
 
@@ -162,8 +186,7 @@ private:
   bool prepare_update(PaxosServiceMessage *m);
   bool should_propose(double &delay);
 
-  void update_trim();
-  bool service_should_trim();
+  version_t get_trim_to();
 
   bool can_mark_down(int o);
   bool can_mark_up(int o);
@@ -171,7 +194,6 @@ private:
   bool can_mark_in(int o);
 
   // ...
-  void send_to_waiting();     // send current map to waiters.
   MOSDMap *build_latest_full();
   MOSDMap *build_incremental(epoch_t first, epoch_t last);
   void send_full(PaxosServiceMessage *m);
@@ -191,7 +213,7 @@ private:
   bool prepare_failure(class MOSDFailure *m);
   bool prepare_mark_me_down(class MOSDMarkMeDown *m);
   void process_failures();
-  void kick_all_failures();
+  void take_all_failures(list<MOSDFailure*>& ls);
 
   bool preprocess_boot(class MOSDBoot *m);
   bool prepare_boot(class MOSDBoot *m);
@@ -212,9 +234,9 @@ private:
   bool prepare_pool_op (MPoolOp *m);
   bool prepare_pool_op_create (MPoolOp *m);
   bool prepare_pool_op_delete(MPoolOp *m);
-  bool prepare_pool_op_auid(MPoolOp *m);
   int prepare_new_pool(string& name, uint64_t auid, int crush_rule,
-                       unsigned pg_num, unsigned pgp_num);
+                       unsigned pg_num, unsigned pgp_num,
+		       const vector<string> &properties);
   int prepare_new_pool(MPoolOp *m);
 
   void update_pool_flags(int64_t pool_id, uint64_t flags);
@@ -284,8 +306,8 @@ private:
     }
   };
 
-  bool preprocess_remove_snaps(class MRemoveSnaps *m);
-  bool prepare_remove_snaps(class MRemoveSnaps *m);
+  bool preprocess_remove_snaps(struct MRemoveSnaps *m);
+  bool prepare_remove_snaps(struct MRemoveSnaps *m);
 
  public:
   OSDMonitor(Monitor *mn, Paxos *p, string service_name)
@@ -295,7 +317,7 @@ private:
   void tick();  // check state, take actions
 
   int parse_osd_id(const char *s, stringstream *pss);
-  void parse_loc_map(const vector<string>& args, int start, map<string,string> *ploc);
+  void parse_loc_map(const vector<string>& args, map<string,string> *ploc);
 
   void get_health(list<pair<health_status_t,string> >& summary,
 		  list<pair<health_status_t,string> > *detail) const;

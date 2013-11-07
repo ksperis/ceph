@@ -37,7 +37,7 @@
  * Accepter
  */
 
-int Accepter::bind(const entity_addr_t &bind_addr, int avoid_port1, int avoid_port2)
+int Accepter::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
 {
   const md_config_t *conf = msgr->cct->_conf;
   // bind to a socket
@@ -92,7 +92,7 @@ int Accepter::bind(const entity_addr_t &bind_addr, int avoid_port1, int avoid_po
   } else {
     // try a range of ports
     for (int port = msgr->cct->_conf->ms_bind_port_min; port <= msgr->cct->_conf->ms_bind_port_max; port++) {
-      if (port == avoid_port1 || port == avoid_port2)
+      if (avoid_ports.count(port))
 	continue;
       listen_addr.set_port(port);
       rc = ::bind(listen_sd, (struct sockaddr *) &listen_addr.ss_addr(), listen_addr.addr_size());
@@ -151,9 +151,9 @@ int Accepter::bind(const entity_addr_t &bind_addr, int avoid_port1, int avoid_po
   return 0;
 }
 
-int Accepter::rebind(int avoid_port)
+int Accepter::rebind(const set<int>& avoid_ports)
 {
-  ldout(msgr->cct,1) << "accepter.rebind avoid " << avoid_port << dendl;
+  ldout(msgr->cct,1) << "accepter.rebind avoid " << avoid_ports << dendl;
   
   stop();
 
@@ -161,11 +161,17 @@ int Accepter::rebind(int avoid_port)
   msgr->unlearn_addr();
 
   entity_addr_t addr = msgr->get_myaddr();
-  int old_port = addr.get_port();
+  set<int> new_avoid = avoid_ports;
+  new_avoid.insert(addr.get_port());
   addr.set_port(0);
 
-  ldout(msgr->cct,10) << " will try " << addr << dendl;
-  int r = bind(addr, old_port, avoid_port);
+  // adjust the nonce; we want our entity_addr_t to be truly unique.
+  nonce += 1000000;
+  msgr->my_inst.addr.nonce = nonce;
+  ldout(msgr->cct,10) << " new nonce " << nonce << " and inst " << msgr->my_inst << dendl;
+
+  ldout(msgr->cct,10) << " will try " << addr << " and avoid ports " << new_avoid << dendl;
+  int r = bind(addr, new_avoid);
   if (r == 0)
     start();
   return r;

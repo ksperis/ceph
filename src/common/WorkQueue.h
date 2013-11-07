@@ -49,6 +49,7 @@ public:
       : cct(cct), hb(hb), grace(grace), suicide_grace(suicide_grace) {}
   public:
     void reset_tp_timeout();
+    void suspend_tp_timeout();
   };
 private:
 
@@ -153,7 +154,7 @@ public:
     }
 
   };
-  template<typename T, typename U>
+  template<typename T, typename U = T>
   class WorkQueueVal : public WorkQueue_ {
     Mutex _lock;
     ThreadPool *pool;

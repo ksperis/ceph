@@ -17,7 +17,7 @@ methods, a :class:`TypeError` will be raised.
 # Copyright 2011 Josh Durgin
 from ctypes import CDLL, c_char, c_char_p, c_size_t, c_void_p, c_int, \
     create_string_buffer, byref, Structure, c_uint64, c_int64, c_uint8, \
-    CFUNCTYPE, pointer
+    CFUNCTYPE
 import ctypes
 import errno
 
@@ -431,7 +431,7 @@ class Image(object):
 
     def parent_info(self):
         ret = -errno.ERANGE
-        size = 8;
+        size = 8
         while ret == -errno.ERANGE and size < 128:
             pool = create_string_buffer(size)
             name = create_string_buffer(size)
@@ -439,7 +439,7 @@ class Image(object):
             ret = self.librbd.rbd_get_parent_info(self.image, pool, len(pool), 
                 name, len(name), snapname, len(snapname))
             if ret == -errno.ERANGE:
-                size *= 2;
+                size *= 2
 
         if (ret != 0):
             raise make_ex(ret, 'error getting parent info for image %s' % (self.name,))

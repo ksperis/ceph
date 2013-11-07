@@ -18,12 +18,12 @@ namespace librados
 {
   using ceph::bufferlist;
 
-  class AioCompletionImpl;
+  struct AioCompletionImpl;
   class IoCtx;
-  class IoCtxImpl;
+  struct IoCtxImpl;
   class ObjectOperationImpl;
-  class ObjListCtx;
-  class PoolAsyncCompletionImpl;
+  struct ObjListCtx;
+  struct PoolAsyncCompletionImpl;
   class RadosClient;
 
   typedef void *list_ctx_t;
@@ -46,6 +46,12 @@ namespace librados
     uint64_t num_objects_degraded;
     uint64_t num_rd, num_rd_kb, num_wr, num_wr_kb;
   };
+
+  typedef struct {
+    std::string client;
+    std::string cookie;
+    std::string address;
+  } locker_t;
 
   typedef std::map<std::string, pool_stat_t> stats_map;
 
@@ -90,7 +96,8 @@ namespace librados
     bool is_complete_and_cb();
     bool is_safe_and_cb();
     int get_return_value();
-    int get_version();
+    int get_version();  ///< DEPRECATED get_version() only returns 32-bits
+    uint64_t get_version64();
     void release();
     AioCompletionImpl *pc;
   };
@@ -105,9 +112,32 @@ namespace librados
     PoolAsyncCompletionImpl *pc;
   };
 
+  /**
+   * These are per-op flags which may be different among
+   * ops added to an ObjectOperation.
+   */
   enum ObjectOperationFlags {
     OP_EXCL =   1,
     OP_FAILOK = 2,
+  };
+
+  class ObjectOperationCompletion {
+  public:
+    virtual ~ObjectOperationCompletion() {}
+    virtual void handle_completion(int r, bufferlist& outbl) = 0;
+  };
+
+  /**
+   * These flags apply to the ObjectOperation as a whole.
+   *
+   * BALANCE_READS and LOCALIZE_READS should only be used
+   * when reading from data you're certain won't change,
+   * like a snapshot, or where eventual consistency is ok.
+   */
+  enum ObjectOperationGlobalFlags {
+    OPERATION_NOFLAG         = 0,
+    OPERATION_BALANCE_READS  = 1,
+    OPERATION_LOCALIZE_READS = 2,
   };
 
   /*
@@ -131,6 +161,8 @@ namespace librados
     void src_cmpxattr(const std::string& src_oid,
 		      const char *name, int op, uint64_t v);
     void exec(const char *cls, const char *method, bufferlist& inbl);
+    void exec(const char *cls, const char *method, bufferlist& inbl, bufferlist *obl, int *prval);
+    void exec(const char *cls, const char *method, bufferlist& inbl, ObjectOperationCompletion *completion);
     /**
      * Guard operation with a check that object version == ver
      *
@@ -205,6 +237,7 @@ namespace librados
     void clone_range(uint64_t dst_off,
                      const std::string& src_oid, uint64_t src_off,
                      size_t len);
+    void selfmanaged_snap_rollback(uint64_t snapid);
 
     /**
      * set keys and values according to map
@@ -232,6 +265,19 @@ namespace librados
      */
     void omap_rm_keys(const std::set<std::string> &to_rm);
 
+    /**
+     * Copy an object
+     *
+     * Copies an object from another location.  The operation is atomic in that
+     * the copy either succeeds in its entirety or fails (e.g., because the
+     * source object was modified while the copy was in progress).
+     *
+     * @param src source object name
+     * @param src_ioctx ioctx for the source object
+     * @param version current version of the source object
+     */
+    void copy_from(const std::string& src, const IoCtx& src_ioctx, uint64_t src_version);
+
     friend class IoCtx;
   };
 
@@ -250,6 +296,11 @@ namespace librados
     void getxattr(const char *name, bufferlist *pbl, int *prval);
     void getxattrs(std::map<std::string, bufferlist> *pattrs, int *prval);
     void read(size_t off, uint64_t len, bufferlist *pbl, int *prval);
+    /**
+     * see aio_sparse_read()
+     */
+    void sparse_read(uint64_t off, uint64_t len, std::map<uint64_t,uint64_t> *m,
+                    bufferlist *data_bl, int *prval);
     void tmap_get(bufferlist *pbl, int *prval);
 
     /**
@@ -388,8 +439,23 @@ namespace librados
     int create(const std::string& oid, bool exclusive);
     int create(const std::string& oid, bool exclusive, const std::string& category);
 
+    /**
+     * write bytes to an object at a specified offset
+     *
+     * NOTE: this call steals the contents of @param bl.
+     */
     int write(const std::string& oid, bufferlist& bl, size_t len, uint64_t off);
+    /**
+     * append bytes to an object
+     *
+     * NOTE: this call steals the contents of @param bl.
+     */
     int append(const std::string& oid, bufferlist& bl, size_t len);
+    /**
+     * replace object contents with provided data
+     *
+     * NOTE: this call steals the contents of @param bl.
+     */
     int write_full(const std::string& oid, bufferlist& bl);
     int clone_range(const std::string& dst_oid, uint64_t dst_off,
                    const std::string& src_oid, uint64_t src_off,
@@ -406,7 +472,17 @@ namespace librados
     int stat(const std::string& oid, uint64_t *psize, time_t *pmtime);
     int exec(const std::string& oid, const char *cls, const char *method,
 	     bufferlist& inbl, bufferlist& outbl);
+    /**
+     * modify object tmap based on encoded update sequence
+     *
+     * NOTE: this call steals the contents of @param bl
+     */
     int tmap_update(const std::string& oid, bufferlist& cmdbl);
+    /**
+     * replace object contents with provided encoded tmap data
+     *
+     * NOTE: this call steals the contents of @param bl
+     */
     int tmap_put(const std::string& oid, bufferlist& bl);
     int tmap_get(const std::string& oid, bufferlist& bl);
 
@@ -464,6 +540,29 @@ namespace librados
     int selfmanaged_snap_remove(uint64_t snapid);
 
     int selfmanaged_snap_rollback(const std::string& oid, uint64_t snapid);
+
+    // Advisory locking on rados objects.
+    int lock_exclusive(const std::string &oid, const std::string &name,
+		       const std::string &cookie,
+		       const std::string &description,
+		       struct timeval * duration, uint8_t flags);
+
+    int lock_shared(const std::string &oid, const std::string &name,
+		    const std::string &cookie, const std::string &tag,
+		    const std::string &description,
+		    struct timeval * duration, uint8_t flags);
+
+    int unlock(const std::string &oid, const std::string &name,
+	       const std::string &cookie);
+
+    int break_lock(const std::string &oid, const std::string &name,
+		   const std::string &client, const std::string &cookie);
+
+    int list_lockers(const std::string &oid, const std::string &name,
+		     int *exclusive,
+		     std::string *tag,
+		     std::list<librados::locker_t> *lockers);
+
 
     ObjectIterator objects_begin();
     const ObjectIterator& objects_end() const;
@@ -580,7 +679,10 @@ namespace librados
     int aio_operate(const std::string& oid, AioCompletion *c,
 		    ObjectWriteOperation *op, snap_t seq,
 		    std::vector<snap_t>& snaps);
-    int aio_operate(const std::string& oid, AioCompletion *c, ObjectReadOperation *op,
+    int aio_operate(const std::string& oid, AioCompletion *c,
+		    ObjectReadOperation *op, bufferlist *pbl);
+    int aio_operate(const std::string& oid, AioCompletion *c,
+		    ObjectReadOperation *op, snap_t snapid, int flags,
 		    bufferlist *pbl);
 
     // watch/notify
@@ -599,6 +701,7 @@ namespace librados
     const std::string& get_pool_name() const;
 
     void locator_set_key(const std::string& key);
+    void set_namespace(const std::string& nspace);
 
     int64_t get_id();
 
@@ -609,6 +712,7 @@ namespace librados
     IoCtx(IoCtxImpl *io_ctx_impl_);
 
     friend class Rados; // Only Rados can use our private constructor to create IoCtxes.
+    friend class ObjectWriteOperation;  // copy_from needs to see our IoCtxImpl
 
     IoCtxImpl *io_ctx_impl;
   };
@@ -623,12 +727,16 @@ namespace librados
     ~Rados();
 
     int init(const char * const id);
+    int init2(const char * const name, const char * const clustername,
+	      uint64_t flags);
     int init_with_context(config_t cct_);
     config_t cct();
     int connect();
     void shutdown();
     int conf_read_file(const char * const path) const;
     int conf_parse_argv(int argc, const char ** argv) const;
+    int conf_parse_argv_remainder(int argc, const char ** argv,
+				  const char ** remargv) const;
     int conf_parse_env(const char *env) const;
     int conf_set(const char *option, const char *value);
     int conf_get(const char *option, std::string &val);
@@ -647,6 +755,9 @@ namespace librados
     uint64_t get_instance_id();
 
     int ioctx_create(const char *name, IoCtx &pioctx);
+
+    // Features useful for test cases
+    void test_blacklist_self(bool set);
 
     /* listing objects */
     int pool_list(std::list<std::string>& v);

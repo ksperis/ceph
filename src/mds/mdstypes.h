@@ -3,7 +3,8 @@
 #ifndef CEPH_MDSTYPES_H
 #define CEPH_MDSTYPES_H
 
-#include <inttypes.h>
+#include "include/int_types.h"
+
 #include <math.h>
 #include <ostream>
 #include <set>
@@ -347,7 +348,7 @@ struct inode_t {
   version_t file_data_version; // auth only
   version_t xattr_version;
 
-  version_t last_renamed_version;      // when i was last renamed
+  version_t backtrace_version;
 
   inode_t() : ino(0), rdev(0),
 	      mode(0), uid(0), gid(0),
@@ -355,7 +356,7 @@ struct inode_t {
 	      size(0), truncate_seq(0), truncate_size(0), truncate_from(0),
 	      truncate_pending(0),
 	      time_warp_seq(0),
-	      version(0), file_data_version(0), xattr_version(0), last_renamed_version(0) { 
+	      version(0), file_data_version(0), xattr_version(0), backtrace_version(0) {
     clear_layout();
     memset(&dir_layout, 0, sizeof(dir_layout));
   }
@@ -425,7 +426,15 @@ struct inode_t {
     }
   }
 
+  bool is_backtrace_updated() {
+    return backtrace_version == version;
+  }
+  void update_backtrace() {
+    backtrace_version = version;
+  }
+
   void add_old_pool(int64_t l) {
+    backtrace_version = version;
     old_pools.push_back(l);
   }
 
@@ -466,6 +475,7 @@ struct fnode_t {
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
   static void generate_test_instances(list<fnode_t*>& ls);
+  fnode_t() : version(0) {};
 };
 WRITE_CLASS_ENCODER(fnode_t)
 

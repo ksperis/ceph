@@ -40,6 +40,8 @@ using namespace __gnu_cxx;
 #include "IndexManager.h"
 #include "ObjectMap.h"
 #include "SequencerPosition.h"
+#include "FDCache.h"
+#include "WBThrottle.h"
 
 #include "include/uuid.h"
 
@@ -49,10 +51,44 @@ using namespace __gnu_cxx;
 # define FALLOC_FL_PUNCH_HOLE 0x2
 #endif
 
+#if defined(__linux__)
+# ifndef BTRFS_SUPER_MAGIC
+static const __SWORD_TYPE BTRFS_SUPER_MAGIC(0x9123683E);
+# endif
+# ifndef XFS_SUPER_MAGIC
+static const __SWORD_TYPE XFS_SUPER_MAGIC(0x58465342);
+# endif
+#endif
+
+#ifndef ZFS_SUPER_MAGIC
+static const __SWORD_TYPE ZFS_SUPER_MAGIC(0x2fc12fc1);
+#endif
+
+class FileStoreBackend;
+
 class FileStore : public JournalingObjectStore,
                   public md_config_obs_t
 {
 public:
+
+  struct FSPerfTracker {
+    PerfCounters::avg_tracker<uint64_t> os_commit_latency;
+    PerfCounters::avg_tracker<uint64_t> os_apply_latency;
+
+    filestore_perf_stat_t get_cur_stats() const {
+      filestore_perf_stat_t ret;
+      ret.filestore_commit_latency = os_commit_latency.avg();
+      ret.filestore_apply_latency = os_apply_latency.avg();
+      return ret;
+    }
+
+    void update_from_perfcounters(PerfCounters &logger);
+  } perf_tracker;
+  filestore_perf_stat_t get_cur_stats() {
+    perf_tracker.update_from_perfcounters(*logger);
+    return perf_tracker.get_cur_stats();
+  }
+
   static const uint32_t on_disk_version = 3;
 private:
   string internal_name;         ///< internal name, used to name the perfcounter instance
@@ -62,19 +98,13 @@ private:
   std::string omap_dir;
   uuid_d fsid;
   
-  bool btrfs;                   ///< fs is btrfs
-  bool btrfs_stable_commits;    ///< we are using btrfs snapshots for a stable journal refernce
-  uint64_t blk_size;            ///< fs block size
-  bool btrfs_trans_start_end;   ///< btrfs trans start/end ioctls are supported
-  bool btrfs_clone_range;       ///< btrfs clone range ioctl is supported
-  bool btrfs_snap_create;       ///< btrfs snap create ioctl is supported
-  bool btrfs_snap_destroy;      ///< btrfs snap destroy ioctl is supported
-  bool btrfs_snap_create_v2;    ///< btrfs snap create v2 ioctl (async!) is supported
-  bool btrfs_wait_sync;         ///< btrfs wait sync ioctl is supported
-  bool ioctl_fiemap;            ///< fiemap ioctl is supported
-  int fsid_fd, op_fd;
+  size_t blk_size;            ///< fs block size
 
-  int basedir_fd, current_fd;
+  int fsid_fd, op_fd, basedir_fd, current_fd;
+
+  FileStoreBackend *generic_backend;
+  FileStoreBackend *backend;
+
   deque<uint64_t> snaps;
 
   // Indexed Collections
@@ -116,8 +146,6 @@ private:
       return 0;
     }
   } sync_thread;
-
-  void sync_fs(); // actuall sync underlying fs
 
   // -- op workqueue --
   struct Op {
@@ -198,6 +226,10 @@ private:
 
   friend ostream& operator<<(ostream& out, const OpSequencer& s);
 
+  Mutex fdcache_lock;
+  FDCache fdcache;
+  WBThrottle wbthrottle;
+
   Sequencer default_osr;
   deque<OpSequencer*> op_queue;
   uint64_t op_queue_len, op_queue_bytes;
@@ -248,25 +280,9 @@ private:
   void op_queue_reserve_throttle(Op *o);
   void op_queue_release_throttle(Op *o);
   void _journaled_ahead(OpSequencer *osr, Op *o, Context *ondisk);
-  friend class C_JournaledAhead;
-
-  // flusher thread
-  Cond flusher_cond;
-  list<uint64_t> flusher_queue;
-  int flusher_queue_len;
-  void flusher_entry();
-  struct FlusherThread : public Thread {
-    FileStore *fs;
-    FlusherThread(FileStore *f) : fs(f) {}
-    void *entry() {
-      fs->flusher_entry();
-      return 0;
-    }
-  } flusher_thread;
-  bool queue_flusher(int fd, uint64_t off, uint64_t len, bool replica);
+  friend struct C_JournaledAhead;
 
   int open_journal();
-
 
   PerfCounters *logger;
 
@@ -274,21 +290,21 @@ public:
   int lfn_find(coll_t cid, const hobject_t& oid, IndexedPath *path);
   int lfn_truncate(coll_t cid, const hobject_t& oid, off_t length);
   int lfn_stat(coll_t cid, const hobject_t& oid, struct stat *buf);
-  int lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode,
-	       IndexedPath *path);
-  int lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode,
-	       IndexedPath *path, Index *index);
-  int lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode);
-  int lfn_open(coll_t cid, const hobject_t& oid, int flags);
-  void lfn_close(int fd);
+  int lfn_open(
+    coll_t cid,
+    const hobject_t& oid,
+    bool create,
+    FDRef *outfd,
+    IndexedPath *path = 0,
+    Index *index = 0);
+  void lfn_close(FDRef fd);
   int lfn_link(coll_t c, coll_t cid, const hobject_t& o) ;
   int lfn_unlink(coll_t cid, const hobject_t& o, const SequencerPosition &spos);
 
- public:
+public:
   FileStore(const std::string &base, const std::string &jdev, const char *internal_name = "filestore", bool update_to=false);
   ~FileStore();
 
-  int _test_fiemap();
   int _detect_fs();
   int _sanity_check_fs();
   
@@ -333,6 +349,8 @@ public:
   void _set_replay_guard(coll_t cid,
                          const SequencerPosition& spos,
                          bool in_progress);
+  void _set_global_replay_guard(coll_t cid,
+				const SequencerPosition &spos);
 
   /// close a replay guard opened with in_progress=true
   void _close_replay_guard(int fd, const SequencerPosition& spos);
@@ -357,6 +375,7 @@ public:
   int _check_replay_guard(int fd, const SequencerPosition& spos);
   int _check_replay_guard(coll_t cid, const SequencerPosition& spos);
   int _check_replay_guard(coll_t cid, hobject_t oid, const SequencerPosition& pos);
+  int _check_global_replay_guard(coll_t cid, const SequencerPosition& spos);
 
   // ------------------
   // objects
@@ -495,6 +514,9 @@ private:
 		    const SequencerPosition &spos);
   int _omap_rmkeys(coll_t cid, const hobject_t &hoid, const set<string> &keys,
 		   const SequencerPosition &spos);
+  int _omap_rmkeyrange(coll_t cid, const hobject_t &hoid,
+		       const string& first, const string& last,
+		       const SequencerPosition &spos);
   int _omap_setheader(coll_t cid, const hobject_t &hoid, const bufferlist &bl,
 		      const SequencerPosition &spos);
   int _split_collection(coll_t cid, uint32_t bits, uint32_t rem, coll_t dest,
@@ -506,19 +528,11 @@ private:
   virtual const char** get_tracked_conf_keys() const;
   virtual void handle_conf_change(const struct md_config_t *conf,
 			  const std::set <std::string> &changed);
-  bool m_filestore_btrfs_clone_range;
-  bool m_filestore_btrfs_snap;
   float m_filestore_commit_timeout;
-  bool m_filestore_fiemap;
-  bool m_filestore_flusher;
-  bool m_filestore_fsync_flushes_journal_data;
   bool m_filestore_journal_parallel;
   bool m_filestore_journal_trailing;
   bool m_filestore_journal_writeahead;
   int m_filestore_fiemap_threshold;
-  bool m_filestore_sync_flush;
-  int m_filestore_flusher_max_fds;
-  int m_filestore_flush_min;
   double m_filestore_max_sync_interval;
   double m_filestore_min_sync_interval;
   bool m_filestore_fail_eio;
@@ -535,8 +549,54 @@ private:
   std::ofstream m_filestore_dump;
   JSONFormatter m_filestore_dump_fmt;
   atomic_t m_filestore_kill_at;
+
+  friend class FileStoreBackend;
 };
 
 ostream& operator<<(ostream& out, const FileStore::OpSequencer& s);
+
+struct fiemap;
+
+class FileStoreBackend {
+private:
+  FileStore *filestore;
+protected:
+  int get_basedir_fd() {
+    return filestore->basedir_fd;
+  }
+  int get_current_fd() {
+    return filestore->current_fd;
+  }
+  int get_op_fd() {
+    return filestore->op_fd;
+  }
+  size_t get_blksize() {
+    return filestore->blk_size;
+  }
+  const string& get_basedir_path() {
+    return filestore->basedir;
+  }
+  const string& get_current_path() {
+    return filestore->current_fn;
+  }
+  int _copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff) {
+    return filestore->_do_copy_range(from, to, srcoff, len, dstoff);
+  }
+public:
+  FileStoreBackend(FileStore *fs) : filestore(fs) {}
+  virtual ~FileStoreBackend() {};
+  virtual int detect_features() = 0;
+  virtual int create_current() = 0;
+  virtual bool can_checkpoint() = 0;
+  virtual int list_checkpoints(list<string>& ls) = 0;
+  virtual int create_checkpoint(const string& name, uint64_t *cid) = 0;
+  virtual int sync_checkpoint(uint64_t id) = 0;
+  virtual int rollback_to(const string& name) = 0;
+  virtual int destroy_checkpoint(const string& name) = 0;
+  virtual int syncfs() = 0;
+  virtual bool has_fiemap() = 0;
+  virtual int do_fiemap(int fd, off_t start, size_t len, struct fiemap **pfiemap) = 0;
+  virtual int clone_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff) = 0;
+};
 
 #endif

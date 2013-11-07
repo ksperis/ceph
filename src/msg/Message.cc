@@ -40,6 +40,7 @@ using namespace std;
 #include "messages/MMonJoin.h"
 #include "messages/MMonElection.h"
 #include "messages/MMonSync.h"
+#include "messages/MMonScrub.h"
 
 #include "messages/MLog.h"
 #include "messages/MLogAck.h"
@@ -112,6 +113,8 @@ using namespace std;
 #include "messages/MMDSCacheRejoin.h"
 #include "messages/MMDSFindIno.h"
 #include "messages/MMDSFindInoReply.h"
+#include "messages/MMDSOpenIno.h"
+#include "messages/MMDSOpenInoReply.h"
 
 #include "messages/MDirUpdate.h"
 #include "messages/MDiscover.h"
@@ -152,6 +155,10 @@ using namespace std;
 
 #include "common/config.h"
 
+#include "messages/MOSDPGPush.h"
+#include "messages/MOSDPGPushReply.h"
+#include "messages/MOSDPGPull.h"
+
 #define DEBUGLVL  10    // debug level of output
 
 #define dout_subsys ceph_subsys_ms
@@ -183,7 +190,15 @@ void Message::encode(uint64_t features, bool datacrc)
 #ifdef ENCODE_DUMP
     bufferlist bl;
     ::encode(get_header(), bl);
-    ::encode(get_footer(), bl);
+
+    // dump the old footer format
+    ceph_msg_footer_old old_footer;
+    old_footer.front_crc = footer.front_crc;
+    old_footer.middle_crc = footer.middle_crc;
+    old_footer.data_crc = footer.data_crc;
+    old_footer.flags = footer.flags;
+    ::encode(old_footer, bl);
+
     ::encode(get_payload(), bl);
     ::encode(get_middle(), bl);
     ::encode(get_data(), bl);
@@ -316,6 +331,9 @@ Message *decode_message(CephContext *cct, ceph_msg_header& header, ceph_msg_foot
   case MSG_MON_SYNC:
     m = new MMonSync;
     break;
+  case MSG_MON_SCRUB:
+    m = new MMonScrub;
+    break;
 
   case MSG_LOG:
     m = new MLog;
@@ -439,6 +457,15 @@ Message *decode_message(CephContext *cct, ceph_msg_header& header, ceph_msg_foot
   case MSG_OSD_PG_BACKFILL:
     m = new MOSDPGBackfill;
     break;
+  case MSG_OSD_PG_PUSH:
+    m = new MOSDPGPush;
+    break;
+  case MSG_OSD_PG_PULL:
+    m = new MOSDPGPull;
+    break;
+  case MSG_OSD_PG_PUSH_REPLY:
+    m = new MOSDPGPushReply;
+    break;
    // auth
   case CEPH_MSG_AUTH:
     m = new MAuth;
@@ -531,6 +558,13 @@ Message *decode_message(CephContext *cct, ceph_msg_header& header, ceph_msg_foot
     break;
   case MSG_MDS_FINDINOREPLY:
     m = new MMDSFindInoReply;
+    break;
+
+  case MSG_MDS_OPENINO:
+    m = new MMDSOpenIno;
+    break;
+  case MSG_MDS_OPENINOREPLY:
+    m = new MMDSOpenInoReply;
     break;
 
   case MSG_MDS_FRAGMENTNOTIFY:

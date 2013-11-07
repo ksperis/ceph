@@ -3,7 +3,7 @@
 #ifndef CEPH_LIBRBD_IMAGECTX_H
 #define CEPH_LIBRBD_IMAGECTX_H
 
-#include <inttypes.h>
+#include "include/int_types.h"
 
 #include <map>
 #include <set>
@@ -99,6 +99,7 @@ namespace librbd {
     void init_layout();
     void perf_start(std::string name);
     void perf_stop();
+    int get_read_flags(librados::snap_t snap_id);
     int snap_set(std::string in_snap_name);
     void snap_unset();
     librados::snap_t get_snap_id(std::string in_snap_name) const;

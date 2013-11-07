@@ -12,8 +12,6 @@
 # Description:       Enable Ceph distributed file system services.
 ### END INIT INFO
 
-RUN_DIR=/var/run/ceph
-
 # if we start up as ./mkcephfs, assume everything else is in the
 # current directory too.
 if [ `dirname $0` = "." ] && [ $PWD != "/etc/init.d" ]; then
@@ -29,12 +27,16 @@ else
 fi
 
 usage_exit() {
-    echo "usage: $0 [options] {start|stop|restart} [mon|osd|mds]..."
+    echo "usage: $0 [options] {start|stop|restart|condrestart} [mon|osd|mds]..."
     printf "\t-c ceph.conf\n"
     printf "\t--valgrind\trun via valgrind\n"
     printf "\t--hostname [hostname]\toverride hostname lookup\n"
     exit
 }
+
+# behave if we are not completely installed (e.g., Debian "removed,
+# config remains" state)
+test -f $LIBDIR/ceph_common.sh || exit 0
 
 . $LIBDIR/ceph_common.sh
 
@@ -181,7 +183,9 @@ for name in $what; do
     binary="$BINDIR/ceph-$type"
     cmd="$binary -i $id"
 
-    get_conf pid_file "$RUN_DIR/$type.$id.pid" "pid file"
+    get_conf run_dir "/var/run/ceph" "run dir"
+
+    get_conf pid_file "$run_dir/$type.$id.pid" "pid file"
 
     if [ "$command" = "start" ]; then
 	if [ -n "$pid_file" ]; then
@@ -236,12 +240,12 @@ for name in $what; do
 	lockfile=""
     fi
 
-    get_conf asok "$RUN_DIR/ceph-$type.$id.asok" "admin socket"
+    get_conf asok "$run_dir/ceph-$type.$id.asok" "admin socket"
 
     case "$command" in
 	start)
             # Increase max_open_files, if the configuration calls for it.
-            get_conf max_open_files "8192" "max open files"
+            get_conf max_open_files "32768" "max open files"
 
             # build final command
 	    wrap=""
@@ -311,7 +315,10 @@ for name in $what; do
 		    get_conf osd_location "" "osd crush location"
 		    get_conf osd_weight "" "osd crush initial weight"
 		    defaultweight="$(do_cmd "df $osd_data/. | tail -1 | awk '{ d= \$2/1073741824 ; r = sprintf(\"%.2f\", d); print r }'")"
+<<<<<<< HEAD
 
+=======
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 		    get_conf osd_keyring "$osd_data/keyring" "keyring"
 		    do_cmd "$BINDIR/ceph \
 			--name=osd.$id \
@@ -328,7 +335,7 @@ for name in $what; do
 	    fi
 
 	    echo Starting Ceph $name on $host...
-	    mkdir -p $RUN_DIR
+	    mkdir -p $run_dir
 	    get_conf pre_start_eval "" "pre start eval"
 	    [ -n "$pre_start_eval" ] && $pre_start_eval
 	    get_conf pre_start "" "pre start command"
@@ -415,6 +422,15 @@ for name in $what; do
 	    $0 $options start $name
 	    ;;
 
+        condrestart)
+            if daemon_is_running $name ceph-$type $id $pid_file; then
+                $0 $options stop $name
+                $0 $options start $name
+            else
+                echo "$name: not running."
+            fi
+            ;;
+
 	cleanlogs)
 	    echo removing logs
 	    [ -n "$log_dir" ] && do_cmd "rm -f $log_dir/$type.$id.*"
@@ -430,5 +446,12 @@ for name in $what; do
 	    ;;
     esac
 done
+
+# activate latent osds?
+if [ "$command" = "start" -a "$BINDIR" != "." ]; then
+    if [ "$*" = "" ] || echo $* | grep -q ^osd\$ ; then
+	ceph-disk activate-all
+    fi
+fi
 
 exit $EXIT_STATUS

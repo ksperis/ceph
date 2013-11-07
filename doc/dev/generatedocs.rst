@@ -20,7 +20,7 @@ on your local host. To install ``git``, execute::
 
 To clone the Ceph repository, execute::
 
-	git clone git://ceph/ceph.git
+	git clone git://github.com/ceph/ceph
 
 You should have a full copy of the Ceph repository.
 
@@ -46,7 +46,7 @@ To run Sphinx, at least the following are required:
 Execute ``apt-get install`` for each dependency that isn't installed
 on your host.::
 
-	sudo apt-get install python-dev python-pip python-virtualenv libxml2-dev libxslt-dev doxygen ditaa graphviz
+	sudo apt-get install python-dev python-pip python-virtualenv libxml2-dev libxslt-dev doxygen ditaa graphviz ant
 
 
 

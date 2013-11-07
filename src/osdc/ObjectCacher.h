@@ -45,7 +45,7 @@ class ObjectCacher {
  public:
   CephContext *cct;
   class Object;
-  class ObjectSet;
+  struct ObjectSet;
   class C_ReadFinish;
 
   typedef void (*flush_set_callback_t) (void *p, ObjectSet *oset);
@@ -104,6 +104,7 @@ class ObjectCacher {
     Object *ob;
     bufferlist  bl;
     tid_t last_write_tid;  // version of bh (if non-zero)
+    tid_t last_read_tid;   // tid of last read op (if any)
     utime_t last_write;
     SnapContext snapc;
     int error; // holds return value for failed reads
@@ -116,6 +117,7 @@ class ObjectCacher {
       ref(0),
       ob(o),
       last_write_tid(0),
+      last_read_tid(0),
       error(0) {
       ex.start = ex.length = 0;
     }
@@ -165,12 +167,13 @@ class ObjectCacher {
     int ref;
     ObjectCacher *oc;
     sobject_t oid;
-    friend class ObjectSet;
+    friend struct ObjectSet;
 
   public:
     ObjectSet *oset;
     xlist<Object*>::item set_item;
     object_locator_t oloc;
+    uint64_t truncate_size, truncate_seq;
     
     bool complete;
     bool exists;
@@ -190,10 +193,12 @@ class ObjectCacher {
     Object(const Object& other);
     const Object& operator=(const Object& other);
 
-    Object(ObjectCacher *_oc, sobject_t o, ObjectSet *os, object_locator_t& l) : 
+    Object(ObjectCacher *_oc, sobject_t o, ObjectSet *os, object_locator_t& l,
+	   uint64_t ts, uint64_t tq) :
       ref(0),
       oc(_oc),
       oid(o), oset(os), set_item(this), oloc(l),
+      truncate_size(ts), truncate_seq(tq),
       complete(false), exists(true),
       last_write_tid(0), last_commit_tid(0),
       dirty_or_tx(0) {
@@ -212,6 +217,7 @@ class ObjectCacher {
     object_t get_oid() { return oid.oid; }
     snapid_t get_snap() { return oid.snap; }
     ObjectSet *get_object_set() { return oset; }
+    string get_namespace() { return oloc.nspace; }
     
     object_locator_t& get_oloc() { return oloc; }
     void set_object_locator(object_locator_t& l) { oloc = l; }
@@ -335,6 +341,8 @@ class ObjectCacher {
 
   vector<hash_map<sobject_t, Object*> > objects; // indexed by pool_id
 
+  tid_t last_read_tid;
+
   set<BufferHead*>    dirty_bh;
   LRU   bh_lru_dirty, bh_lru_rest;
   LRU   ob_lru;
@@ -363,8 +371,8 @@ class ObjectCacher {
     return NULL;
   }
 
-  Object *get_object(sobject_t oid, ObjectSet *oset,
-                     object_locator_t &l);
+  Object *get_object(sobject_t oid, ObjectSet *oset, object_locator_t &l,
+		     uint64_t truncate_size, uint64_t truncate_seq);
   void close_object(Object *ob);
 
   // bh stats
@@ -451,8 +459,9 @@ class ObjectCacher {
 	     bool external_call);
 
  public:
-  void bh_read_finish(int64_t poolid, sobject_t oid, loff_t offset,
-		      uint64_t length, bufferlist &bl, int r,
+  void bh_read_finish(int64_t poolid, sobject_t oid, tid_t tid,
+		      loff_t offset, uint64_t length,
+		      bufferlist &bl, int r,
 		      bool trust_enoent);
   void bh_write_commit(int64_t poolid, sobject_t oid, loff_t offset,
 		       uint64_t length, tid_t t, int r);
@@ -465,17 +474,20 @@ class ObjectCacher {
     uint64_t length;
     xlist<C_ReadFinish*>::item set_item;
     bool trust_enoent;
+    tid_t tid;
 
   public:
     bufferlist bl;
-    C_ReadFinish(ObjectCacher *c, Object *ob, loff_t s, uint64_t l) :
+    C_ReadFinish(ObjectCacher *c, Object *ob, tid_t t, loff_t s, uint64_t l) :
       oc(c), poolid(ob->oloc.pool), oid(ob->get_soid()), start(s), length(l),
-      set_item(this), trust_enoent(true) {
+      set_item(this), trust_enoent(true),
+      tid(t) {
       ob->reads.push_back(&set_item);
     }
 
     void finish(int r) {
-      oc->bh_read_finish(poolid, oid, start, length, bl, r, trust_enoent);
+      oc->bh_read_finish(poolid, oid, tid, start, length, bl, r, trust_enoent);
+
       // object destructor clears the list
       if (set_item.is_on_list())
 	set_item.remove_myself();
@@ -626,7 +638,7 @@ public:
   int file_is_cached(ObjectSet *oset, ceph_file_layout *layout, snapid_t snapid,
 		     loff_t offset, uint64_t len) {
     vector<ObjectExtent> extents;
-    Striper::file_to_extents(cct, oset->ino, layout, offset, len, extents);
+    Striper::file_to_extents(cct, oset->ino, layout, offset, len, oset->truncate_size, extents);
     return is_cached(oset, extents, snapid);
   }
 
@@ -636,7 +648,7 @@ public:
 		int flags,
                 Context *onfinish) {
     OSDRead *rd = prepare_read(snapid, bl, flags);
-    Striper::file_to_extents(cct, oset->ino, layout, offset, len, rd->extents);
+    Striper::file_to_extents(cct, oset->ino, layout, offset, len, oset->truncate_size, rd->extents);
     return readx(rd, oset, onfinish);
   }
 
@@ -645,14 +657,14 @@ public:
                  bufferlist& bl, utime_t mtime, int flags,
 		 Mutex& wait_on_lock) {
     OSDWrite *wr = prepare_write(snapc, bl, mtime, flags);
-    Striper::file_to_extents(cct, oset->ino, layout, offset, len, wr->extents);
+    Striper::file_to_extents(cct, oset->ino, layout, offset, len, oset->truncate_size, wr->extents);
     return writex(wr, oset, wait_on_lock, NULL);
   }
 
   bool file_flush(ObjectSet *oset, ceph_file_layout *layout, const SnapContext& snapc,
                   loff_t offset, uint64_t len, Context *onfinish) {
     vector<ObjectExtent> extents;
-    Striper::file_to_extents(cct, oset->ino, layout, offset, len, extents);
+    Striper::file_to_extents(cct, oset->ino, layout, offset, len, oset->truncate_size, extents);
     return flush_set(oset, extents, onfinish);
   }
 };

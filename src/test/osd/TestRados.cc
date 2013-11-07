@@ -2,6 +2,7 @@
 #include "common/Mutex.h"
 #include "common/Cond.h"
 #include "common/errno.h"
+#include "common/version.h"
 
 #include <iostream>
 #include <sstream>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include "test/osd/RadosModel.h"
+
 
 using namespace std;
 
@@ -82,7 +84,7 @@ private:
 
   TestOp *gen_op(RadosTestContext &context, TestOpType type)
   {
-    string oid;
+    string oid, oid2;
     cout << "oids not in use " << context.oid_not_in_use.size() << std::endl;
     assert(context.oid_not_in_use.size());
     switch (type) {
@@ -150,6 +152,13 @@ private:
 	   << " current snap is " << context.current_snap << std::endl;
       return new WatchOp(&context, oid, m_stats);
 
+    case TEST_OP_COPY_FROM:
+      oid = *(rand_choose(context.oid_not_in_use));
+      oid2 = *(rand_choose(context.oid_not_in_use));
+      cout << "copy_from " << oid << " from " << oid2
+	   << " current snap is " << context.current_snap << std::endl;
+      return new CopyFromOp(&context, oid, oid2, m_stats);
+
     default:
       cerr << "Invalid op type " << type << std::endl;
       assert(0);
@@ -190,14 +199,18 @@ int main(int argc, char **argv)
     { TEST_OP_RMATTR, "rmattr" },
     { TEST_OP_TMAPPUT, "tmapput" },
     { TEST_OP_WATCH, "watch" },
+    { TEST_OP_COPY_FROM, "copy_from" },
     { TEST_OP_READ /* grr */, NULL },
   };
 
   map<TestOpType, unsigned int> op_weights;
+  string pool_name = "data";
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--max-ops") == 0)
       ops = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--pool") == 0)
+      pool_name = argv[++i];
     else if (strcmp(argv[i], "--max-seconds") == 0)
       max_seconds = atoi(argv[++i]);
     else if (strcmp(argv[i], "--objects") == 0)
@@ -236,11 +249,18 @@ int main(int argc, char **argv)
     }
   }
 
+  if (op_weights.empty()) {
+    cerr << "No operations specified" << std::endl;
+    //usage();
+    exit(1);
+  }
+
   if (min_stride_size < 0)
     min_stride_size = size / 10;
   if (max_stride_size < 0)
     max_stride_size = size / 5;
 
+  cout << pretty_version_to_str() << std::endl;
   cout << "Configuration:" << std::endl
        << "\tNumber of operations: " << ops << std::endl
        << "\tNumber of objects: " << objects << std::endl
@@ -268,7 +288,6 @@ int main(int argc, char **argv)
   }
 
   char *id = getenv("CEPH_CLIENT_ID");
-  string pool_name = "data";
   VarLenGenerator cont_gen(size, min_stride_size, max_stride_size);
   RadosTestContext context(pool_name, max_in_flight, cont_gen, id);
 

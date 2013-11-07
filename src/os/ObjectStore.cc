@@ -41,25 +41,6 @@ unsigned ObjectStore::apply_transactions(Sequencer *osr,
   return r;
 }
 
-template <class T>
-struct Wrapper : public Context {
-  Context *to_run;
-  T val;
-  Wrapper(Context *to_run, T val) : to_run(to_run), val(val) {}
-  void finish(int r) {
-    if (to_run)
-      to_run->complete(r);
-  }
-};
-struct RunOnDelete {
-  Context *to_run;
-  RunOnDelete(Context *to_run) : to_run(to_run) {}
-  ~RunOnDelete() {
-    if (to_run)
-      to_run->complete(0);
-  }
-};
-typedef std::tr1::shared_ptr<RunOnDelete> RunOnDeleteRef;
 int ObjectStore::queue_transactions(
   Sequencer *osr,
   list<Transaction*>& tls,
@@ -425,6 +406,7 @@ void ObjectStore::Transaction::dump(ceph::Formatter *f)
 	f->dump_stream("rem") << rem;
 	f->dump_stream("dest") << dest;
       }
+      break;
 
     case Transaction::OP_SPLIT_COLLECTION2:
       {
@@ -438,6 +420,22 @@ void ObjectStore::Transaction::dump(ceph::Formatter *f)
 	f->dump_stream("rem") << rem;
 	f->dump_stream("dest") << dest;
       }
+      break;
+
+    case Transaction::OP_OMAP_RMKEYRANGE:
+      {
+	coll_t cid(i.get_cid());
+	hobject_t oid = i.get_oid();
+	string first, last;
+	first = i.get_key();
+	last = i.get_key();
+	f->dump_string("op_name", "op_omap_rmkeyrange");
+	f->dump_stream("collection") << cid;
+	f->dump_stream("oid") << oid;
+	f->dump_string("first", first);
+	f->dump_string("last", last);
+      }
+      break;
 
     default:
       f->dump_string("op_name", "unknown");
@@ -462,9 +460,9 @@ void ObjectStore::Transaction::generate_test_instances(list<ObjectStore::Transac
   t = new Transaction;
   coll_t c("foocoll");
   coll_t c2("foocoll2");
-  hobject_t o1("obj", "", 123, 456, -1);
-  hobject_t o2("obj2", "", 123, 456, -1);
-  hobject_t o3("obj3", "", 123, 456, -1);
+  hobject_t o1("obj", "", 123, 456, -1, "");
+  hobject_t o2("obj2", "", 123, 456, -1, "");
+  hobject_t o3("obj3", "", 123, 456, -1, "");
   t->touch(c, o1);
   bufferlist bl;
   bl.append("some data");

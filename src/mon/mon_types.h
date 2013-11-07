@@ -16,6 +16,7 @@
 #define CEPH_MON_TYPES_H
 
 #include "include/utime.h"
+#include "common/Formatter.h"
 
 #define PAXOS_PGMAP      0  // before osd, for pg kick to behave
 #define PAXOS_MDSMAP     1
@@ -39,6 +40,52 @@ inline const char *get_paxos_name(int p) {
 
 #define CEPH_MON_ONDISK_MAGIC "ceph mon volume v012"
 
+/**
+ * leveldb store stats
+ *
+ * If we ever decide to support multiple backends for the monitor store,
+ * we should then create an abstract class 'MonitorStoreStats' of sorts
+ * and inherit it on LevelDBStoreStats.  I'm sure you'll figure something
+ * out.
+ */
+struct LevelDBStoreStats {
+  uint64_t bytes_total;
+  uint64_t bytes_sst;
+  uint64_t bytes_log;
+  uint64_t bytes_misc;
+  utime_t last_update;
+
+  void dump(Formatter *f) const {
+    assert(f != NULL);
+    f->dump_int("bytes_total", bytes_total);
+    f->dump_int("bytes_sst", bytes_sst);
+    f->dump_int("bytes_log", bytes_log);
+    f->dump_int("bytes_misc", bytes_misc);
+    f->dump_stream("last_updated") << last_update;
+  }
+
+  void encode(bufferlist &bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(bytes_total, bl);
+    ::encode(bytes_sst, bl);
+    ::encode(bytes_log, bl);
+    ::encode(bytes_misc, bl);
+    ::encode(last_update, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::iterator &p) {
+    DECODE_START(1, p);
+    ::decode(bytes_total, p);
+    ::decode(bytes_sst, p);
+    ::decode(bytes_log, p);
+    ::decode(bytes_misc, p);
+    ::decode(last_update, p);
+    DECODE_FINISH(p);
+  }
+};
+WRITE_CLASS_ENCODER(LevelDBStoreStats);
+
 // data stats
 
 struct DataStats {
@@ -49,13 +96,29 @@ struct DataStats {
   int latest_avail_percent;
   utime_t last_update;
 
+  LevelDBStoreStats store_stats;
+
+  void dump(Formatter *f) const {
+    assert(f != NULL);
+    f->dump_int("kb_total", kb_total);
+    f->dump_int("kb_used", kb_used);
+    f->dump_int("kb_avail", kb_avail);
+    f->dump_int("avail_percent", latest_avail_percent);
+    f->dump_stream("last_updated") << last_update;
+
+    f->open_object_section("store_stats");
+    store_stats.dump(f);
+    f->close_section();
+  }
+
   void encode(bufferlist &bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     ::encode(kb_total, bl);
     ::encode(kb_used, bl);
     ::encode(kb_avail, bl);
     ::encode(latest_avail_percent, bl);
     ::encode(last_update, bl);
+    ::encode(store_stats, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator &p) {
@@ -65,10 +128,55 @@ struct DataStats {
     ::decode(kb_avail, p);
     ::decode(latest_avail_percent, p);
     ::decode(last_update, p);
+    if (struct_v > 1)
+      ::decode(store_stats, p);
+
     DECODE_FINISH(p);
   }
 };
-
 WRITE_CLASS_ENCODER(DataStats);
+
+struct ScrubResult {
+  map<string,uint32_t> prefix_crc;  ///< prefix -> crc
+  map<string,uint64_t> prefix_keys; ///< prefix -> key count
+
+  bool operator!=(const ScrubResult& other) {
+    return prefix_crc != other.prefix_crc || prefix_keys != other.prefix_keys;
+  }
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(prefix_crc, bl);
+    ::encode(prefix_keys, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator& p) {
+    DECODE_START(1, p);
+    ::decode(prefix_crc, p);
+    ::decode(prefix_keys, p);
+    DECODE_FINISH(p);
+  }
+  void dump(Formatter *f) const {
+    f->open_object_section("crc");
+    for (map<string,uint32_t>::const_iterator p = prefix_crc.begin(); p != prefix_crc.end(); ++p)
+      f->dump_unsigned(p->first.c_str(), p->second);
+    f->close_section();
+    f->open_object_section("keys");
+    for (map<string,uint64_t>::const_iterator p = prefix_keys.begin(); p != prefix_keys.end(); ++p)
+      f->dump_unsigned(p->first.c_str(), p->second);
+    f->close_section();
+  }
+  static void generate_test_instances(list<ScrubResult*>& ls) {
+    ls.push_back(new ScrubResult);
+    ls.push_back(new ScrubResult);
+    ls.back()->prefix_crc["foo"] = 123;
+    ls.back()->prefix_keys["bar"] = 456;
+  }
+};
+WRITE_CLASS_ENCODER(ScrubResult);
+
+static inline ostream& operator<<(ostream& out, const ScrubResult& r) {
+  return out << "ScrubResult(keys " << r.prefix_keys << " crc " << r.prefix_crc << ")";
+}
 
 #endif

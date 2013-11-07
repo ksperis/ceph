@@ -11,12 +11,11 @@
  * Foundation.  See file COPYING.
  * 
  */
-
 #ifndef CEPH_TYPES_H
 #define CEPH_TYPES_H
 
 // this is needed for ceph_fs to compile in userland
-#include "inttypes.h"
+#include "int_types.h"
 #include "byteorder.h"
 
 #include "uuid.h"
@@ -271,8 +270,6 @@ typedef uint64_t tid_t;         // transaction id
 typedef uint64_t version_t;
 typedef __u32 epoch_t;       // map epoch  (32bits -> 13 epochs/second for 10 years)
 
-#define O_LAZY 01000000
-
 // --------------------------------------
 // identify individual mount clients by 64bit value
 
@@ -407,6 +404,29 @@ inline ostream& operator<<(ostream& out, const si_t& b)
   if (b.v > bump_after << 10)
     return out << (b.v >> 10) << "K";
   return out << b.v;
+}
+
+struct pretty_si_t {
+  uint64_t v;
+  pretty_si_t(uint64_t _v) : v(_v) {}
+};
+
+inline ostream& operator<<(ostream& out, const pretty_si_t& b)
+{
+  uint64_t bump_after = 100;
+  if (b.v > bump_after << 60)
+    return out << (b.v >> 60) << " E";
+  if (b.v > bump_after << 50)
+    return out << (b.v >> 50) << " P";
+  if (b.v > bump_after << 40)
+    return out << (b.v >> 40) << " T";
+  if (b.v > bump_after << 30)
+    return out << (b.v >> 30) << " G";
+  if (b.v > bump_after << 20)
+    return out << (b.v >> 20) << " M";
+  if (b.v > bump_after << 10)
+    return out << (b.v >> 10) << " K";
+  return out << b.v << " ";
 }
 
 struct kb_t {

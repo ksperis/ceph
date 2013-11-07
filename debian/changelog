@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ceph (0.61.2-1) precise; urgency=low
 
   * New upstream release 
@@ -9,6 +10,67 @@ ceph (0.61.1-1) precise; urgency=low
   * New upstream release 
 
  -- Gary Lowell <gary.lowell@inktank.com>  Wed, 08 May 2013 17:23:25 -0700
+=======
+ceph (0.68-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 03 Sep 2013 16:10:11 -0700
+
+ceph (0.67-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 13 Aug 2013 10:44:30 -0700
+
+ceph (0.67-rc3-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 30 Jul 2013 14:37:40 -0700
+
+ceph (0.67-rc2-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Wed, 24 Jul 2013 16:18:33 -0700
+
+ceph (0.67-rc1-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Mon, 22 Jul 2013 11:57:01 -0700
+
+ceph (0.66-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Mon, 08 Jul 2013 15:44:45 -0700
+
+ceph (0.65-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 25 Jun 2013 09:19:14 -0700
+
+ceph (0.64-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Wed, 12 Jun 2013 09:53:54 -0700
+
+ceph (0.63-1) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 28 May 2013 13:57:53 -0700
+
+ceph (0.62) precise; urgency=low
+
+  * New upstream release 
+
+ -- Gary Lowell <gary.lowell@inktank.com>  Tue, 14 May 2013 09:08:21 -0700
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 
 ceph (0.61-1) precise; urgency=low
 

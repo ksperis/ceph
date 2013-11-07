@@ -36,14 +36,18 @@
 #include "include/atomic.h"
 #include "SnapMapper.h"
 
+#include "PGLog.h"
 #include "OpRequest.h"
 #include "OSDMap.h"
 #include "os/ObjectStore.h"
 #include "msg/Messenger.h"
 #include "messages/MOSDRepScrub.h"
 #include "messages/MOSDPGLog.h"
+#include "common/cmdparse.h"
 #include "common/tracked_int_ptr.hpp"
 #include "common/WorkQueue.h"
+#include "common/ceph_context.h"
+#include "include/str_list.h"
 
 #include <list>
 #include <memory>
@@ -107,8 +111,34 @@ struct PGRecoveryStats {
 	  << i.total_time << "\t"
 	  << i.min_time << "\t" << i.max_time << "\t"
 	  << p->first << "\n";
-	       
     }
+  }
+
+  void dump_formatted(Formatter *f) {
+    Mutex::Locker l(lock);
+    f->open_array_section("pg_recovery_stats");
+    for (map<const char *,per_state_info>::iterator p = info.begin();
+	 p != info.end(); ++p) {
+      per_state_info& i = p->second;
+      f->open_object_section("recovery_state");
+      f->dump_int("enter", i.enter);
+      f->dump_int("exit", i.exit);
+      f->dump_int("events", i.events);
+      f->dump_stream("event_time") << i.event_time;
+      f->dump_stream("total_time") << i.total_time;
+      f->dump_stream("min_time") << i.min_time;
+      f->dump_stream("max_time") << i.max_time;
+      vector<string> states;
+      get_str_vec(p->first, "/", states);
+      f->open_array_section("nested_states");
+      for (vector<string>::iterator st = states.begin();
+	   st != states.end(); ++st) {
+	f->dump_string("state", *st);
+      }
+      f->close_section();
+      f->close_section();
+    }
+    f->close_section();
   }
 
   void log_enter(const char *s) {
@@ -155,21 +185,9 @@ struct PGPool {
 
 class PG {
 public:
-  /* Exceptions */
-  class read_log_error : public buffer::error {
-  public:
-    explicit read_log_error(const char *what) {
-      snprintf(buf, sizeof(buf), "read_log_error: %s", what);
-    }
-    const char *what() const throw () {
-      return buf;
-    }
-  private:
-    char buf[512];
-  };
-
   std::string gen_prefix() const;
 
+<<<<<<< HEAD
 
   /**
    * IndexLog - adds in-memory index of the log, by oid.
@@ -373,9 +391,12 @@ public:
 
 
 
+=======
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
   /*** PG ****/
 protected:
   OSDService *osd;
+  CephContext *cct;
   OSDriver osdriver;
   SnapMapper snap_mapper;
 public:
@@ -383,9 +404,27 @@ public:
     snap_mapper.update_bits(bits);
   }
 protected:
+  // Ops waiting for map, should be queued at back
+  Mutex map_lock;
+  list<OpRequestRef> waiting_for_map;
   OSDMapRef osdmap_ref;
   OSDMapRef last_persisted_osdmap_ref;
   PGPool pool;
+
+  void queue_op(OpRequestRef op);
+  void take_op_map_waiters();
+
+  void update_osdmap_ref(OSDMapRef newmap) {
+    assert(_lock.is_locked_by_me());
+    Mutex::Locker l(map_lock);
+    osdmap_ref = newmap;
+  }
+
+  OSDMapRef get_osdmap_with_maplock() const {
+    assert(map_lock.is_locked());
+    assert(osdmap_ref);
+    return osdmap_ref;
+  }
 
   OSDMapRef get_osdmap() const {
     assert(is_locked());
@@ -401,7 +440,6 @@ protected:
    * put_unlock() when done with the current pointer (_most common_).
    */  
   Mutex _lock;
-  Cond _cond;
   atomic_t ref;
 
 #ifdef PG_DEBUG_REFS
@@ -414,35 +452,21 @@ protected:
 public:
   bool deleting;  // true while in removing or OSD is shutting down
 
+
+  void lock_suspend_timeout(ThreadPool::TPHandle &handle);
   void lock(bool no_lockdep = false);
   void unlock() {
     //generic_dout(0) << this << " " << info.pgid << " unlock" << dendl;
     assert(!dirty_info);
     assert(!dirty_big_info);
-    assert(!dirty_log);
     _lock.Unlock();
   }
-
-  /* During handle_osd_map, the osd holds a write lock to the osdmap.
-   * *_with_map_lock_held assume that the map_lock is already held */
-  void lock_with_map_lock_held(bool no_lockdep = false);
-
-  // assert we still have lock held, and update our map ref
-  void reassert_lock_with_map_lock_held();
 
   void assert_locked() {
     assert(_lock.is_locked());
   }
   bool is_locked() const {
     return _lock.is_locked();
-  }
-  void wait() {
-    assert(_lock.is_locked());
-    _cond.Wait(_lock);
-  }
-  void kick() {
-    assert(_lock.is_locked());
-    _cond.Signal();
   }
 
 #ifdef PG_DEBUG_REFS
@@ -453,7 +477,7 @@ public:
   void get(const string &tag);
   void put(const string &tag);
 
-  bool dirty_info, dirty_big_info, dirty_log;
+  bool dirty_info, dirty_big_info;
 
 public:
   // pg state
@@ -468,7 +492,7 @@ public:
     const interval_set<snapid_t> &snapcolls);
 
   const coll_t coll;
-  IndexedLog  log;
+  PGLog  pg_log;
   static string get_info_key(pg_t pgid) {
     return stringify(pgid) + "_info";
   }
@@ -480,8 +504,6 @@ public:
   }
   hobject_t    log_oid;
   hobject_t    biginfo_oid;
-  OndiskLog   ondisklog;
-  pg_missing_t     missing;
   map<hobject_t, set<int> > missing_loc;
   set<int> missing_loc_sources;           // superset of missing_loc locations
   
@@ -521,8 +543,6 @@ public:
 
   // [primary only] content recovery state
  protected:
-  bool prior_set_built;
-
   struct PriorSet {
     set<int> probe; /// current+prior OSDs we need to probe.
     set<int> down;  /// down osds that would normally be in @a probe and might be interesting.
@@ -571,7 +591,9 @@ public:
     const char *state_name;
     utime_t enter_time;
     const char *get_state_name() { return state_name; }
-    NamedState() : state_name(0), enter_time(ceph_clock_now(g_ceph_context)) {}
+    NamedState(CephContext *cct_, const char *state_name_)
+      : state_name(state_name_),
+        enter_time(ceph_clock_now(cct_)) {};
     virtual ~NamedState() {}
   };
 
@@ -704,8 +726,6 @@ protected:
 
   // Ops waiting on backfill_pos to change
   list<OpRequestRef> waiting_for_backfill_pos;
-
-  list<OpRequestRef> waiting_for_map;
   list<OpRequestRef>            waiting_for_active;
   list<OpRequestRef>            waiting_for_all_missing;
   map<hobject_t, list<OpRequestRef> > waiting_for_missing_object,
@@ -790,16 +810,6 @@ public:
   bool proc_replica_info(int from, const pg_info_t &info);
   void remove_snap_mapped_object(
     ObjectStore::Transaction& t, const hobject_t& soid);
-  bool merge_old_entry(ObjectStore::Transaction& t, pg_log_entry_t& oe);
-
-  /**
-   * Merges authoratative log/info into current log/info/store
-   *
-   * @param [in,out] t used to delete obsolete objects
-   * @param [in,out] oinfo recieved authoritative info
-   * @param [in,out] olog recieved authoritative log
-   * @param [in] from peer which sent the information
-   */
   void merge_log(ObjectStore::Transaction& t, pg_info_t &oinfo, pg_log_t &olog, int from);
   void rewind_divergent_log(ObjectStore::Transaction& t, eversion_t newhead);
   bool search_for_missing(const pg_info_t &oinfo, const pg_missing_t *omissing,
@@ -828,15 +838,17 @@ public:
   void proc_primary_info(ObjectStore::Transaction &t, const pg_info_t &info);
 
   bool have_unfound() const { 
-    return missing.num_missing() > missing_loc.size();
+    return pg_log.get_missing().num_missing() > missing_loc.size();
   }
   int get_num_unfound() const {
-    return missing.num_missing() - missing_loc.size();
+    return pg_log.get_missing().num_missing() - missing_loc.size();
   }
 
-  virtual void clean_up_local(ObjectStore::Transaction& t) = 0;
+  virtual void check_local() = 0;
 
-  virtual int start_recovery_ops(int max, RecoveryCtx *prctx) = 0;
+  virtual int start_recovery_ops(
+    int max, RecoveryCtx *prctx,
+    ThreadPool::TPHandle &handle) = 0;
 
   void purge_strays();
 
@@ -849,7 +861,6 @@ public:
   void cancel_recovery();
   void clear_recovery_state();
   virtual void _clear_recovery_state() = 0;
-  void defer_recovery();
   virtual void check_recovery_sources(const OSDMapRef newmap) = 0;
   void start_recovery_op(const hobject_t& soid);
   void finish_recovery_op(const hobject_t& soid, bool dequeue=false);
@@ -1080,7 +1091,7 @@ public:
   void unreg_next_scrub();
 
   void replica_scrub(
-    class MOSDRepScrub *op,
+    struct MOSDRepScrub *op,
     ThreadPool::TPHandle &handle);
   void sub_op_scrub_map(OpRequestRef op);
   void sub_op_scrub_reserve(OpRequestRef op);
@@ -1215,6 +1226,15 @@ public:
       *out << "Activate from " << query_epoch;
     }
   };
+  struct RequestBackfillPrio : boost::statechart::event< RequestBackfillPrio > {
+    unsigned priority;
+    RequestBackfillPrio(unsigned prio) :
+              boost::statechart::event< RequestBackfillPrio >(),
+			  priority(prio) {}
+    void print(std::ostream *out) const {
+      *out << "RequestBackfillPrio: priority " << priority;
+    }
+  };
 #define TrivialEvent(T) struct T : boost::statechart::event< T > { \
     T() : boost::statechart::event< T >() {}			   \
     void print(std::ostream *out) const {			   \
@@ -1250,21 +1270,8 @@ public:
 
   /* Encapsulates PG recovery process */
   class RecoveryState {
-    void start_handle(RecoveryCtx *new_ctx) {
-      assert(!rctx);
-      rctx = new_ctx;
-      if (rctx)
-	rctx->start_time = ceph_clock_now(g_ceph_context);
-    }
-
-    void end_handle() {
-      if (rctx) {
-	utime_t dur = ceph_clock_now(g_ceph_context) - rctx->start_time;
-	machine.event_time += dur;
-      }
-      machine.event_count++;
-      rctx = 0;
-    }
+    void start_handle(RecoveryCtx *new_ctx);
+    void end_handle();
 
     /* States */
     struct Initial;
@@ -1618,11 +1625,12 @@ public:
 
     struct RepNotRecovering : boost::statechart::state< RepNotRecovering, ReplicaActive>, NamedState {
       typedef boost::mpl::list<
-	boost::statechart::transition< RequestBackfill, RepWaitBackfillReserved >,
+	boost::statechart::custom_reaction< RequestBackfillPrio >,
         boost::statechart::transition< RequestRecovery, RepWaitRecoveryReserved >,
 	boost::statechart::transition< RecoveryDone, RepNotRecovering >  // for compat with pre-reservation peers
 	> reactions;
       RepNotRecovering(my_context ctx);
+      boost::statechart::result react(const RequestBackfillPrio &evt);
       void exit();
     };
 
@@ -1858,46 +1866,34 @@ public:
 
   bool  is_empty() const { return info.last_update == eversion_t(0,0); }
 
-  void init(int role, vector<int>& up, vector<int>& acting, pg_history_t& history,
-	    pg_interval_map_t& pim, ObjectStore::Transaction *t);
+  void init(
+    int role,
+    vector<int>& up,
+    vector<int>& acting,
+    pg_history_t& history,
+    pg_interval_map_t& pim,
+    bool backfill,
+    ObjectStore::Transaction *t);
 
   // pg on-disk state
   void do_pending_flush();
 
 private:
   void write_info(ObjectStore::Transaction& t);
-  void write_log(ObjectStore::Transaction& t);
 
 public:
-  static void clear_info_log(
-    pg_t pgid,
-    const hobject_t &infos_oid,
-    const hobject_t &log_oid,
-    ObjectStore::Transaction *t);
-
   static int _write_info(ObjectStore::Transaction& t, epoch_t epoch,
     pg_info_t &info, coll_t coll,
     map<epoch_t,pg_interval_t> &past_intervals,
     interval_set<snapid_t> &snap_collections,
     hobject_t &infos_oid,
     __u8 info_struct_v, bool dirty_big_info, bool force_ver = false);
-  static void _write_log(ObjectStore::Transaction& t, pg_log_t &log,
-    const hobject_t &log_oid, map<eversion_t, hobject_t> &divergent_priors);
   void write_if_dirty(ObjectStore::Transaction& t);
 
   void add_log_entry(pg_log_entry_t& e, bufferlist& log_bl);
   void append_log(
     vector<pg_log_entry_t>& logv, eversion_t trim_to, ObjectStore::Transaction &t);
-
-  /// return true if the log should be rewritten
-  static bool read_log(ObjectStore *store, coll_t coll, hobject_t log_oid,
-    const pg_info_t &info, OndiskLog &ondisklog, IndexedLog &log,
-    pg_missing_t &missing, ostringstream &oss, const PG *passedpg = NULL);
-  static void read_log_old(ObjectStore *store, coll_t coll, hobject_t log_oid,
-    const pg_info_t &info, OndiskLog &ondisklog, IndexedLog &log,
-    pg_missing_t &missing, ostringstream &oss, const PG *passedpg = NULL);
   bool check_log_for_corruption(ObjectStore *store);
-  void trim(ObjectStore::Transaction& t, eversion_t v);
   void trim_peers();
 
   std::string get_corrupt_pg_log_name() const;
@@ -1927,7 +1923,8 @@ public:
 
   void start_peering_interval(const OSDMapRef lastmap,
 			      const vector<int>& newup,
-			      const vector<int>& newacting);
+			      const vector<int>& newacting,
+			      ObjectStore::Transaction *t);
   void start_flush(ObjectStore::Transaction *t,
 		   list<Context *> *on_applied,
 		   list<Context *> *on_safe);
@@ -1947,17 +1944,22 @@ public:
   // OpRequest queueing
   bool can_discard_op(OpRequestRef op);
   bool can_discard_scan(OpRequestRef op);
-  bool can_discard_subop(OpRequestRef op);
   bool can_discard_backfill(OpRequestRef op);
   bool can_discard_request(OpRequestRef op);
 
-  bool must_delay_request(OpRequestRef op);
+  template<typename T, int MSGTYPE>
+  bool can_discard_replica_op(OpRequestRef op);
+
+  static bool op_must_wait_for_map(OSDMapRef curmap, OpRequestRef op);
 
   static bool split_request(OpRequestRef op, unsigned match, unsigned bits);
 
   bool old_peering_msg(epoch_t reply_epoch, epoch_t query_epoch);
   bool old_peering_evt(CephPeeringEvtRef evt) {
     return old_peering_msg(evt->get_epoch_sent(), evt->get_epoch_requested());
+  }
+  static bool have_same_or_newer_map(OSDMapRef osdmap, epoch_t e) {
+    return e <= osdmap->get_epoch();
   }
   bool have_same_or_newer_map(epoch_t e) {
     return e <= get_osdmap()->get_epoch();
@@ -1992,16 +1994,25 @@ public:
 
 
   // abstract bits
-  void do_request(OpRequestRef op);
+  void do_request(
+    OpRequestRef op,
+    ThreadPool::TPHandle &handle
+  );
 
   virtual void do_op(OpRequestRef op) = 0;
   virtual void do_sub_op(OpRequestRef op) = 0;
   virtual void do_sub_op_reply(OpRequestRef op) = 0;
-  virtual void do_scan(OpRequestRef op) = 0;
+  virtual void do_scan(
+    OpRequestRef op,
+    ThreadPool::TPHandle &handle
+  ) = 0;
   virtual void do_backfill(OpRequestRef op) = 0;
+  virtual void do_push(OpRequestRef op) = 0;
+  virtual void do_pull(OpRequestRef op) = 0;
+  virtual void do_push_reply(OpRequestRef op) = 0;
   virtual void snap_trimmer() = 0;
 
-  virtual int do_command(vector<string>& cmd, ostream& ss,
+  virtual int do_command(cmdmap_t cmdmap, ostream& ss,
 			 bufferlist& idata, bufferlist& odata) = 0;
 
   virtual bool same_for_read_since(epoch_t e) = 0;
@@ -2009,13 +2020,13 @@ public:
   virtual bool same_for_rep_modify_since(epoch_t e) = 0;
 
   virtual void on_role_change() = 0;
-  virtual void on_change() = 0;
+  virtual void on_change(ObjectStore::Transaction *t) = 0;
   virtual void on_activate() = 0;
   virtual void on_flushed() = 0;
   virtual void on_shutdown() = 0;
+  virtual void check_blacklisted_watchers() = 0;
+  virtual void get_watchers(std::list<obj_watch_item_t>&) = 0;
 };
-
-WRITE_CLASS_ENCODER(PG::OndiskLog)
 
 ostream& operator<<(ostream& out, const PG& pg);
 

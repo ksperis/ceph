@@ -40,6 +40,12 @@
 #include "rgw_rest_usage.h"
 #include "rgw_rest_user.h"
 #include "rgw_rest_bucket.h"
+#include "rgw_rest_metadata.h"
+#include "rgw_rest_log.h"
+#include "rgw_rest_opstate.h"
+#include "rgw_replica_log.h"
+#include "rgw_rest_replica_log.h"
+#include "rgw_rest_config.h"
 #include "rgw_swift_auth.h"
 #include "rgw_swift.h"
 #include "rgw_log.h"
@@ -59,9 +65,7 @@
 
 using namespace std;
 
-static sighandler_t sighandler_usr1;
 static sighandler_t sighandler_alrm;
-static sighandler_t sighandler_term;
 
 class RGWProcess;
 
@@ -109,10 +113,10 @@ struct RGWRequest
   }
 
   void log(struct req_state *s, const char *msg) {
-    if (s->method && req_str.size() == 0) {
-      req_str = s->method;
+    if (s->info.method && req_str.size() == 0) {
+      req_str = s->info.method;
       req_str.append(" ");
-      req_str.append(s->request_uri);
+      req_str.append(s->info.request_uri);
     }
     utime_t t = ceph_clock_now(g_ceph_context) - ts;
     dout(2) << "req " << id << ":" << t << ":" << s->dialect << ":" << req_str << ":" << (op ? op->name() : "") << ":" << msg << dendl;
@@ -253,17 +257,31 @@ void RGWProcess::run()
     req_wq.queue(req);
   }
 
+  m_tp.drain();
   m_tp.stop();
 }
 
-static void godown_handler(int signum)
+static void handle_sigterm(int signum)
 {
+  dout(1) << __func__ << dendl;
   FCGX_ShutdownPending();
+
+  // close the fd, so that accept can't start again.
   pprocess->close_fd();
-  signal(signum, sighandler_usr1);
-  uint64_t secs = g_ceph_context->_conf->rgw_exit_timeout_secs;
-  if (secs)
-    alarm(secs);
+
+  // send a signal to make fcgi's accept(2) wake up.  unfortunately the
+  // initial signal often isn't sufficient because we race with accept's
+  // check of the flag wet by ShutdownPending() above.
+  if (signum != SIGUSR1) {
+    kill(getpid(), SIGUSR1);
+
+    // safety net in case we get stuck doing an orderly shutdown.
+    uint64_t secs = g_ceph_context->_conf->rgw_exit_timeout_secs;
+    if (secs)
+      alarm(secs);
+    dout(1) << __func__ << " set alarm for " << secs << dendl;
+  }
+
 }
 
 static void godown_alarm(int signum)
@@ -295,20 +313,26 @@ void RGWProcess::handle_request(RGWRequest *req)
   s->obj_ctx = store->create_context(s);
   store->set_intent_cb(s->obj_ctx, call_log_intent);
 
+  s->req_id = store->unique_id(req->id);
+
   req->log(s, "initializing");
 
   RGWOp *op = NULL;
   int init_error = 0;
-  RGWHandler *handler = rest->get_handler(store, s, &client_io, &init_error);
+  bool should_log = false;
+  RGWRESTMgr *mgr;
+  RGWHandler *handler = rest->get_handler(store, s, &client_io, &mgr, &init_error);
   if (init_error != 0) {
-    abort_early(s, init_error);
+    abort_early(s, NULL, init_error);
     goto done;
   }
+
+  should_log = mgr->get_logging();
 
   req->log(s, "getting op");
   op = handler->get_op(store);
   if (!op) {
-    abort_early(s, -ERR_METHOD_NOT_ALLOWED);
+    abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED);
     goto done;
   }
   req->op = op;
@@ -317,36 +341,44 @@ void RGWProcess::handle_request(RGWRequest *req)
   ret = handler->authorize();
   if (ret < 0) {
     dout(10) << "failed to authorize request" << dendl;
-    abort_early(s, ret);
+    abort_early(s, op, ret);
     goto done;
   }
 
   if (s->user.suspended) {
     dout(10) << "user is suspended, uid=" << s->user.user_id << dendl;
-    abort_early(s, -ERR_USER_SUSPENDED);
+    abort_early(s, op, -ERR_USER_SUSPENDED);
     goto done;
   }
   req->log(s, "reading permissions");
   ret = handler->read_permissions(op);
   if (ret < 0) {
-    abort_early(s, ret);
+    abort_early(s, op, ret);
     goto done;
   }
 
-  req->log(s, "reading the cors attr");
-  handler->read_cors_config();
-  
+  req->log(s, "verifying op mask");
+  ret = op->verify_op_mask();
+  if (ret < 0) {
+    abort_early(s, op, ret);
+    goto done;
+  }
+
   req->log(s, "verifying op permissions");
   ret = op->verify_permission();
   if (ret < 0) {
-    abort_early(s, ret);
-    goto done;
+    if (s->system_request) {
+      dout(2) << "overriding permissions due to system operation" << dendl;
+    } else {
+      abort_early(s, op, ret);
+      goto done;
+    }
   }
 
   req->log(s, "verifying op params");
   ret = op->verify_params();
   if (ret < 0) {
-    abort_early(s, ret);
+    abort_early(s, op, ret);
     goto done;
   }
 
@@ -357,7 +389,9 @@ void RGWProcess::handle_request(RGWRequest *req)
   op->execute();
   op->complete();
 done:
-  rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+  if (should_log) {
+    rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+  }
 
   int http_ret = s->err.http_ret;
 
@@ -373,6 +407,18 @@ done:
   delete req;
 }
 
+#ifdef HAVE_CURL_MULTI_WAIT
+static void check_curl()
+{
+}
+#else
+static void check_curl()
+{
+  derr << "WARNING: libcurl doesn't support curl_multi_wait()" << dendl;
+  derr << "WARNING: cross zone / region transfer performance may be affected" << dendl;
+}
+#endif
+
 class C_InitTimeout : public Context {
 public:
   C_InitTimeout() {}
@@ -381,6 +427,22 @@ public:
     exit(1);
   }
 };
+
+int usage()
+{
+  cerr << "usage: radosgw [options...]" << std::endl;
+  cerr << "options:\n";
+  cerr << "   --rgw-region=<region>     region in which radosgw runs\n";
+  cerr << "   --rgw-zone=<zone>         zone in which radosgw runs\n";
+  generic_server_usage();
+  return 0;
+}
+
+static RGWRESTMgr *set_logging(RGWRESTMgr *mgr)
+{
+  mgr->set_logging(true);
+  return mgr;
+}
 
 /*
  * start up the RADOS connection and then handle HTTP messages as they come in
@@ -409,6 +471,15 @@ int main(int argc, const char **argv)
   global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
 	      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
+  for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ++i) {
+    if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
+      usage();
+      return 0;
+    }
+  }
+
+  check_curl();
+
   if (g_conf->daemonize) {
     if (g_conf->rgw_socket_path.empty() and g_conf->rgw_port.empty()) {
       cerr << "radosgw: must specify 'rgw socket path' or 'rgw port' to run as a daemon" << std::endl;
@@ -433,16 +504,7 @@ int main(int argc, const char **argv)
   
   curl_global_init(CURL_GLOBAL_ALL);
   
-  sighandler_usr1 = signal(SIGUSR1, godown_handler);
-  sighandler_alrm = signal(SIGALRM, godown_alarm);
-  
-  init_async_signal_handler();
-  register_async_signal_handler(SIGHUP, sighup_handler);
-
   FCGX_Init();
-
-  sighandler_term = signal(SIGTERM, godown_alarm);
-  
 
   int r = 0;
   RGWRados *store = RGWStoreManager::get_storage(g_ceph_context, true);
@@ -461,6 +523,8 @@ int main(int argc, const char **argv)
   if (r) 
     return 1;
 
+  rgw_user_init(store->meta_mgr);
+  rgw_bucket_init(store->meta_mgr);
   rgw_log_usage_init(g_ceph_context, store);
 
   RGWREST rest;
@@ -476,22 +540,29 @@ int main(int argc, const char **argv)
   }
 
   if (apis_map.count("s3") > 0)
-    rest.register_default_mgr(new RGWRESTMgr_S3);
+    rest.register_default_mgr(set_logging(new RGWRESTMgr_S3));
 
   if (apis_map.count("swift") > 0) {
     do_swift = true;
     swift_init(g_ceph_context);
-    rest.register_resource(g_conf->rgw_swift_url_prefix, new RGWRESTMgr_SWIFT);
+    rest.register_resource(g_conf->rgw_swift_url_prefix, set_logging(new RGWRESTMgr_SWIFT));
   }
 
   if (apis_map.count("swift_auth") > 0)
-    rest.register_resource(g_conf->rgw_swift_auth_entry, new RGWRESTMgr_SWIFT_Auth);
+    rest.register_resource(g_conf->rgw_swift_auth_entry, set_logging(new RGWRESTMgr_SWIFT_Auth));
 
   if (apis_map.count("admin") > 0) {
     RGWRESTMgr_Admin *admin_resource = new RGWRESTMgr_Admin;
     admin_resource->register_resource("usage", new RGWRESTMgr_Usage);
     admin_resource->register_resource("user", new RGWRESTMgr_User);
     admin_resource->register_resource("bucket", new RGWRESTMgr_Bucket);
+  
+    /*Registering resource for /admin/metadata */
+    admin_resource->register_resource("metadata", new RGWRESTMgr_Metadata);
+    admin_resource->register_resource("log", new RGWRESTMgr_Log);
+    admin_resource->register_resource("opstate", new RGWRESTMgr_Opstate);
+    admin_resource->register_resource("replica_log", new RGWRESTMgr_ReplicaLog);
+    admin_resource->register_resource("config", new RGWRESTMgr_Config);
     rest.register_resource(g_conf->rgw_admin_entry, admin_resource);
   }
 
@@ -504,7 +575,22 @@ int main(int argc, const char **argv)
 
   pprocess = new RGWProcess(g_ceph_context, store, olog, g_conf->rgw_thread_pool_size, &rest);
 
+  init_async_signal_handler();
+  register_async_signal_handler(SIGHUP, sighup_handler);
+  register_async_signal_handler(SIGTERM, handle_sigterm);
+  register_async_signal_handler(SIGINT, handle_sigterm);
+  register_async_signal_handler(SIGUSR1, handle_sigterm);
+
+  sighandler_alrm = signal(SIGALRM, godown_alarm);
+
   pprocess->run();
+  derr << "shutting down" << dendl;
+
+  unregister_async_signal_handler(SIGHUP, sighup_handler);
+  unregister_async_signal_handler(SIGTERM, handle_sigterm);
+  unregister_async_signal_handler(SIGINT, handle_sigterm);
+  unregister_async_signal_handler(SIGUSR1, handle_sigterm);
+  shutdown_async_signal_handler();
 
   delete pprocess;
 
@@ -518,15 +604,14 @@ int main(int argc, const char **argv)
 
   rgw_perf_stop(g_ceph_context);
 
-  unregister_async_signal_handler(SIGHUP, sighup_handler);
-
   RGWStoreManager::close_storage(store);
 
   rgw_tools_cleanup();
+  rgw_shutdown_resolver();
   curl_global_cleanup();
-  g_ceph_context->put();
 
-  shutdown_async_signal_handler();
+  dout(1) << "final shutdown" << dendl;
+  g_ceph_context->put();
 
   ceph::crypto::shutdown();
 

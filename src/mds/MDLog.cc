@@ -173,8 +173,7 @@ void MDLog::submit_entry(LogEvent *le, Context *c)
   if (!g_conf->mds_log) {
     // hack: log is disabled.
     if (c) {
-      c->finish(0);
-      delete c;
+      c->complete(0);
     }
     return;
   }
@@ -245,8 +244,7 @@ void MDLog::wait_for_safe(Context *c)
     journaler->wait_for_flush(c);
   } else {
     // hack: bypass.
-    c->finish(0);
-    delete c;
+    c->complete(0);
   }
 }
 
@@ -269,16 +267,19 @@ void MDLog::cap()
 
 void MDLog::start_new_segment(Context *onsync)
 {
-  dout(7) << "start_new_segment at " << journaler->get_write_pos() << dendl;
-
-  segments[journaler->get_write_pos()] = new LogSegment(journaler->get_write_pos());
-
-  ESubtreeMap *le = mds->mdcache->create_subtree_map();
-  submit_entry(le);
+  prepare_new_segment();
+  journal_segment_subtree_map();
   if (onsync) {
-    wait_for_safe(onsync);  
+    wait_for_safe(onsync);
     flush();
   }
+}
+
+void MDLog::prepare_new_segment()
+{
+  dout(7) << __func__ << " at " << journaler->get_write_pos() << dendl;
+
+  segments[journaler->get_write_pos()] = new LogSegment(journaler->get_write_pos());
 
   logger->inc(l_mdl_segadd);
   logger->set(l_mdl_seg, segments.size());
@@ -287,6 +288,12 @@ void MDLog::start_new_segment(Context *onsync)
   dout(10) << "Advancing to next stray directory on mds " << mds->get_nodeid() 
 	   << dendl;
   mds->mdcache->advance_stray();
+}
+
+void MDLog::journal_segment_subtree_map()
+{
+  dout(7) << __func__ << dendl;
+  submit_entry(mds->mdcache->create_subtree_map());
 }
 
 void MDLog::trim(int m)
@@ -442,8 +449,7 @@ void MDLog::replay(Context *c)
   if (journaler->get_read_pos() == journaler->get_write_pos()) {
     dout(10) << "replay - journal empty, done." << dendl;
     if (c) {
-      c->finish(0);
-      delete c;
+      c->complete(0);
     }
     return;
   }
@@ -610,19 +616,21 @@ void MDLog::standby_trim_segments()
   dout(10) << "standby_trim_segments" << dendl;
   uint64_t expire_pos = journaler->get_expire_pos();
   dout(10) << " expire_pos=" << expire_pos << dendl;
-  LogSegment *seg = NULL;
   bool removed_segment = false;
-  while ((seg = get_oldest_segment())->end <= expire_pos) {
+  while (have_any_segments()) {
+    LogSegment *seg = get_oldest_segment();
+    if (seg->end > expire_pos)
+      break;
     dout(10) << " removing segment " << seg->offset << dendl;
     seg->dirty_dirfrags.clear_list();
     seg->new_dirfrags.clear_list();
     seg->dirty_inodes.clear_list();
     seg->dirty_dentries.clear_list();
     seg->open_files.clear_list();
+    seg->dirty_parent_inodes.clear_list();
     seg->dirty_dirfrag_dir.clear_list();
     seg->dirty_dirfrag_nest.clear_list();
     seg->dirty_dirfrag_dirfragtree.clear_list();
-    seg->update_backtraces.clear_list();
     remove_oldest_segment();
     removed_segment = true;
   }

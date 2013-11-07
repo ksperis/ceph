@@ -131,7 +131,7 @@ class Paxos;
  * This libary is based on the Paxos algorithm, but varies in a few key ways:
  *  1- Only a single new value is generated at a time, simplifying the recovery logic.
  *  2- Nodes track "committed" values, and share them generously (and trustingly)
- *  3- A 'leasing' mechism is built-in, allowing nodes to determine when it is 
+ *  3- A 'leasing' mechanism is built-in, allowing nodes to determine when it is 
  *     safe to "read" their copy of the last committed value.
  *
  * This provides a simple replication substrate that services can be built on top of.
@@ -163,24 +163,24 @@ public:
    * @defgroup Paxos_h_states States on which the leader/peon may be.
    * @{
    */
-  /**
-   * Leader/Peon is in Paxos' Recovery state
-   */
-  const static int STATE_RECOVERING = 0x01;
-  /**
-   * Leader/Peon is idle, and the Peon may or may not have a valid lease.
-   */
-  const static int STATE_ACTIVE     = 0x02;
-  /**
-   * Leader/Peon is updating to a new value.
-   */
-  const static int STATE_UPDATING   = 0x04;
-  /**
-   * Leader is about to propose a new value, but hasn't gotten to do it yet.
-   */
-  const static int STATE_PREPARING  = 0x08;
-
-  const static int STATE_LOCKED     = 0x10;
+  enum {
+    /**
+     * Leader/Peon is in Paxos' Recovery state
+     */
+    STATE_RECOVERING,
+    /**
+     * Leader/Peon is idle, and the Peon may or may not have a valid lease.
+     */
+    STATE_ACTIVE,
+    /**
+     * Leader/Peon is updating to a new value.
+     */
+    STATE_UPDATING,
+    /*
+     * Leader proposing an old value
+     */
+    STATE_UPDATING_PREVIOUS,
+  };
 
   /**
    * Obtain state name from constant value.
@@ -192,26 +192,18 @@ public:
    * @return The state's name.
    */
   static const string get_statename(int s) {
-    stringstream ss;
-    if (s & STATE_RECOVERING) {
-      ss << "recovering";
-      assert(!(s & ~(STATE_RECOVERING|STATE_LOCKED)));
-    } else if (s & STATE_ACTIVE) {
-      ss << "active";
-      assert(s == STATE_ACTIVE);
-    } else if (s & STATE_UPDATING) {
-      ss << "updating";
-      assert(!(s & ~(STATE_UPDATING|STATE_LOCKED)));
-    } else if (s & STATE_PREPARING) {
-      ss << "preparing update";
-      assert(!(s & ~(STATE_PREPARING|STATE_LOCKED)));
-    } else {
-      assert(0 == "We shouldn't have gotten here!");
+    switch (s) {
+    case STATE_RECOVERING:
+      return "recovering";
+    case STATE_ACTIVE:
+      return "active";
+    case STATE_UPDATING:
+      return "updating";
+    case STATE_UPDATING_PREVIOUS:
+      return "updating-previous";
+    default:
+      return "UNKNOWN";
     }
-
-    if (s & STATE_LOCKED)
-      ss << " (locked)";
-    return ss.str();
   }
 
 private:
@@ -241,10 +233,13 @@ public:
    *
    * @return 'true' if we are on the Updating state; 'false' otherwise.
    */
-  bool is_updating() const { return (state & STATE_UPDATING); }
+  bool is_updating() const { return state == STATE_UPDATING; }
 
-  bool is_preparing() const { return (state & STATE_PREPARING); }
-  bool is_locked() const { return (state & STATE_LOCKED); }
+  /**
+   * Check if we are updating/proposing a previous value from a
+   * previous quorum
+   */
+  bool is_updating_previous() const { return state == STATE_UPDATING_PREVIOUS; }
 
 private:
   /**
@@ -295,8 +290,9 @@ private:
    */
   version_t accepted_pn;
   /**
-   * @todo This has something to do with the last_committed version. Not sure
-   *	   about what it entails, tbh.
+   * The last_committed epoch of the leader at the time we accepted the last pn.
+   *
+   * This has NO SEMANTIC MEANING, and is there only for the debug output.
    */
   version_t accepted_pn_from;
   /**
@@ -329,8 +325,7 @@ private:
    *
    * Instead of performing a full commit each time a read is requested, we
    * keep leases. Each lease will have an expiration date, which may or may
-   * not be extended. This member variable will keep when is the lease 
-   * expiring.
+   * not be extended. 
    */
   utime_t lease_expire;
   /**
@@ -534,13 +529,7 @@ private:
    * Should be true if we have proposed to trim, or are in the middle of
    * trimming; false otherwise.
    */
-  bool going_to_trim;
-  /**
-   * If we have disabled trimming our state, this variable should have a
-   * value greater than zero, corresponding to the version we had at the time
-   * we disabled the trim.
-   */
-  version_t trim_disabled_version;
+  bool trimming;
 
   /**
    * @defgroup Paxos_h_callbacks Callback classes.
@@ -621,7 +610,7 @@ private:
   public:
     C_Trimmed(Paxos *p) : paxos(p) { }
     void finish(int r) {
-      paxos->going_to_trim = false;
+      paxos->trimming = false;
     }
   };
   /**
@@ -956,6 +945,9 @@ private:
    */
   void lease_timeout();        // on peon, if lease isn't extended
 
+  /// restart the lease timeout timer
+  void reset_lease_timeout();
+
   /**
    * Cancel all of Paxos' timeout/renew events. 
    */
@@ -991,8 +983,19 @@ private:
    * Begin proposing the Proposal at the front of the proposals queue.
    */
   void propose_queued();
-  void finish_queued_proposal();
-  void finish_proposal();
+
+  /**
+   * refresh state from store
+   *
+   * Called when we have new state for the mon to consume.  If we return false,
+   * abort (we triggered a bootstrap).
+   *
+   * @returns true on success, false if we are now bootstrapping
+   */
+  bool do_refresh();
+
+  void commit_proposal();
+  void finish_round();
 
 public:
   /**
@@ -1016,8 +1019,12 @@ public:
 		   lease_timeout_event(0),
 		   accept_timeout_event(0),
 		   clock_drift_warned(0),
+<<<<<<< HEAD
 		   going_to_trim(false),
 		   trim_disabled_version(0) { }
+=======
+		   trimming(false) { }
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 
   const string get_name() const {
     return paxos_name;
@@ -1025,10 +1032,15 @@ public:
 
   void dispatch(PaxosServiceMessage *m);
 
-  void reapply_all_versions();
-  void apply_version(MonitorDBStore::Transaction &tx, version_t v);
+  void read_and_prepare_transactions(MonitorDBStore::Transaction *tx, version_t from, version_t last);
 
   void init();
+
+  /**
+   * dump state info to a formatter
+   */
+  void dump_info(Formatter *f);
+
   /**
    * This function runs basic consistency checks. Importantly, if
    * it is inconsistent and shouldn't be, it asserts out.
@@ -1083,12 +1095,20 @@ public:
    * onto paxos-related keys), and then we will decode those same bufferlists
    * we just wrote and apply the transactions they hold. We will also update
    * our first and last committed values to point to the new values, if need
-   * be. All all this is done tightly wrapped in a transaction to ensure we
+   * be. All this is done tightly wrapped in a transaction to ensure we
    * enjoy the atomicity guarantees given by our awesome k/v store.
    *
    * @param m A message
+   * @returns true if we stored something new; false otherwise
    */
-  void store_state(MMonPaxos *m);
+  bool store_state(MMonPaxos *m);
+  void _sanity_check_store();
+
+  /**
+   * remove legacy paxos versions from before conversion
+   */
+  void remove_legacy_versions();
+
   /**
    * Helper function to decode a bufferlist into a transaction and append it
    * to another transaction.
@@ -1100,7 +1120,7 @@ public:
    * @param t The transaction to which we will append the operations
    * @param bl A bufferlist containing an encoded transaction
    */
-  void decode_append_transaction(MonitorDBStore::Transaction& t,
+  static void decode_append_transaction(MonitorDBStore::Transaction& t,
 				 bufferlist& bl) {
     MonitorDBStore::Transaction vt;
     bufferlist::iterator it = bl.begin();
@@ -1128,55 +1148,10 @@ public:
   }
 
   /**
-   * Erase old states from stable storage.
-   *
-   * @param first The version we are trimming to
-   */
-  void trim_to(version_t first);
-  /**
-   * Erase old states from stable storage.
-   *
-   * @param t A transaction
-   * @param first The version we are trimming to
-   */
-  void trim_to(MonitorDBStore::Transaction *t, version_t first);
-  /**
-   * Auxiliary function to erase states in the interval [from, to[ from stable
-   * storage.
-   *
-   * @param t A transaction
-   * @param from Bottom limit of the interval of versions to erase
-   * @param to Upper limit, not including, of the interval of versions to erase
-   */
-  void trim_to(MonitorDBStore::Transaction *t, version_t from, version_t to);
-  /**
    * Trim the Paxos state as much as we can.
    */
-  void trim() {
-    assert(should_trim());
-    version_t trim_to_version = get_version() - g_conf->paxos_max_join_drift;
-    trim_to(trim_to_version);
-  }
-  /**
-   * Disable trimming
-   *
-   * This is required by the Monitor's store synchronization mechanisms
-   * to guarantee a consistent store state.
-   */
-  void trim_disable() {
-    if (!trim_disabled_version)
-      trim_disabled_version = get_version();
-  }
-  /**
-   * Enable trimming
-   */
-  void trim_enable();
-  /**
-   * Check if trimming has been disabled
-   *
-   * @returns true if trim has been disabled; false otherwise.
-   */
-  bool is_trim_disabled() { return (trim_disabled_version > 0); }
+  void trim();
+
   /**
    * Check if we should trim.
    *
@@ -1186,18 +1161,12 @@ public:
    * @returns true if we should trim; false otherwise.
    */
   bool should_trim() {
-    int available_versions = (get_version() - get_first_committed());
-    int maximum_versions =
-      (g_conf->paxos_max_join_drift + g_conf->paxos_trim_tolerance);
+    int available_versions = get_version() - get_first_committed();
+    int maximum_versions = g_conf->paxos_min + g_conf->paxos_trim_min;
 
-    if (going_to_trim || (available_versions <= maximum_versions))
+    if (trimming || (available_versions <= maximum_versions))
       return false;
 
-    if (trim_disabled_version > 0) {
-      int disabled_versions = (get_version() - trim_disabled_version);
-      if (disabled_versions < g_conf->paxos_trim_disabled_max_versions)
-	return false;
-    }
     return true;
   }
  

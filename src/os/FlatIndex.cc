@@ -99,9 +99,8 @@ static void build_filename(char *filename, int len, const char *old_filename, in
 
   hash_filename(old_filename, hash, sizeof(hash));
   int ofs = FILENAME_PREFIX_LEN;
-  int suffix_len;
   while (1) {
-    suffix_len = sprintf(filename + ofs, "_%s_%d_" FILENAME_COOKIE, hash, i);
+    int suffix_len = sprintf(filename + ofs, "_%s_%d_" FILENAME_COOKIE, hash, i);
     if (ofs + suffix_len <= FILENAME_SHORT_LEN || !ofs)
       break;
     ofs--;
@@ -388,7 +387,8 @@ int FlatIndex::collection_list_partial(const hobject_t &start,
 }
 
 int FlatIndex::collection_list(vector<hobject_t> *ls) {
-  char dir_name[PATH_MAX], buf[PATH_MAX], new_name[PATH_MAX];
+  char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
+  char dir_name[PATH_MAX], new_name[PATH_MAX];
   strncpy(dir_name, base_path.c_str(), sizeof(dir_name));
   dir_name[sizeof(dir_name)-1]='\0';
 
@@ -400,7 +400,7 @@ int FlatIndex::collection_list(vector<hobject_t> *ls) {
   vector< pair<ino_t,hobject_t> > inolist;
 
   struct dirent *de;
-  while (::readdir_r(dir, (struct dirent*)buf, &de) == 0) {
+  while (::readdir_r(dir, (struct dirent *)buf, &de) == 0) {
     if (!de)
       break;
     // parse

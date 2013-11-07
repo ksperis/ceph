@@ -3,14 +3,12 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
+ * Copyright (C) 2004-2012 Sage Weil <sage@newdream.net> and others
  *
- * This is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License version 2, as published by the Free Software
- * Foundation.  See file COPYING.
+ * LGPL2.  See file COPYING.
  *
  */
+#include "include/int_types.h"
 
 #include "mon/MonClient.h"
 #include "mon/MonMap.h"
@@ -36,7 +34,6 @@
 #include <boost/scoped_ptr.hpp>
 #include <dirent.h>
 #include <errno.h>
-#include <inttypes.h>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -59,8 +56,6 @@
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #endif
-
-#include "include/fiemap.h"
 
 #define MAX_SECRET_LEN 1000
 #define MAX_POOL_NAME_SIZE 128
@@ -1141,7 +1136,7 @@ static int do_export_diff(librbd::Image& image, const char *fromsnapname,
     __u8 tag = 'e';
     bufferlist bl;
     ::encode(tag, bl);
-    bl.write_fd(fd);
+    r = bl.write_fd(fd);
     if (r < 0)
       return r;
   }
@@ -1294,20 +1289,22 @@ static int do_import(librbd::RBD &rbd, librados::IoCtx& io_ctx,
   bool from_stdin = !strcmp(path, "-");
   if (from_stdin) {
     fd = 0;
-    size = 1 << *order;
+    size = 1ULL << *order;
   } else {
-    fd = open(path, O_RDONLY);
-
-    if (fd < 0) {
+    if ((fd = open(path, O_RDONLY)) < 0) {
       r = -errno;
       cerr << "rbd: error opening " << path << std::endl;
-      return r;
+      goto done2;
     }
 
-    r = fstat(fd, &stat_buf);
-    if (r < 0) {
+    if ((fstat(fd, &stat_buf)) < 0) {
       r = -errno;
       cerr << "rbd: stat error " << path << std::endl;
+      goto done;
+    }
+    if (S_ISDIR(stat_buf.st_mode)) {
+      r = -EISDIR;
+      cerr << "rbd: cannot import a directory" << std::endl;
       goto done;
     }
     if (stat_buf.st_size)
@@ -1394,7 +1391,8 @@ static int do_import(librbd::RBD &rbd, librados::IoCtx& io_ctx,
       pc.finish();
     close(fd);
   }
-
+ done2:
+  delete[] p;
   return r;
 }
 
@@ -2486,7 +2484,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (r < 0) {
       cerr << "rbd: error opening pool " << poolname << ": "
 	   << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
   }
 
@@ -2513,7 +2511,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (r < 0) {
       cerr << "rbd: error opening image " << imgname << ": "
 	   << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
   }
 
@@ -2528,7 +2526,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (r < 0) {
       cerr << "rbd: error setting snapshot context: " << cpp_strerror(-r)
 	   << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
   }
 
@@ -2537,14 +2535,14 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (r < 0) {
       cerr << "rbd: error opening pool " << dest_poolname << ": "
 	   << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
   }
 
   if (opt_cmd == OPT_CREATE || opt_cmd == OPT_RESIZE) {
     if (!size_set) {
       cerr << "rbd: must specify --size <MB>" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
   }
 
@@ -2560,7 +2558,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
       default:
         cerr << "rbd: list: " << cpp_strerror(-r) << std::endl;
       }
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2568,19 +2566,19 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (order && (order < 12 || order > 25)) {
       cerr << "rbd: order must be between 12 (4 KB) and 25 (32 MB)"
 	   << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     if ((stripe_unit && !stripe_count) || (!stripe_unit && stripe_count)) {
       cerr << "must specify both (or neither) of stripe-unit and stripe-count"
 	   << std::endl;
       usage();
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_create(rbd, io_ctx, imgname, size, &order, format, features,
 		  stripe_unit, stripe_count);
     if (r < 0) {
       cerr << "rbd: create error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2588,14 +2586,14 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (order && (order < 12 || order > 25)) {
       cerr << "rbd: order must be between 12 (4 KB) and 25 (32 MB)"
 	   << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
 
     r = do_clone(rbd, io_ctx, imgname, snapname, dest_io_ctx, destname,
 		 features, &order);
     if (r < 0) {
       cerr << "rbd: clone error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2603,7 +2601,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_flatten(image);
     if (r < 0) {
       cerr << "rbd: flatten error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2611,7 +2609,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_rename(rbd, io_ctx, imgname, destname);
     if (r < 0) {
       cerr << "rbd: rename error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2619,7 +2617,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_show_info(imgname, image, snapname, formatter.get());
     if (r < 0) {
       cerr << "rbd: info: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2649,18 +2647,18 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = image.stat(info, sizeof(info));
     if (r < 0) {
       cerr << "rbd: resize error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
 
     if (info.size > size && !resize_allow_shrink) {
       cerr << "rbd: shrinking an image is only allowed with the --allow-shrink flag" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
 
     r = do_resize(image, size);
     if (r < 0) {
       cerr << "rbd: resize error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2673,87 +2671,87 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     if (r < 0) {
       cerr << "rbd: failed to list snapshots: " << cpp_strerror(-r)
 	   << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_SNAP_CREATE:
     if (!imgname || !snapname) {
       cerr << "rbd: snap create requires image and snapname" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_add_snap(image, snapname);
     if (r < 0) {
       cerr << "rbd: failed to create snapshot: " << cpp_strerror(-r)
 	   << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_SNAP_ROLLBACK:
     if (!imgname) {
       cerr << "rbd: snap rollback requires image name" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_rollback_snap(image, snapname);
     if (r < 0) {
       cerr << "rbd: rollback failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_SNAP_REMOVE:
     if (!imgname) {
       cerr << "rbd: snap remove requires image name" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_remove_snap(image, snapname);
-    if (r == -EBUSY) {
-      cerr << "rbd: snapshot '" << snapname << "' is protected from removal."
-	   << std::endl;
-      return EXIT_FAILURE;
-    }
     if (r < 0) {
-      cerr << "rbd: failed to remove snapshot: " << cpp_strerror(-r)
-	   << std::endl;
-      return EXIT_FAILURE;
+      if (r == -EBUSY) {
+        cerr << "rbd: snapshot '" << snapname << "' is protected from removal."
+             << std::endl;
+      } else {
+        cerr << "rbd: failed to remove snapshot: " << cpp_strerror(-r)
+             << std::endl;
+      }
+      return -r;
     }
     break;
 
   case OPT_SNAP_PURGE:
     if (!imgname) {
       cerr << "rbd: snap purge requires image name" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_purge_snaps(image);
     if (r < 0) {
       cerr << "rbd: removing snaps failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_SNAP_PROTECT:
     if (!imgname) {
       cerr << "rbd: snap protect requires image name" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_protect_snap(image, snapname);
     if (r < 0) {
       cerr << "rbd: protecting snap failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_SNAP_UNPROTECT:
     if (!imgname) {
       cerr << "rbd: snap unprotect requires image name" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_unprotect_snap(image, snapname);
     if (r < 0) {
       cerr << "rbd: unprotecting snap failed: " << cpp_strerror(-r)
 	   << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2761,19 +2759,19 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_list_children(image, formatter.get());
     if (r < 0) {
       cerr << "rbd: listing children failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_EXPORT:
     if (!path) {
       cerr << "rbd: export requires pathname" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_export(image, path);
     if (r < 0) {
       cerr << "rbd: export error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2781,32 +2779,32 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_diff(image, fromsnapname, formatter.get());
     if (r < 0) {
       cerr << "rbd: diff error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_EXPORT_DIFF:
     if (!path) {
       cerr << "rbd: export-diff requires pathname" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_export_diff(image, fromsnapname, snapname, path);
     if (r < 0) {
       cerr << "rbd: export-diff error: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
   case OPT_IMPORT:
     if (!path) {
       cerr << "rbd: import requires pathname" << std::endl;
-      return EXIT_FAILURE;
+      return EINVAL;
     }
     r = do_import(rbd, dest_io_ctx, destname, &order, path,
 		  format, features, size);
     if (r < 0) {
       cerr << "rbd: import failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2815,7 +2813,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_import_diff(image, path);
     if (r < 0) {
       cerr << "rbd: import-diff failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2823,7 +2821,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_copy(image, dest_io_ctx, destname);
     if (r < 0) {
       cerr << "rbd: copy failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2831,7 +2829,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_watch(io_ctx, imgname);
     if (r < 0) {
       cerr << "rbd: watch failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2839,7 +2837,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_kernel_add(poolname, imgname, snapname);
     if (r < 0) {
       cerr << "rbd: add failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2847,7 +2845,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_kernel_rm(devpath);
     if (r < 0) {
       cerr << "rbd: remove failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2855,7 +2853,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_kernel_showmapped(formatter.get());
     if (r < 0) {
       cerr << "rbd: showmapped failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2863,7 +2861,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_lock_list(image, formatter.get());
     if (r < 0) {
       cerr << "rbd: listing locks failed: " << cpp_strerror(r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2880,7 +2878,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
       } else {
 	cerr << "rbd: taking lock failed: " << cpp_strerror(r) << std::endl;
       }
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2888,7 +2886,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_lock_remove(image, lock_cookie, lock_client);
     if (r < 0) {
       cerr << "rbd: releasing lock failed: " << cpp_strerror(r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
 
@@ -2896,7 +2894,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
     r = do_bench_write(image, bench_io_size, bench_io_threads, bench_bytes, bench_pattern);
     if (r < 0) {
       cerr << "bench-write failed: " << cpp_strerror(-r) << std::endl;
-      return EXIT_FAILURE;
+      return -r;
     }
     break;
   }

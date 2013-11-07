@@ -67,6 +67,7 @@ enum {
   l_os_commit_len,
   l_os_commit_lat,
   l_os_j_full,
+  l_os_queue_lat,
   l_os_last,
 };
 
@@ -79,6 +80,8 @@ class ObjectStore {
 public:
 
   Logger *logger;
+
+  virtual filestore_perf_stat_t get_cur_stats() = 0;
 
   /**
    * a sequencer orders transactions
@@ -155,6 +158,7 @@ public:
       OP_SPLIT_COLLECTION = 35, // cid, bits, destination
       OP_SPLIT_COLLECTION2 = 36, /* cid, bits, destination
 				    doesn't create the destination */
+      OP_OMAP_RMKEYRANGE = 37,  // cid, oid, firstkey, lastkey
     };
 
   private:
@@ -177,13 +181,22 @@ public:
       tolerate_collection_add_enoent = true;
     }
     void register_on_applied(Context *c) {
+      if (!c) return;
       on_applied.push_back(c);
     }
     void register_on_commit(Context *c) {
+      if (!c) return;
       on_commit.push_back(c);
     }
     void register_on_applied_sync(Context *c) {
+      if (!c) return;
       on_applied_sync.push_back(c);
+    }
+    void register_on_complete(Context *c) {
+      if (!c) return;
+      RunOnDeleteRef _complete(new RunOnDelete(c));
+      register_on_applied(new ContainerContext<RunOnDeleteRef>(_complete));
+      register_on_commit(new ContainerContext<RunOnDeleteRef>(_complete));
     }
 
     static void collect_contexts(
@@ -357,6 +370,11 @@ public:
 	::decode(s, p);
 	return s;
       }
+      string get_key() {
+	string s;
+	::decode(s, p);
+	return s;
+      }
       void get_attrset(map<string,bufferptr>& aset) {
 	::decode(aset, p);
       }
@@ -450,6 +468,14 @@ public:
       ops++;
     }
     void setattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>& attrset) {
+      __u32 op = OP_SETATTRS;
+      ::encode(op, tbl);
+      ::encode(cid, tbl);
+      ::encode(oid, tbl);
+      ::encode(attrset, tbl);
+      ops++;
+    }
+    void setattrs(coll_t cid, const hobject_t& oid, map<string,bufferlist>& attrset) {
       __u32 op = OP_SETATTRS;
       ::encode(op, tbl);
       ::encode(cid, tbl);
@@ -560,6 +586,13 @@ public:
       ::encode(aset, tbl);
       ops++;
     }
+    void collection_setattrs(coll_t cid, map<string,bufferlist>& aset) {
+      __u32 op = OP_COLL_SETATTRS;
+      ::encode(op, tbl);
+      ::encode(cid, tbl);
+      ::encode(aset, tbl);
+      ops++;
+    }
     void collection_rename(coll_t cid, coll_t ncid) {
       __u32 op = OP_COLL_RENAME;
       ::encode(op, tbl);
@@ -603,6 +636,22 @@ public:
       ::encode(cid, tbl);
       ::encode(hoid, tbl);
       ::encode(keys, tbl);
+      ops++;
+    }
+
+    /// Remove key range from hoid omap
+    void omap_rmkeyrange(
+      coll_t cid,             ///< [in] Collection containing hoid
+      const hobject_t &hoid,  ///< [in] Object from which to remove the omap
+      const string& first,    ///< [in] first key in range
+      const string& last      ///< [in] first key past range
+      ) {
+      __u32 op = OP_OMAP_RMKEYRANGE;
+      ::encode(op, tbl);
+      ::encode(cid, tbl);
+      ::encode(hoid, tbl);
+      ::encode(first, tbl);
+      ::encode(last, tbl);
       ops++;
     }
 

@@ -140,7 +140,7 @@ public:
     crush->choose_total_tries = n;
   }
 
-  int get_chooseleaf_descend_once() {
+  int get_chooseleaf_descend_once() const {
     return crush->chooseleaf_descend_once;
   }
   void set_chooseleaf_descend_once(int n) {
@@ -166,7 +166,7 @@ public:
     build_rmaps();
     if (type_rmap.count(name))
       return type_rmap[name];
-    return 0;
+    return -1;
   }
   const char *get_type_name(int t) const {
     std::map<int,string>::const_iterator p = type_map.find(t);
@@ -200,10 +200,13 @@ public:
       return p->second.c_str();
     return 0;
   }
-  void set_item_name(int i, const string& name) {
+  int set_item_name(int i, const string& name) {
+    if (!is_valid_crush_name(name))
+      return -EINVAL;
     name_map[i] = name;
     if (have_rmaps)
       name_rmap[name] = i;
+    return 0;
   }
 
   // rule names
@@ -575,7 +578,8 @@ public:
     return set_rule_step(ruleno, step, CRUSH_RULE_EMIT, 0, 0);
   }
 
-  int add_simple_rule(string name, string root_name, string failure_domain_type);
+  int add_simple_rule(string name, string root_name, string failure_domain_type,
+		      ostream *err = 0);
 
   int remove_rule(int ruleno);
 
@@ -632,7 +636,7 @@ private:
     pair<string, string> bucket_location = get_immediate_parent(item);
 
     // get the id of the parent bucket
-    int parent_id = get_item_id( (bucket_location.second).c_str() );
+    int parent_id = get_item_id(bucket_location.second);
 
     // get the parent bucket
     crush_bucket *parent_bucket = get_bucket(parent_id);
@@ -716,10 +720,10 @@ public:
 
   /* modifiers */
   int add_bucket(int bucketno, int alg, int hash, int type, int size,
-		 int *items, int *weights) {
+		 int *items, int *weights, int *idout) {
     crush_bucket *b = crush_make_bucket(alg, hash, type, size, items, weights);
     assert(b);
-    return crush_add_bucket(crush, bucketno, b);
+    return crush_add_bucket(crush, bucketno, b, idout);
   }
   
   void finalize() {
@@ -789,6 +793,9 @@ public:
   void dump_rules(Formatter *f) const;
   void list_rules(Formatter *f) const;
   static void generate_test_instances(list<CrushWrapper*>& o);
+
+
+  static bool is_valid_crush_name(const string& s);
 };
 WRITE_CLASS_ENCODER(CrushWrapper)
 

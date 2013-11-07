@@ -101,9 +101,9 @@ TEST_F(TestHASH_INDEX_TAG, generate_and_parse_name) {
   uint64_t hash = 0xABABABAB;
   uint64_t pool = -1;
 
-  test_generate_and_parse(hobject_t(object_t(".A/B_\\C.D"), key, CEPH_NOSNAP, hash, pool),
+  test_generate_and_parse(hobject_t(object_t(".A/B_\\C.D"), key, CEPH_NOSNAP, hash, pool, ""),
 			  "\\.A\\sB_\\\\C.D_head_ABABABAB");
-  test_generate_and_parse(hobject_t(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool),
+  test_generate_and_parse(hobject_t(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool, ""),
 			  "\\dA_head_ABABABAB");
 }
 
@@ -123,11 +123,11 @@ TEST_F(TestHASH_INDEX_TAG_2, generate_and_parse_name) {
   {
     std::string name(".XA/B_\\C.D");
     name[1] = '\0';
-    hobject_t hoid(object_t(name), key, CEPH_NOSNAP, hash, pool);
+    hobject_t hoid(object_t(name), key, CEPH_NOSNAP, hash, pool, "");
 
     test_generate_and_parse(hoid, "\\.\\nA\\sB\\u\\\\C.D_KEY_head_ABABABAB");
   }
-  test_generate_and_parse(hobject_t(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool),
+  test_generate_and_parse(hobject_t(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool, ""),
 			  "\\dA_KEY_head_ABABABAB");
 }
 
@@ -147,13 +147,13 @@ TEST_F(TestHOBJECT_WITH_POOL, generate_and_parse_name) {
   {
     std::string name(".XA/B_\\C.D");
     name[1] = '\0';
-    hobject_t hoid(object_t(name), key, CEPH_NOSNAP, hash, pool);
+    hobject_t hoid(object_t(name), key, CEPH_NOSNAP, hash, pool, "");
     hoid.nspace = "NSPACE";
 
     test_generate_and_parse(hoid, "\\.\\nA\\sB\\u\\\\C.D_KEY_head_ABABABAB_NSPACE_cdcdcdcd");
   }
   {
-    hobject_t hoid(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool);
+    hobject_t hoid(object_t("DIR_A"), key, CEPH_NOSNAP, hash, pool, "");
     hoid.nspace = "NSPACE";
 
     test_generate_and_parse(hoid, "\\dA_KEY_head_ABABABAB_NSPACE_cdcdcdcd");
@@ -162,7 +162,7 @@ TEST_F(TestHOBJECT_WITH_POOL, generate_and_parse_name) {
 
 class TestLFNIndex : public TestWrapLFNIndex, public ::testing::Test {
 public:
-  TestLFNIndex() : TestWrapLFNIndex(coll_t("ABC"), "PATH", CollectionIndex::HASH_INDEX_TAG) {
+  TestLFNIndex() : TestWrapLFNIndex(coll_t("ABC"), "PATH", CollectionIndex::HOBJECT_WITH_POOL) {
   }
 
   virtual void SetUp() {
@@ -237,7 +237,12 @@ TEST_F(TestLFNIndex, remove_object) {
     std::string pathname("PATH/" + mangled_name);
     EXPECT_EQ(0, ::close(::creat(pathname.c_str(), 0600)));
     EXPECT_EQ(0, created(hoid, pathname.c_str()));
-    const string LFN_ATTR = "user.cephos.lfn";
+    string LFN_ATTR = "user.cephos.lfn";
+    if (index_version != HASH_INDEX_TAG) {
+      char buf[100];
+      snprintf(buf, sizeof(buf), "%d", index_version);
+      LFN_ATTR += string(buf);
+    }
     const std::string object_name_1 = object_name + "SUFFIX";
     EXPECT_EQ(object_name_1.size(), (unsigned)chain_setxattr(pathname.c_str(), LFN_ATTR.c_str(), object_name_1.c_str(), object_name_1.size()));
 
@@ -321,13 +326,13 @@ TEST_F(TestLFNIndex, get_mangled_name) {
     hobject_t hoid(sobject_t("ABC", CEPH_NOSNAP));
 
     EXPECT_EQ(0, get_mangled_name(path, hoid, &mangled_name, &exists));
-    EXPECT_NE(std::string::npos, mangled_name.find("ABC_head"));
+    EXPECT_NE(std::string::npos, mangled_name.find("ABC__head"));
     EXPECT_EQ(std::string::npos, mangled_name.find("0_long"));
     EXPECT_EQ(0, exists);
     const std::string pathname("PATH/" + mangled_name);
     EXPECT_EQ(0, ::close(::creat(pathname.c_str(), 0600)));
     EXPECT_EQ(0, get_mangled_name(path, hoid, &mangled_name, &exists));
-    EXPECT_NE(std::string::npos, mangled_name.find("ABC_head"));
+    EXPECT_NE(std::string::npos, mangled_name.find("ABC__head"));
     EXPECT_EQ(1, exists);
     EXPECT_EQ(0, ::unlink(pathname.c_str()));
   }
@@ -399,7 +404,12 @@ TEST_F(TestLFNIndex, get_mangled_name) {
     // are not identical and it so happens that their SHA1 is
     // identical : a collision number is used to differentiate them
     //
-    const string LFN_ATTR = "user.cephos.lfn";
+    string LFN_ATTR = "user.cephos.lfn";
+    if (index_version != HASH_INDEX_TAG) {
+      char buf[100];
+      snprintf(buf, sizeof(buf), "%d", index_version);
+      LFN_ATTR += string(buf);
+    }
     const std::string object_name_same_prefix = object_name + "SUFFIX";
     EXPECT_EQ(object_name_same_prefix.size(), (unsigned)chain_setxattr(pathname.c_str(), LFN_ATTR.c_str(), object_name_same_prefix.c_str(), object_name_same_prefix.size()));
     std::string mangled_name_same_prefix;

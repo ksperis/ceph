@@ -29,6 +29,7 @@ class SharedPtrRegistry {
 public:
   typedef std::tr1::shared_ptr<V> VPtr;
   typedef std::tr1::weak_ptr<V> WeakVPtr;
+  int waiting;
 private:
   Mutex lock;
   Cond cond;
@@ -52,8 +53,36 @@ private:
   friend class OnRemoval;
 
 public:
-  SharedPtrRegistry() : lock("SharedPtrRegistry::lock") {}
+  SharedPtrRegistry() :
+    waiting(0),
+    lock("SharedPtrRegistry::lock")
+  {}
 
+  bool empty() {
+    Mutex::Locker l(lock);
+    return contents.empty();
+  }
+
+  bool get_next(const K &key, pair<K, VPtr> *next) {
+    pair<K, VPtr> r;
+    {
+      Mutex::Locker l(lock);
+      VPtr next_val;
+      typename map<K, WeakVPtr>::iterator i = contents.upper_bound(key);
+      while (i != contents.end() &&
+	     !(next_val = i->second.lock()))
+	++i;
+      if (i == contents.end())
+	return false;
+      if (next)
+	r = make_pair(i->first, next_val);
+    }
+    if (next)
+      *next = r;
+    return true;
+  }
+
+  
   bool get_next(const K &key, pair<K, V> *next) {
     VPtr next_val;
     Mutex::Locker l(lock);
@@ -70,26 +99,33 @@ public:
 
   VPtr lookup(const K &key) {
     Mutex::Locker l(lock);
+    waiting++;
     while (1) {
       if (contents.count(key)) {
 	VPtr retval = contents[key].lock();
-	if (retval)
+	if (retval) {
+	  waiting--;
 	  return retval;
+	}
       } else {
 	break;
       }
       cond.Wait(lock);
     }
+    waiting--;
     return VPtr();
   }
 
   VPtr lookup_or_create(const K &key) {
     Mutex::Locker l(lock);
+    waiting++;
     while (1) {
       if (contents.count(key)) {
 	VPtr retval = contents[key].lock();
-	if (retval)
+	if (retval) {
+	  waiting--;
 	  return retval;
+	}
       } else {
 	break;
       }
@@ -97,17 +133,27 @@ public:
     }
     VPtr retval(new V(), OnRemoval(this, key));
     contents[key] = retval;
+    waiting--;
     return retval;
+  }
+
+  void remove(const K &key) {
+    Mutex::Locker l(lock);
+    contents.erase(key);
+    cond.Signal();
   }
 
   template<class A>
   VPtr lookup_or_create(const K &key, const A &arg) {
     Mutex::Locker l(lock);
+    waiting++;
     while (1) {
       if (contents.count(key)) {
 	VPtr retval = contents[key].lock();
-	if (retval)
+	if (retval) {
+	  waiting--;
 	  return retval;
+	}
       } else {
 	break;
       }
@@ -115,8 +161,11 @@ public:
     }
     VPtr retval(new V(arg), OnRemoval(this, key));
     contents[key] = retval;
+    waiting--;
     return retval;
   }
+
+  friend class SharedPtrRegistryTest;
 };
 
 #endif

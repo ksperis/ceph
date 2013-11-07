@@ -20,7 +20,7 @@
 
 #include "key_value_store/key_value_structure.h"
 #include "include/utime.h"
-#include "include/rados.h"
+#include "include/types.h"
 #include "include/encoding.h"
 #include "common/Mutex.h"
 #include "common/Clock.h"
@@ -693,7 +693,7 @@ protected:
    * died (should be -ENOENT or -ETIMEDOUT)
    * @post: rolls forward if -ENOENT, otherwise rolls back.
    */
-  int cleanup(const index_data &idata, const int &errno);
+  int cleanup(const index_data &idata, const int &error);
 
   /**
    * does the ObjectWriteOperation and splits, reads the index, and/or retries

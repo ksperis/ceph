@@ -55,7 +55,8 @@ void Elector::bump_epoch(epoch_t e)
   MonitorDBStore::Transaction t;
   t.put(Monitor::MONITOR_NAME, "election_epoch", epoch);
   mon->store->apply_transaction(t);
-  mon->reset();
+
+  mon->join_election();
 
   // clear up some state
   electing_me = false;
@@ -152,9 +153,10 @@ void Elector::victory()
   leader_acked = -1;
   electing_me = false;
 
-  unsigned features = CEPH_FEATURES_ALL;
+  uint64_t features = CEPH_FEATURES_ALL;
   set<int> quorum;
-  for (map<int,unsigned>::iterator p = acked_me.begin(); p != acked_me.end(); ++p) {
+  for (map<int, uint64_t>::iterator p = acked_me.begin(); p != acked_me.end();
+       ++p) {
     quorum.insert(p->first);
     features &= p->second;
   }    
@@ -197,7 +199,6 @@ void Elector::handle_propose(MMonElection *m)
       dout(5) << " got propose from old epoch, quorum is " << mon->quorum 
 	      << ", " << m->get_source() << " must have just started" << dendl;
       // we may be active; make sure we reset things in the monitor appropriately.
-      mon->reset();
       mon->start_election();
     } else {
       dout(5) << " ignoring old propose" << dendl;
@@ -214,7 +215,6 @@ void Elector::handle_propose(MMonElection *m)
     } else {
       // wait, i should win!
       if (!electing_me) {
-	mon->reset();
 	mon->start_election();
       }
     }
@@ -346,6 +346,7 @@ void Elector::dispatch(Message *m)
         t.put("monmap", "last_committed", mon->monmap->epoch);
         mon->store->apply_transaction(t);
 	//mon->monmon()->paxos->stash_latest(mon->monmap->epoch, em->monmap_bl);
+	cancel_timer();
 	mon->bootstrap();
 	m->put();
 	delete peermap;

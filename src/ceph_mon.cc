@@ -76,7 +76,8 @@ int obtain_monmap(MonitorDBStore &store, bufferlist &bl)
     }
   }
 
-  if (store.exists("mon_sync", "in_sync")) {
+  if (store.exists("mon_sync", "in_sync")
+      || store.exists("mon_sync", "force_sync")) {
     dout(10) << __func__ << " detected aborted sync" << dendl;
     if (store.exists("mon_sync", "latest_monmap")) {
       int err = store.get("mon_sync", "latest_monmap", bl);
@@ -107,6 +108,8 @@ void usage()
   cerr << "        debug monitor level (e.g. 10)\n";
   cerr << "  --mkfs\n";
   cerr << "        build fresh monitor fs\n";
+  cerr << "  --force-sync\n";
+  cerr << "        force a sync from another mon by wiping local data (BE CAREFUL)\n";
   generic_server_usage();
 }
 
@@ -116,6 +119,11 @@ int main(int argc, const char **argv)
 
   bool mkfs = false;
   bool compact = false;
+<<<<<<< HEAD
+=======
+  bool force_sync = false;
+  bool yes_really = false;
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
   std::string osdmapfn, inject_monmap, extract_monmap;
 
   vector<const char*> args;
@@ -136,6 +144,10 @@ int main(int argc, const char **argv)
       mkfs = true;
     } else if (ceph_argparse_flag(args, i, "--compact", (char*)NULL)) {
       compact = true;
+    } else if (ceph_argparse_flag(args, i, "--force-sync", (char*)NULL)) {
+      force_sync = true;
+    } else if (ceph_argparse_flag(args, i, "--yes-i-really-mean-it", (char*)NULL)) {
+      yes_really = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--osdmap", (char*)NULL)) {
       osdmapfn = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--inject_monmap", (char*)NULL)) {
@@ -151,6 +163,12 @@ int main(int argc, const char **argv)
     usage();
   }
 
+  if (force_sync && !yes_really) {
+    cerr << "are you SURE you want to force a sync?  this will erase local data and may\n"
+	 << "break your mon cluster.  pass --yes-i-really-mean-it if you do." << std::endl;
+    exit(1);
+  }
+
   if (g_conf->mon_data.empty()) {
     cerr << "must specify '--mon-data=foo' data path" << std::endl;
     usage();
@@ -164,7 +182,7 @@ int main(int argc, const char **argv)
   // -- mkfs --
   if (mkfs) {
     // resolve public_network -> public_addr
-    pick_addresses(g_ceph_context);
+    pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_PUBLIC);
 
     common_init_finish(g_ceph_context);
 
@@ -289,29 +307,39 @@ int main(int argc, const char **argv)
   common_init_finish(g_ceph_context);
   global_init_chdir(g_ceph_context);
 
-  {
-    Monitor::StoreConverter converter(g_conf->mon_data);
-    int ret = converter.needs_conversion();
-    if (ret > 0) {
-      assert(!converter.convert());
-    } else if (ret < 0) {
-      derr << "found errors while attempting to convert the monitor store: "
+  MonitorDBStore *store = new MonitorDBStore(g_conf->mon_data);
+
+  Monitor::StoreConverter converter(g_conf->mon_data, store);
+  if (store->open(std::cerr) < 0) {
+    int ret = store->create_and_open(std::cerr);
+    if (ret < 0) {
+      derr << "failed to create new leveldb store" << dendl;
+      prefork.exit(1);
+    }
+
+    ret = converter.needs_conversion();
+    if (ret < 0) {
+      derr << "found errors while validating legacy unconverted monitor store: "
            << cpp_strerror(ret) << dendl;
       prefork.exit(1);
     }
-  }
-
-  MonitorDBStore store(g_conf->mon_data);
-  err = store.open(std::cerr);
-  if (err < 0) {
-    cerr << argv[0] << ": error opening mon data store at '"
-         << g_conf->mon_data << "': " << cpp_strerror(err) << std::endl;
+    if (ret > 0) {
+      cout << "converting monitor store, please do not interrupt..." << std::endl;
+      int r = converter.convert();
+      if (r) {
+	derr << "failed to convert monitor store: " << cpp_strerror(r) << dendl;
+	prefork.exit(1);
+      }
+    }
+  } else if (converter.is_converting()) {
+    derr << "there is an on-going (maybe aborted?) conversion." << dendl;
+    derr << "you should check what happened" << dendl;
+    derr << "remove store.db to restart conversion" << dendl;
     prefork.exit(1);
   }
-  assert(err == 0);
 
   bufferlist magicbl;
-  err = store.get(Monitor::MONITOR_NAME, "magic", magicbl);
+  err = store->get(Monitor::MONITOR_NAME, "magic", magicbl);
   if (!magicbl.length()) {
     cerr << "unable to read magic from mon data.. did you run mkcephfs?" << std::endl;
     prefork.exit(1);
@@ -322,7 +350,7 @@ int main(int argc, const char **argv)
     prefork.exit(1);
   }
 
-  err = Monitor::check_features(&store);
+  err = Monitor::check_features(store);
   if (err < 0) {
     cerr << "error checking features: " << cpp_strerror(err) << std::endl;
     prefork.exit(1);
@@ -340,7 +368,7 @@ int main(int argc, const char **argv)
     }
 
     // get next version
-    version_t v = store.get("monmap", "last_committed");
+    version_t v = store->get("monmap", "last_committed");
     cout << "last committed monmap epoch is " << v << ", injected map will be " << (v+1) << std::endl;
     v++;
 
@@ -362,7 +390,7 @@ int main(int argc, const char **argv)
     t.put("monmap", v, mapbl);
     t.put("monmap", "latest", final);
     t.put("monmap", "last_committed", v);
-    store.apply_transaction(t);
+    store->apply_transaction(t);
 
     cout << "done." << std::endl;
     prefork.exit(0);
@@ -374,7 +402,7 @@ int main(int argc, const char **argv)
     // note that even if we don't find a viable monmap, we should go ahead
     // and try to build it up in the next if-else block.
     bufferlist mapbl;
-    int err = obtain_monmap(store, mapbl);
+    int err = obtain_monmap(*store, mapbl);
     if (err >= 0) {
       try {
         monmap.decode(mapbl);
@@ -419,7 +447,7 @@ int main(int argc, const char **argv)
   } else {
     dout(0) << g_conf->name << " does not exist in monmap, will attempt to join an existing cluster" << dendl;
 
-    pick_addresses(g_ceph_context);
+    pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_PUBLIC);
     if (!g_conf->public_addr.is_blank_ip()) {
       ipaddr = g_conf->public_addr;
       if (ipaddr.get_port() == 0)
@@ -497,8 +525,13 @@ int main(int argc, const char **argv)
     prefork.exit(1);
 
   // start monitor
-  mon = new Monitor(g_ceph_context, g_conf->name.get_id(), &store, 
+  mon = new Monitor(g_ceph_context, g_conf->name.get_id(), store, 
 		    messenger, &monmap);
+
+  if (force_sync) {
+    derr << "flagging a forced sync ..." << dendl;
+    mon->sync_force(NULL, cerr);
+  }
 
   err = mon->preinit();
   if (err < 0)
@@ -513,25 +546,28 @@ int main(int argc, const char **argv)
   if (g_conf->daemonize)
     prefork.daemonize();
 
+  messenger->start();
+
+  mon->init();
+
   // set up signal handlers, now that we've daemonized/forked.
   init_async_signal_handler();
   register_async_signal_handler(SIGHUP, sighup_handler);
   register_async_signal_handler_oneshot(SIGINT, handle_mon_signal);
   register_async_signal_handler_oneshot(SIGTERM, handle_mon_signal);
 
-  messenger->start();
-
-  mon->init();
+  if (g_conf->inject_early_sigterm)
+    kill(getpid(), SIGTERM);
 
   messenger->wait();
 
   unregister_async_signal_handler(SIGHUP, sighup_handler);
   unregister_async_signal_handler(SIGINT, handle_mon_signal);
   unregister_async_signal_handler(SIGTERM, handle_mon_signal);
-
   shutdown_async_signal_handler();
 
   delete mon;
+  delete store;
   delete messenger;
   delete client_throttler;
   delete daemon_throttler;
@@ -544,6 +580,7 @@ int main(int argc, const char **argv)
     dout(0) << "ceph-mon: gmon.out should be in " << s << dendl;
   }
 
-  prefork.exit(0);
+  prefork.signal_exit(0);
+  return 0;
 }
 

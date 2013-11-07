@@ -160,9 +160,10 @@ bool KeyServer::_check_rotating_secrets()
   added += _rotate_secret(CEPH_ENTITY_TYPE_MDS);
 
   if (added) {
+    ldout(cct, 10) << __func__ << " added " << added << dendl;
     data.rotating_ver++;
     //data.next_rotating_time = ceph_clock_now(cct);
-    //data.next_rotating_time += MIN(g_conf->auth_mon_ticket_ttl, g_conf->auth_service_ticket_ttl);
+    //data.next_rotating_time += MIN(cct->_conf->auth_mon_ticket_ttl, cct->_conf->auth_service_ticket_ttl);
     _dump_rotating_secrets();
     return true;
   }
@@ -190,7 +191,7 @@ int KeyServer::_rotate_secret(uint32_t service_id)
   RotatingSecrets& r = data.rotating_secrets[service_id];
   int added = 0;
   utime_t now = ceph_clock_now(cct);
-  double ttl = service_id == CEPH_ENTITY_TYPE_AUTH ? g_conf->auth_mon_ticket_ttl : g_conf->auth_service_ticket_ttl;
+  double ttl = service_id == CEPH_ENTITY_TYPE_AUTH ? cct->_conf->auth_mon_ticket_ttl : cct->_conf->auth_service_ticket_ttl;
 
   while (r.need_new_secrets(now)) {
     ExpiringCryptoKey ek;
@@ -294,36 +295,71 @@ bool KeyServer::contains(const EntityName& name) const
   return data.contains(name);
 }
 
-void KeyServer::list_secrets(stringstream& ss) const
+int KeyServer::encode_secrets(Formatter *f, stringstream *ds) const
 {
   Mutex::Locker l(lock);
 
+  if (f)
+    f->open_array_section("auth_dump");
+
   map<EntityName, EntityAuth>::const_iterator mapiter = data.secrets_begin();
-  if (mapiter != data.secrets_end()) {
-    ss << "installed auth entries: " << std::endl;      
 
-    while (mapiter != data.secrets_end()) {
-      const EntityName& name = mapiter->first;
-      ss << name.to_str() << std::endl;
+  if (mapiter == data.secrets_end())
+    return -ENOENT;
 
-      ss << "\tkey: " << mapiter->second.key << std::endl;
-
-      map<string, bufferlist>::const_iterator capsiter =
-	  mapiter->second.caps.begin();
-      for (; capsiter != mapiter->second.caps.end(); ++capsiter) {
-	// FIXME: need a const_iterator for bufferlist, but it doesn't exist yet.
-	bufferlist *bl = const_cast<bufferlist*>(&capsiter->second);
-        bufferlist::iterator dataiter = bl->begin();
-        string caps;
-        ::decode(caps, dataiter);
-	ss << "\tcaps: [" << capsiter->first << "] " << caps << std::endl;
-      }
-     
-      ++mapiter;
+  while (mapiter != data.secrets_end()) {
+    const EntityName& name = mapiter->first;
+    if (ds) {
+      *ds << name.to_str() << std::endl;
+      *ds << "\tkey: " << mapiter->second.key << std::endl;
     }
-  } else {
-    ss << "no installed auth entries!";
+    if (f) {
+      f->open_object_section("auth_entities");
+      f->dump_string("entity", name.to_str());
+      f->dump_stream("key") << mapiter->second.key;
+      f->open_object_section("caps");
+    }
+
+    map<string, bufferlist>::const_iterator capsiter =
+        mapiter->second.caps.begin();
+    for (; capsiter != mapiter->second.caps.end(); ++capsiter) {
+      // FIXME: need a const_iterator for bufferlist, but it doesn't exist yet.
+      bufferlist *bl = const_cast<bufferlist*>(&capsiter->second);
+      bufferlist::iterator dataiter = bl->begin();
+      string caps;
+      ::decode(caps, dataiter);
+      if (ds)
+        *ds << "\tcaps: [" << capsiter->first << "] " << caps << std::endl;
+      if (f)
+        f->dump_string(capsiter->first.c_str(), caps);
+    }
+    if (f) {
+      f->close_section(); // caps
+      f->close_section(); // auth_entities
+    }
+
+    ++mapiter;
   }
+
+  if (f)
+    f->close_section(); // auth_dump
+  return 0;
+}
+
+void KeyServer::encode_formatted(string label, Formatter *f, bufferlist &bl)
+{
+  assert(f != NULL);
+  f->open_object_section(label.c_str());
+  encode_secrets(f, NULL);
+  f->close_section();
+  f->flush(bl);
+}
+
+void KeyServer::encode_plaintext(bufferlist &bl)
+{
+  stringstream os;
+  encode_secrets(NULL, &os);
+  bl.append(os.str());
 }
 
 bool KeyServer::updated_rotating(bufferlist& rotating_bl, version_t& rotating_ver)
@@ -388,7 +424,7 @@ int KeyServer::_build_session_auth_info(uint32_t service_id, CephXServiceTicketI
 {
   info.service_id = service_id;
   info.ticket = auth_ticket_info.ticket;
-  info.ticket.init_timestamps(ceph_clock_now(cct), g_conf->auth_service_ticket_ttl);
+  info.ticket.init_timestamps(ceph_clock_now(cct), cct->_conf->auth_service_ticket_ttl);
 
   generate_secret(info.session_key);
 

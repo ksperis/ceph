@@ -245,7 +245,6 @@ void CryptoAES::encrypt(const bufferptr& secret, const bufferlist& in, bufferlis
 #ifdef USE_CRYPTOPP
   {
     const unsigned char *key = (const unsigned char *)secret.c_str();
-    const unsigned char *in_buf;
 
     string ciphertext;
     CryptoPP::AES::Encryption aesEncryption(key, CryptoPP::AES::DEFAULT_KEYLENGTH);
@@ -255,8 +254,7 @@ void CryptoAES::encrypt(const bufferptr& secret, const bufferlist& in, bufferlis
 
     for (std::list<bufferptr>::const_iterator it = in.buffers().begin();
 	 it != in.buffers().end(); ++it) {
-      in_buf = (const unsigned char *)it->c_str();
-
+      const unsigned char *in_buf = (const unsigned char *)it->c_str();
       stfEncryptor.Put(in_buf, it->length());
     }
     try {
@@ -375,9 +373,7 @@ void CryptoKey::decrypt(CephContext *cct, const bufferlist& in, bufferlist& out,
 
 void CryptoKey::print(std::ostream &out) const
 {
-  string a;
-  encode_base64(a);
-  out << a;
+  out << encode_base64();
 }
 
 void CryptoKey::to_str(std::string& s) const
@@ -386,4 +382,17 @@ void CryptoKey::to_str(std::string& s) const
   char buf[len];
   hex2str(secret.c_str(), secret.length(), buf, len);
   s = buf;
+}
+
+void CryptoKey::encode_formatted(string label, Formatter *f, bufferlist &bl)
+{
+  f->open_object_section(label.c_str());
+  f->dump_string("key", encode_base64());
+  f->close_section();
+  f->flush(bl);
+}
+
+void CryptoKey::encode_plaintext(bufferlist &bl)
+{
+  bl.append(encode_base64());
 }

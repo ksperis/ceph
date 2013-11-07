@@ -11,15 +11,15 @@
 
 #include "messages/MClientCapRelease.h"
 
-class Cap;
+struct Cap;
 class Inode;
-class CapSnap;
-class MetaRequest;
+struct CapSnap;
+struct MetaRequest;
 class MClientCapRelease;
 
 struct MetaSession {
   int mds_num;
-  Connection *con;
+  ConnectionRef con;
   version_t seq;
   uint64_t cap_gen;
   utime_t cap_ttl, last_cap_renew_request;
@@ -35,7 +35,7 @@ struct MetaSession {
     STATE_CLOSED,
   } state;
 
-  list<Cond*> waiting_for_open;
+  list<Context*> waiting_for_open;
 
   xlist<Cap*> caps;
   xlist<Inode*> flushing_caps;

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <iostream>
 #include <time.h>
+#include <sys/mount.h>
 #include "os/FileStore.h"
 #include "include/Context.h"
 #include "common/ceph_argparse.h"
@@ -282,7 +283,7 @@ public:
     // hash
     //boost::binomial_distribution<uint32_t> bin(0xFFFFFF, 0.5);
     ++seq;
-    return hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, 0);
+    return hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, 0, "");
   }
 };
 
@@ -505,13 +506,16 @@ TEST_F(StoreTest, HashCollisionTest) {
   string base = "";
   for (int i = 0; i < 100; ++i) base.append("aaaaa");
   set<hobject_t> created;
+  for (int n = 0; n < 10; ++n) {
+    char nbuf[100];
+    sprintf(nbuf, "n%d", n);
   for (int i = 0; i < 1000; ++i) {
     char buf[100];
     sprintf(buf, "%d", i);
     if (!(i % 5)) {
-      cerr << "Object " << i << std::endl;
+      cerr << "Object n" << n << " "<< i << std::endl;
     }
-    hobject_t hoid(string(buf) + base, string(), CEPH_NOSNAP, 0, 0);
+    hobject_t hoid(string(buf) + base, string(), CEPH_NOSNAP, 0, 0, string(nbuf));
     {
       ObjectStore::Transaction t;
       t.touch(cid, hoid);
@@ -519,6 +523,7 @@ TEST_F(StoreTest, HashCollisionTest) {
       ASSERT_EQ(r, 0);
     }
     created.insert(hoid);
+  }
   }
   vector<hobject_t> objects;
   r = store->collection_list(cid, objects);
@@ -571,7 +576,7 @@ TEST_F(StoreTest, HashCollisionTest) {
 
 TEST_F(StoreTest, OMapTest) {
   coll_t cid("blah");
-  hobject_t hoid("tesomap", "", CEPH_NOSNAP, 0, 0);
+  hobject_t hoid("tesomap", "", CEPH_NOSNAP, 0, 0, "");
   int r;
   {
     ObjectStore::Transaction t;
@@ -667,7 +672,7 @@ TEST_F(StoreTest, OMapTest) {
 
 TEST_F(StoreTest, XattrTest) {
   coll_t cid("blah");
-  hobject_t hoid("tesomap", "", CEPH_NOSNAP, 0, 0);
+  hobject_t hoid("tesomap", "", CEPH_NOSNAP, 0, 0, "");
   bufferlist big;
   for (unsigned i = 0; i < 10000; ++i) {
     big.append('\0');
@@ -769,13 +774,14 @@ void colsplittest(
 	  "",
 	  CEPH_NOSNAP,
 	  i<<common_suffix_size,
-	  0));
+	  0, ""));
     }
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
   {
     ObjectStore::Transaction t;
+    t.create_collection(tid);
     t.split_collection(cid, common_suffix_size+1, 0, tid);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
@@ -823,6 +829,131 @@ TEST_F(StoreTest, ColSplitTest3) {
 }
 #endif
 
+/**
+ * This test tests adding two different groups
+ * of objects, each with 1 common prefix and 1
+ * different prefix.  We then remove half
+ * in order to verify that the merging correctly
+ * stops at the common prefix subdir.  See bug
+ * #5273 */
+TEST_F(StoreTest, TwoHash) {
+  coll_t cid("asdf");
+  int r;
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  std::cout << "Making objects" << std::endl;
+  for (int i = 0; i < 360; ++i) {
+    ObjectStore::Transaction t;
+    hobject_t o;
+    if (i < 8) {
+      o.hash = (i << 16) | 0xA1;
+      t.touch(cid, o);
+    }
+    o.hash = (i << 16) | 0xB1;
+    t.touch(cid, o);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  std::cout << "Removing half" << std::endl;
+  for (int i = 1; i < 8; ++i) {
+    ObjectStore::Transaction t;
+    hobject_t o;
+    o.hash = (i << 16) | 0xA1;
+    t.remove(cid, o);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  std::cout << "Checking" << std::endl;
+  for (int i = 1; i < 8; ++i) {
+    ObjectStore::Transaction t;
+    hobject_t o;
+    o.hash = (i << 16) | 0xA1;
+    bool exists = store->exists(cid, o);
+    ASSERT_EQ(exists, false);
+  }
+  {
+    hobject_t o;
+    o.hash = 0xA1;
+    bool exists = store->exists(cid, o);
+    ASSERT_EQ(exists, true);
+  }
+  std::cout << "Cleanup" << std::endl;
+  for (int i = 0; i < 360; ++i) {
+    ObjectStore::Transaction t;
+    hobject_t o;
+    o.hash = (i << 16) | 0xA1;
+    t.remove(cid, o);
+    o.hash = (i << 16) | 0xB1;
+    t.remove(cid, o);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  ObjectStore::Transaction t;
+  t.remove_collection(cid);
+  r = store->apply_transaction(t);
+  ASSERT_EQ(r, 0);
+}
+
+//
+// support tests for qa/workunits/filestore/filestore.sh
+//
+TEST(EXT4StoreTest, _detect_fs) {
+  if (::getenv("DISK") == NULL || ::getenv("MOUNTPOINT") == NULL) {
+    cerr << "SKIP because DISK and MOUNTPOINT environment variables are not set. It is meant to run from qa/workunits/filestore/filestore.sh " << std::endl;
+    return;
+  }
+  const string disk(::getenv("DISK"));
+  EXPECT_LT((unsigned)0, disk.size());
+  const string mnt(::getenv("MOUNTPOINT"));
+  EXPECT_LT((unsigned)0, mnt.size());
+  ::umount(mnt.c_str());
+
+  const string dir("store_test_temp_dir");
+  const string journal("store_test_temp_journal");
+
+  //
+  // without user_xattr, ext4 fails
+  //
+  {
+    g_ceph_context->_conf->set_val("filestore_xattr_use_omap", "true");
+    EXPECT_EQ(::system((string("mount -o loop,nouser_xattr ") + disk + " " + mnt).c_str()), 0);
+    EXPECT_EQ(::chdir(mnt.c_str()), 0);
+    EXPECT_EQ(::mkdir(dir.c_str(), 0755), 0);
+    FileStore store(dir, journal);
+    EXPECT_EQ(store._detect_fs(), -ENOTSUP);
+    EXPECT_EQ(::chdir(".."), 0);
+    EXPECT_EQ(::umount(mnt.c_str()), 0);
+  }
+  //
+  // mounted with user_xattr, ext4 fails if filestore_xattr_use_omap is false
+  //
+  {
+    g_ceph_context->_conf->set_val("filestore_xattr_use_omap", "false");
+    EXPECT_EQ(::system((string("mount -o loop,user_xattr ") + disk + " " + mnt).c_str()), 0);
+    EXPECT_EQ(::chdir(mnt.c_str()), 0);
+    FileStore store(dir, journal);
+    EXPECT_EQ(store._detect_fs(), -ENOTSUP);
+    EXPECT_EQ(::chdir(".."), 0);
+    EXPECT_EQ(::umount(mnt.c_str()), 0);
+  }
+  //
+  // mounted with user_xattr, ext4 succeeds if filestore_xattr_use_omap is true
+  //
+  {
+    g_ceph_context->_conf->set_val("filestore_xattr_use_omap", "true");
+    EXPECT_EQ(::system((string("mount -o loop,user_xattr ") + disk + " " + mnt).c_str()), 0);
+    EXPECT_EQ(::chdir(mnt.c_str()), 0);
+    FileStore store(dir, journal);
+    EXPECT_EQ(store._detect_fs(), 0);
+    EXPECT_EQ(::chdir(".."), 0);
+    EXPECT_EQ(::umount(mnt.c_str()), 0);
+  }
+}
+
 int main(int argc, char **argv) {
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
@@ -830,7 +961,7 @@ int main(int argc, char **argv) {
   global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
   g_ceph_context->_conf->set_val("osd_journal_size", "400");
-  g_ceph_context->_conf->set_val("filestore_index_retry_probability", "1");
+  g_ceph_context->_conf->set_val("filestore_index_retry_probability", "0.5");
   g_ceph_context->_conf->set_val("filestore_op_thread_timeout", "1000");
   g_ceph_context->_conf->set_val("filestore_op_thread_suicide_timeout", "10000");
   g_ceph_context->_conf->apply_changes(NULL);
@@ -838,3 +969,7 @@ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// Local Variables:
+// compile-command: "cd ../.. ; make ceph_test_filestore ; ./ceph_test_filestore --gtest_filter=StoreTest.* --log-to-stderr=true --debug-filestore=20"
+// End:

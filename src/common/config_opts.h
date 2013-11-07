@@ -23,12 +23,15 @@ OPTION(num_client, OPT_INT, 1)
 OPTION(monmap, OPT_STR, "")
 OPTION(mon_host, OPT_STR, "")
 OPTION(lockdep, OPT_BOOL, false)
-OPTION(admin_socket, OPT_STR, "/var/run/ceph/$cluster-$name.asok") // default changed by common_preinit()
+OPTION(run_dir, OPT_STR, "/var/run/ceph")       // the "/var/run/ceph" dir, created on daemon startup
+OPTION(admin_socket, OPT_STR, "$run_dir/$cluster-$name.asok") // default changed by common_preinit()
 
 OPTION(daemonize, OPT_BOOL, false) // default changed by common_preinit()
 OPTION(pid_file, OPT_STR, "") // default changed by common_preinit()
 OPTION(chdir, OPT_STR, "/")
 OPTION(max_open_files, OPT_LONGLONG, 0)
+OPTION(restapi_log_level, OPT_STR, "") 	// default set by Python code
+OPTION(restapi_base_url, OPT_STR, "")	// "
 OPTION(fatal_signal_handlers, OPT_BOOL, true)
 
 OPTION(log_file, OPT_STR, "/var/log/ceph/$cluster-$name.log") // default changed by common_preinit()
@@ -50,6 +53,7 @@ OPTION(mon_cluster_log_to_syslog, OPT_BOOL, false)
 OPTION(mon_cluster_log_to_syslog_level, OPT_STR, "info")   // this level and above
 OPTION(mon_cluster_log_to_syslog_facility, OPT_STR, "daemon")
 OPTION(mon_cluster_log_file, OPT_STR, "/var/log/ceph/$cluster.log")
+OPTION(mon_cluster_log_file_level, OPT_STR, "info")
 
 DEFAULT_SUBSYS(0, 5)
 SUBSYS(lockdep, 0, 1)
@@ -79,7 +83,7 @@ SUBSYS(journal, 1, 3)
 SUBSYS(ms, 0, 5)
 SUBSYS(mon, 1, 5)
 SUBSYS(monc, 0, 10)
-SUBSYS(paxos, 0, 5)
+SUBSYS(paxos, 1, 5)
 SUBSYS(tp, 0, 5)
 SUBSYS(auth, 1, 5)
 SUBSYS(crypto, 1, 5)
@@ -87,7 +91,6 @@ SUBSYS(finisher, 1, 1)
 SUBSYS(heartbeatmap, 1, 5)
 SUBSYS(perfcounter, 1, 5)
 SUBSYS(rgw, 1, 5)                 // log level for the Rados gateway
-SUBSYS(hadoop, 1, 5)
 SUBSYS(javaclient, 1, 5)
 SUBSYS(asok, 1, 5)
 SUBSYS(throttle, 1, 1)
@@ -107,10 +110,11 @@ OPTION(ms_max_backoff, OPT_DOUBLE, 15.0)
 OPTION(ms_nocrc, OPT_BOOL, false)
 OPTION(ms_die_on_bad_msg, OPT_BOOL, false)
 OPTION(ms_die_on_unhandled_msg, OPT_BOOL, false)
+OPTION(ms_die_on_old_message, OPT_BOOL, false)     // assert if we get a dup incoming message and shouldn't have (may be triggered by pre-541cd3c64be0dfa04e8a2df39422e0eb9541a428 code)
 OPTION(ms_dispatch_throttle_bytes, OPT_U64, 100 << 20)
 OPTION(ms_bind_ipv6, OPT_BOOL, false)
 OPTION(ms_bind_port_min, OPT_INT, 6800)
-OPTION(ms_bind_port_max, OPT_INT, 7100)
+OPTION(ms_bind_port_max, OPT_INT, 7300)
 OPTION(ms_rwthread_stack_bytes, OPT_U64, 1024 << 10)
 OPTION(ms_tcp_read_timeout, OPT_U64, 900)
 OPTION(ms_pq_max_tokens_per_priority, OPT_U64, 4194304)
@@ -121,6 +125,8 @@ OPTION(ms_inject_delay_max, OPT_DOUBLE, 1)         // seconds
 OPTION(ms_inject_delay_probability, OPT_DOUBLE, 0) // range [0, 1]
 OPTION(ms_inject_internal_delays, OPT_DOUBLE, 0)   // seconds
 
+OPTION(inject_early_sigterm, OPT_BOOL, false)
+
 OPTION(mon_data, OPT_STR, "/var/lib/ceph/mon/$cluster-$id")
 OPTION(mon_initial_members, OPT_STR, "")    // list of initial cluster mon ids; if specified, need majority to form initial quorum and create new cluster
 OPTION(mon_sync_fs_threshold, OPT_INT, 5)   // sync() when writing this many objects; 0 to disable.
@@ -129,6 +135,7 @@ OPTION(mon_compact_on_bootstrap, OPT_BOOL, false)  // trigger leveldb compaction
 OPTION(mon_compact_on_trim, OPT_BOOL, true)       // compact (a prefix) when we trim old states
 OPTION(mon_tick_interval, OPT_INT, 5)
 OPTION(mon_subscribe_interval, OPT_DOUBLE, 300)
+OPTION(mon_delta_reset_interval, OPT_DOUBLE, 10)   // seconds of inactivity before we reset the pg delta to 0
 OPTION(mon_osd_laggy_halflife, OPT_INT, 60*60)        // (seconds) how quickly our laggy estimations decay
 OPTION(mon_osd_laggy_weight, OPT_DOUBLE, .3)          // weight for new 'samples's in laggy estimations
 OPTION(mon_osd_adjust_heartbeat_grace, OPT_BOOL, true)    // true if we should scale based on laggy estimations
@@ -140,6 +147,7 @@ OPTION(mon_osd_down_out_interval, OPT_INT, 300) // seconds
 OPTION(mon_osd_down_out_subtree_limit, OPT_STR, "rack")   // smallest crush unit/type that we will not automatically mark out
 OPTION(mon_osd_min_up_ratio, OPT_DOUBLE, .3)    // min osds required to be up to mark things down
 OPTION(mon_osd_min_in_ratio, OPT_DOUBLE, .3)   // min osds required to be in to mark things out
+OPTION(mon_osd_max_op_age, OPT_DOUBLE, 32)     // max op age before we get concerned (make it a power of 2)
 OPTION(mon_stat_smooth_intervals, OPT_INT, 2)  // smooth stats over last N PGMap maps
 OPTION(mon_lease, OPT_FLOAT, 5)       // lease interval
 OPTION(mon_lease_renew_interval, OPT_FLOAT, 3) // on leader, to renew the lease
@@ -169,41 +177,53 @@ OPTION(mon_health_data_update_interval, OPT_FLOAT, 60.0)
 OPTION(mon_data_avail_crit, OPT_INT, 5)
 OPTION(mon_data_avail_warn, OPT_INT, 30)
 OPTION(mon_config_key_max_entry_size, OPT_INT, 4096) // max num bytes per config-key entry
-OPTION(mon_sync_trim_timeout, OPT_DOUBLE, 30.0)
-OPTION(mon_sync_heartbeat_timeout, OPT_DOUBLE, 30.0)
-OPTION(mon_sync_heartbeat_interval, OPT_DOUBLE, 5.0)
-OPTION(mon_sync_backoff_timeout, OPT_DOUBLE, 30.0)
-OPTION(mon_sync_timeout, OPT_DOUBLE, 30.0)
-OPTION(mon_sync_max_retries, OPT_INT, 5)
+OPTION(mon_sync_timeout, OPT_DOUBLE, 60.0)
 OPTION(mon_sync_max_payload_size, OPT_U32, 1048576) // max size for a sync chunk payload (say, 1MB)
 OPTION(mon_sync_debug, OPT_BOOL, false) // enable sync-specific debug
 OPTION(mon_sync_debug_leader, OPT_INT, -1) // monitor to be used as the sync leader
 OPTION(mon_sync_debug_provider, OPT_INT, -1) // monitor to be used as the sync provider
 OPTION(mon_sync_debug_provider_fallback, OPT_INT, -1) // monitor to be used as fallback if sync provider fails
+<<<<<<< HEAD
+=======
+OPTION(mon_inject_sync_get_chunk_delay, OPT_DOUBLE, 0)  // inject N second delay on each get_chunk request
+OPTION(mon_osd_min_down_reporters, OPT_INT, 1)   // number of OSDs who need to report a down OSD for it to count
+OPTION(mon_osd_min_down_reports, OPT_INT, 3)     // number of times a down OSD must be reported for it to count
+OPTION(mon_osd_force_trim_to, OPT_INT, 0)   // force mon to trim maps to this point, regardless of min_last_epoch_clean (dangerous, use with care)
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 
 // dump transactions
 OPTION(mon_debug_dump_transactions, OPT_BOOL, false)
 OPTION(mon_debug_dump_location, OPT_STR, "/var/log/ceph/$cluster-$name.tdump")
 
+<<<<<<< HEAD
 OPTION(mon_sync_leader_kill_at, OPT_INT, 0) // kill the sync leader at a specifc point in the work flow
 OPTION(mon_sync_provider_kill_at, OPT_INT, 0) // kill the sync provider at a specific point in the work flow
+=======
+OPTION(mon_sync_provider_kill_at, OPT_INT, 0)  // kill the sync provider at a specific point in the work flow
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 OPTION(mon_sync_requester_kill_at, OPT_INT, 0) // kill the sync requester at a specific point in the work flow
 OPTION(mon_leveldb_write_buffer_size, OPT_U64, 32*1024*1024) // monitor's leveldb write buffer size
-OPTION(mon_leveldb_cache_size, OPT_U64, 0) // monitor's leveldb cache size
+OPTION(mon_leveldb_cache_size, OPT_U64, 512*1024*1024) // monitor's leveldb cache size
 OPTION(mon_leveldb_block_size, OPT_U64, 64*1024) // monitor's leveldb block size
 OPTION(mon_leveldb_bloom_size, OPT_INT, 0) // monitor's leveldb bloom bits per entry
 OPTION(mon_leveldb_max_open_files, OPT_INT, 0) // monitor's leveldb max open files
 OPTION(mon_leveldb_compression, OPT_BOOL, false) // monitor's leveldb uses compression
 OPTION(mon_leveldb_paranoid, OPT_BOOL, false)   // monitor's leveldb paranoid flag
 OPTION(mon_leveldb_log, OPT_STR, "")
+<<<<<<< HEAD
+=======
+OPTION(mon_leveldb_size_warn, OPT_U64, 40*1024*1024*1024) // issue a warning when the monitor's leveldb goes over 40GB (in bytes)
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 OPTION(paxos_stash_full_interval, OPT_INT, 25)   // how often (in commits) to stash a full copy of the PaxosService state
 OPTION(paxos_max_join_drift, OPT_INT, 10) // max paxos iterations before we must first sync the monitor stores
 OPTION(paxos_propose_interval, OPT_DOUBLE, 1.0)  // gather updates for this long before proposing a map update
 OPTION(paxos_min_wait, OPT_DOUBLE, 0.05)  // min time to gather updates for after period of inactivity
-OPTION(paxos_trim_tolerance, OPT_INT, 30) // number of extra proposals tolerated before trimming
-OPTION(paxos_trim_disabled_max_versions, OPT_INT, 100) // maximum amount of versions we shall allow passing by without trimming
-OPTION(paxos_service_trim_max, OPT_INT, 500) // maximum amount of versions to trim during a single proposal (0 disables it)
+OPTION(paxos_min, OPT_INT, 500)       // minimum number of paxos states to keep around
+OPTION(paxos_trim_min, OPT_INT, 250)  // number of extra proposals tolerated before trimming
+OPTION(paxos_trim_max, OPT_INT, 500) // max number of extra proposals to trim at a time
 OPTION(paxos_service_trim_min, OPT_INT, 250) // minimum amount of versions to trigger a trim (0 disables it)
+OPTION(paxos_service_trim_max, OPT_INT, 500) // maximum amount of versions to trim during a single proposal (0 disables it)
+OPTION(paxos_kill_at, OPT_INT, 0)
 OPTION(clock_offset, OPT_DOUBLE, 0) // how much to offset the system clock in Clock.cc
 OPTION(auth_cluster_required, OPT_STR, "cephx")   // required of mon, mds, osd daemons
 OPTION(auth_service_required, OPT_STR, "cephx")   // required by daemons of clients
@@ -234,6 +254,7 @@ OPTION(client_readahead_max_periods, OPT_LONGLONG, 4)  // as multiple of file la
 OPTION(client_snapdir, OPT_STR, ".snap")
 OPTION(client_mountpoint, OPT_STR, "/")
 OPTION(client_notify_timeout, OPT_INT, 10) // in seconds
+OPTION(osd_client_watch_timeout, OPT_INT, 30) // in seconds
 OPTION(client_caps_release_delay, OPT_INT, 5) // in seconds
 OPTION(client_oc, OPT_BOOL, true)
 OPTION(client_oc_size, OPT_INT, 1024*1024* 200)    // MB * n
@@ -335,6 +356,7 @@ OPTION(mds_kill_openc_at, OPT_INT, 0)
 OPTION(mds_kill_journal_at, OPT_INT, 0)
 OPTION(mds_kill_journal_expire_at, OPT_INT, 0)
 OPTION(mds_kill_journal_replay_at, OPT_INT, 0)
+OPTION(mds_open_remote_link_mode, OPT_INT, 0)
 OPTION(mds_inject_traceless_reply_probability, OPT_DOUBLE, 0) /* percentage
 				of MDS modify replies to skip sending the
 				client a trace on [0-1]*/
@@ -345,6 +367,9 @@ OPTION(max_mds, OPT_INT, 1)
 OPTION(mds_standby_for_name, OPT_STR, "")
 OPTION(mds_standby_for_rank, OPT_INT, -1)
 OPTION(mds_standby_replay, OPT_BOOL, false)
+
+// If true, compact leveldb store on mount
+OPTION(osd_compact_leveldb_on_mount, OPT_BOOL, false)
 
 // If true, uses tmap as initial value for omap on old objects
 OPTION(osd_auto_upgrade_tmap, OPT_BOOL, true)
@@ -380,15 +405,23 @@ OPTION(osd_pool_default_min_size, OPT_INT, 0)  // 0 means no specific default; c
 OPTION(osd_pool_default_pg_num, OPT_INT, 8) // number of PGs for new pools. Configure in global or mon section of ceph.conf
 OPTION(osd_pool_default_pgp_num, OPT_INT, 8) // number of PGs for placement purposes. Should be equal to pg_num
 OPTION(osd_pool_default_flags, OPT_INT, 0)   // default flags for new pools
+OPTION(osd_pool_default_flag_hashpspool, OPT_BOOL, false)   // use new pg hashing to prevent pool/pg overlap
 OPTION(osd_map_dedup, OPT_BOOL, true)
 OPTION(osd_map_cache_size, OPT_INT, 500)
 OPTION(osd_map_message_max, OPT_INT, 100)  // max maps per MOSDMap message
+OPTION(osd_map_share_max_epochs, OPT_INT, 100)  // cap on # of inc maps we send to peers, clients
 OPTION(osd_op_threads, OPT_INT, 2)    // 0 == no threading
+OPTION(osd_peering_wq_batch_size, OPT_U64, 20)
 OPTION(osd_op_pq_max_tokens_per_priority, OPT_U64, 4194304)
 OPTION(osd_op_pq_min_cost, OPT_U64, 65536)
 OPTION(osd_disk_threads, OPT_INT, 1)
 OPTION(osd_recovery_threads, OPT_INT, 1)
 OPTION(osd_recover_clone_overlap, OPT_BOOL, true)   // preserve clone_overlap during recovery/migration
+
+// Only use clone_overlap for recovery if there are fewer than
+// osd_recover_clone_overlap_limit entries in the overlap set
+OPTION(osd_recover_clone_overlap_limit, OPT_INT, 10)
+
 OPTION(osd_backfill_scan_min, OPT_INT, 64)
 OPTION(osd_backfill_scan_max, OPT_INT, 512)
 OPTION(osd_op_thread_timeout, OPT_INT, 15)
@@ -403,28 +436,41 @@ OPTION(osd_age_time, OPT_INT, 0)
 OPTION(osd_heartbeat_addr, OPT_ADDR, entity_addr_t())
 OPTION(osd_heartbeat_interval, OPT_INT, 6)       // (seconds) how often we ping peers
 OPTION(osd_heartbeat_grace, OPT_INT, 20)         // (seconds) how long before we decide a peer has failed
+OPTION(osd_heartbeat_min_peers, OPT_INT, 10)     // minimum number of peers
+
+// minimum number of peers tha tmust be reachable to mark ourselves
+// back up after being wrongly marked down.
+OPTION(osd_heartbeat_min_healthy_ratio, OPT_FLOAT, .33)
+
 OPTION(osd_mon_heartbeat_interval, OPT_INT, 30)  // (seconds) how often to ping monitor if no peers
 OPTION(osd_mon_report_interval_max, OPT_INT, 120)
 OPTION(osd_mon_report_interval_min, OPT_INT, 5)  // pg stats, failures, up_thru, boot.
+OPTION(osd_pg_stat_report_interval_max, OPT_INT, 500)  // report pg stats for any given pg at least this often
 OPTION(osd_mon_ack_timeout, OPT_INT, 30) // time out a mon if it doesn't ack stats
-OPTION(osd_min_down_reporters, OPT_INT, 1)   // number of OSDs who need to report a down OSD for it to count
-OPTION(osd_min_down_reports, OPT_INT, 3)     // number of times a down OSD must be reported for it to count
 OPTION(osd_default_data_pool_replay_window, OPT_INT, 45)
 OPTION(osd_preserve_trimmed_log, OPT_BOOL, false)
 OPTION(osd_auto_mark_unfound_lost, OPT_BOOL, false)
 OPTION(osd_recovery_delay_start, OPT_FLOAT, 0)
-OPTION(osd_recovery_max_active, OPT_INT, 5)
+OPTION(osd_recovery_max_active, OPT_INT, 15)
+OPTION(osd_recovery_max_single_start, OPT_INT, 5)
 OPTION(osd_recovery_max_chunk, OPT_U64, 8<<20)  // max size of push chunk
+OPTION(osd_copyfrom_max_chunk, OPT_U64, 8<<20)   // max size of a COPYFROM chunk
+OPTION(osd_push_per_object_cost, OPT_U64, 1000)  // push cost per object
+OPTION(osd_max_push_cost, OPT_U64, 8<<20)  // max size of push message
+OPTION(osd_max_push_objects, OPT_U64, 10)  // max objects in single push op
 OPTION(osd_recovery_forget_lost_objects, OPT_BOOL, false)   // off for now
 OPTION(osd_max_scrubs, OPT_INT, 1)
 OPTION(osd_scrub_load_threshold, OPT_FLOAT, 0.5)
 OPTION(osd_scrub_min_interval, OPT_FLOAT, 60*60*24)    // if load is low
 OPTION(osd_scrub_max_interval, OPT_FLOAT, 7*60*60*24)  // regardless of load
+OPTION(osd_scrub_chunk_min, OPT_INT, 5)
+OPTION(osd_scrub_chunk_max, OPT_INT, 25)
 OPTION(osd_deep_scrub_interval, OPT_FLOAT, 60*60*24*7) // once a week
 OPTION(osd_deep_scrub_stride, OPT_INT, 524288)
 OPTION(osd_scan_list_ping_tp_interval, OPT_U64, 100)
 OPTION(osd_auto_weight, OPT_BOOL, false)
 OPTION(osd_class_dir, OPT_STR, CEPH_LIBDIR "/rados-classes") // where rados plugins are stored
+OPTION(osd_open_classes_on_start, OPT_BOOL, true)
 OPTION(osd_check_for_log_corruption, OPT_BOOL, false)
 OPTION(osd_use_stale_snap, OPT_BOOL, false)
 OPTION(osd_rollback_to_cluster_snap, OPT_STR, "")
@@ -447,6 +493,7 @@ OPTION(osd_debug_drop_pg_create_duration, OPT_INT, 1)
 OPTION(osd_debug_drop_op_probability, OPT_DOUBLE, 0)   // probability of stalling/dropping a client op
 OPTION(osd_debug_op_order, OPT_BOOL, false)
 OPTION(osd_debug_verify_snaps_on_info, OPT_BOOL, false)
+OPTION(osd_debug_verify_stray_on_activate, OPT_BOOL, false)
 OPTION(osd_debug_skip_full_check_in_backfill_reservation, OPT_BOOL, false)
 OPTION(osd_op_history_size, OPT_U32, 20)    // Max number of completed ops to track
 OPTION(osd_op_history_duration, OPT_U32, 600) // Oldest completed op to track
@@ -461,6 +508,12 @@ OPTION(osd_leveldb_max_open_files, OPT_INT, 0) // OSD's leveldb max open files
 OPTION(osd_leveldb_compression, OPT_BOOL, true) // OSD's leveldb uses compression
 OPTION(osd_leveldb_paranoid, OPT_BOOL, false) // OSD's leveldb paranoid flag
 OPTION(osd_leveldb_log, OPT_STR, "")  // enable OSD leveldb log file
+<<<<<<< HEAD
+=======
+
+// determines whether PGLog::check() compares written out log to stored log
+OPTION(osd_debug_pg_log_writeout, OPT_BOOL, false)
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 
 /**
  * osd_client_op_priority and osd_recovery_op_priority adjust the relative
@@ -469,14 +522,38 @@ OPTION(osd_leveldb_log, OPT_STR, "")  // enable OSD leveldb log file
  * osd_client_op_priority/osd_recovery_op_priority determines the ratio of
  * available io between client and recovery.  Each option may be set between
  * 1..63.
+ *
+ * osd_recovery_op_warn_multiple scales the normal warning threshhold,
+ * osd_op_complaint_time, so that slow recovery ops won't cause noise
  */
-OPTION(osd_client_op_priority, OPT_INT, 63)
-OPTION(osd_recovery_op_priority, OPT_INT, 10)
+OPTION(osd_client_op_priority, OPT_U32, 63)
+OPTION(osd_recovery_op_priority, OPT_U32, 10)
+OPTION(osd_recovery_op_warn_multiple, OPT_U32, 16)
 
 // Max time to wait between notifying mon of shutdown and shutting down
 OPTION(osd_mon_shutdown_timeout, OPT_DOUBLE, 5)
 
+OPTION(osd_max_object_size, OPT_U64, 100*1024L*1024L*1024L) // OSD's maximum object size
+OPTION(osd_max_attr_size, OPT_U64, 65536)
+
 OPTION(filestore, OPT_BOOL, false)
+
+/// filestore wb throttle limits
+OPTION(filestore_wbthrottle_enable, OPT_BOOL, true)
+OPTION(filestore_wbthrottle_btrfs_bytes_start_flusher, OPT_U64, 41943040)
+OPTION(filestore_wbthrottle_btrfs_bytes_hard_limit, OPT_U64, 419430400)
+OPTION(filestore_wbthrottle_btrfs_ios_start_flusher, OPT_U64, 500)
+OPTION(filestore_wbthrottle_btrfs_ios_hard_limit, OPT_U64, 5000)
+OPTION(filestore_wbthrottle_btrfs_inodes_start_flusher, OPT_U64, 500)
+OPTION(filestore_wbthrottle_xfs_bytes_start_flusher, OPT_U64, 41943040)
+OPTION(filestore_wbthrottle_xfs_bytes_hard_limit, OPT_U64, 419430400)
+OPTION(filestore_wbthrottle_xfs_ios_start_flusher, OPT_U64, 500)
+OPTION(filestore_wbthrottle_xfs_ios_hard_limit, OPT_U64, 5000)
+OPTION(filestore_wbthrottle_xfs_inodes_start_flusher, OPT_U64, 500)
+
+/// These must be less than the fd limit
+OPTION(filestore_wbthrottle_btrfs_inodes_hard_limit, OPT_U64, 5000)
+OPTION(filestore_wbthrottle_xfs_inodes_hard_limit, OPT_U64, 5000)
 
 // Tests index failure paths
 OPTION(filestore_index_retry_probability, OPT_DOUBLE, 0)
@@ -496,12 +573,9 @@ OPTION(filestore_max_sync_interval, OPT_DOUBLE, 5)    // seconds
 OPTION(filestore_min_sync_interval, OPT_DOUBLE, .01)  // seconds
 OPTION(filestore_btrfs_snap, OPT_BOOL, true)
 OPTION(filestore_btrfs_clone_range, OPT_BOOL, true)
+OPTION(filestore_zfs_snap, OPT_BOOL, false) // zfsonlinux is still unstable
 OPTION(filestore_fsync_flushes_journal_data, OPT_BOOL, false)
 OPTION(filestore_fiemap, OPT_BOOL, false)     // (try to) use fiemap
-OPTION(filestore_flusher, OPT_BOOL, true)
-OPTION(filestore_flusher_max_fds, OPT_INT, 512)
-OPTION(filestore_flush_min, OPT_INT, 65536)
-OPTION(filestore_sync_flush, OPT_BOOL, false)
 OPTION(filestore_journal_parallel, OPT_BOOL, false)
 OPTION(filestore_journal_writeahead, OPT_BOOL, false)
 OPTION(filestore_journal_trailing, OPT_BOOL, false)
@@ -518,6 +592,7 @@ OPTION(filestore_merge_threshold, OPT_INT, 10)
 OPTION(filestore_split_multiple, OPT_INT, 2)
 OPTION(filestore_update_to, OPT_INT, 1000)
 OPTION(filestore_blackhole, OPT_BOOL, false)     // drop any new transactions on the floor
+OPTION(filestore_fd_cache_size, OPT_INT, 128)    // FD lru size
 OPTION(filestore_dump_file, OPT_STR, "")         // file onto which store transaction dumps
 OPTION(filestore_kill_at, OPT_INT, 0)            // inject a failure at the n'th opportunity
 OPTION(filestore_inject_stall, OPT_INT, 0)       // artificially stall for N seconds in op queue thread
@@ -548,6 +623,31 @@ OPTION(rbd_cache_max_dirty, OPT_LONGLONG, 24<<20)    // dirty limit in bytes - s
 OPTION(rbd_cache_target_dirty, OPT_LONGLONG, 16<<20) // target dirty limit in bytes
 OPTION(rbd_cache_max_dirty_age, OPT_FLOAT, 1.0)      // seconds in cache before writeback starts
 OPTION(rbd_cache_block_writes_upfront, OPT_BOOL, false) // whether to block writes to the cache before the aio_write call completes (true), or block before the aio completion is called (false)
+OPTION(rbd_concurrent_management_ops, OPT_INT, 10) // how many operations can be in flight for a management operation like deleting or resizing an image
+OPTION(rbd_balance_snap_reads, OPT_BOOL, false)
+OPTION(rbd_localize_snap_reads, OPT_BOOL, false)
+
+/*
+ * The following options change the behavior for librbd's image creation methods that
+ * don't require all of the parameters. These are provided so that older programs
+ * can take advantage of newer features without being rewritten to use new versions
+ * of the image creation functions.
+ *
+ * rbd_create()/RBD::create() are affected by all of these options.
+ *
+ * rbd_create2()/RBD::create2() and rbd_clone()/RBD::clone() are affected by:
+ * - rbd_default_order
+ * - rbd_default_stripe_count
+ * - rbd_default_stripe_size
+ *
+ * rbd_create3()/RBD::create3() and rbd_clone2/RBD::clone2() are only
+ * affected by rbd_default_order.
+ */
+OPTION(rbd_default_format, OPT_INT, 1)
+OPTION(rbd_default_order, OPT_INT, 22)
+OPTION(rbd_default_stripe_count, OPT_U64, 1) // changing requires stripingv2 feature
+OPTION(rbd_default_stripe_unit, OPT_U64, 4194304) // changing to non-object size requires stripingv2 feature
+OPTION(rbd_default_features, OPT_INT, 3) // 1 for layering, 3 for layering+stripingv2. only applies to format 2 images
 
 /*
  * The following options change the behavior for librbd's image creation methods that
@@ -592,6 +692,8 @@ OPTION(rgw_keystone_admin_token, OPT_STR, "")  // keystone admin token (shared s
 OPTION(rgw_keystone_accepted_roles, OPT_STR, "Member, admin")  // roles required to serve requests
 OPTION(rgw_keystone_token_cache_size, OPT_INT, 10000)  // max number of entries in keystone token cache
 OPTION(rgw_keystone_revocation_interval, OPT_INT, 15 * 60)  // seconds between tokens revocation check
+OPTION(rgw_s3_auth_use_rados, OPT_BOOL, true)  // should we try to use the internal credentials for s3?
+OPTION(rgw_s3_auth_use_keystone, OPT_BOOL, false)  // should we try to use keystone for s3?
 OPTION(rgw_admin_entry, OPT_STR, "admin")  // entry point for which a url is considered an admin request
 OPTION(rgw_enforce_swift_acls, OPT_BOOL, true)
 OPTION(rgw_swift_token_expiration, OPT_INT, 24 * 3600) // time in seconds for swift token expiration
@@ -602,7 +704,11 @@ OPTION(rgw_op_thread_suicide_timeout, OPT_INT, 0)
 OPTION(rgw_thread_pool_size, OPT_INT, 100)
 OPTION(rgw_num_control_oids, OPT_INT, 8)
 
-OPTION(rgw_zone_root_pool, OPT_STR, ".rgw.root")
+OPTION(rgw_zone, OPT_STR, "") // zone name
+OPTION(rgw_zone_root_pool, OPT_STR, ".rgw.root")    // pool where zone specific info is stored
+OPTION(rgw_region, OPT_STR, "") // region name
+OPTION(rgw_region_root_pool, OPT_STR, ".rgw.root")  // pool where all region info is stored
+OPTION(rgw_default_region_info_oid, OPT_STR, "default.region")  // oid where default region info is stored
 OPTION(rgw_log_nonexistent_bucket, OPT_BOOL, false)
 OPTION(rgw_log_object_name, OPT_STR, "%Y-%m-%d-%H-%i-%n")      // man date to see codes (a subset are supported)
 OPTION(rgw_log_object_name_utc, OPT_BOOL, false)
@@ -632,6 +738,18 @@ OPTION(rgw_get_obj_window_size, OPT_INT, 16 << 20) // window size in bytes for s
 OPTION(rgw_get_obj_max_req_size, OPT_INT, 4 << 20) // max length of a single get obj rados op
 OPTION(rgw_relaxed_s3_bucket_names, OPT_BOOL, false) // enable relaxed bucket name rules for US region buckets
 OPTION(rgw_list_buckets_max_chunk, OPT_INT, 1000) // max buckets to retrieve in a single op when listing user buckets
+OPTION(rgw_md_log_max_shards, OPT_INT, 64) // max shards for metadata log
+OPTION(rgw_num_zone_opstate_shards, OPT_INT, 128) // max shards for keeping inter-region copy progress info
+OPTION(rgw_opstate_ratelimit_sec, OPT_INT, 30) // min time between opstate updates on a single upload (0 for disabling ratelimit)
+OPTION(rgw_curl_wait_timeout_ms, OPT_INT, 1000) // timeout for certain curl calls
+OPTION(rgw_copy_obj_progress, OPT_BOOL, true) // should dump progress during long copy operations?
+OPTION(rgw_copy_obj_progress_every_bytes, OPT_INT, 1024 * 1024) // min bytes between copy progress output
+
+OPTION(rgw_data_log_window, OPT_INT, 30) // data log entries window (in seconds)
+OPTION(rgw_data_log_changes_size, OPT_INT, 1000) // number of in-memory entries to hold for data changes log
+OPTION(rgw_data_log_num_shards, OPT_INT, 128) // number of objects to keep data changes log on
+OPTION(rgw_data_log_obj_prefix, OPT_STR, "data_log") // 
+OPTION(rgw_replica_log_obj_prefix, OPT_STR, "replica_log") // 
 
 OPTION(mutex_perf_counter, OPT_BOOL, false) // enable/disable mutex perf counter
 

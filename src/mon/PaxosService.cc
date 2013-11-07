@@ -24,16 +24,22 @@
 
 #define dout_subsys ceph_subsys_paxos
 #undef dout_prefix
-#define dout_prefix _prefix(_dout, mon, paxos, service_name)
-static ostream& _prefix(std::ostream *_dout, Monitor *mon, Paxos *paxos, string service_name) {
+#define dout_prefix _prefix(_dout, mon, paxos, service_name, get_first_committed(), get_last_committed())
+static ostream& _prefix(std::ostream *_dout, Monitor *mon, Paxos *paxos, string service_name,
+			version_t fc, version_t lc) {
   return *_dout << "mon." << mon->name << "@" << mon->rank
 		<< "(" << mon->get_state_name()
-		<< ").paxosservice(" << service_name << ") ";
+		<< ").paxosservice(" << service_name << " " << fc << ".." << lc << ") ";
 }
 
 bool PaxosService::dispatch(PaxosServiceMessage *m)
 {
   dout(10) << "dispatch " << *m << " from " << m->get_orig_source_inst() << dendl;
+
+  if (mon->is_shutdown()) {
+    m->put();
+    return true;
+  }
 
   // make sure this message isn't forwarded from a previous election epoch
   if (m->rx_election_epoch &&
@@ -44,15 +50,24 @@ bool PaxosService::dispatch(PaxosServiceMessage *m)
     return true;
   }
 
+  // make sure the client is still connected.  note that a proxied
+  // connection will be disconnected with a null message; don't drop
+  // those.  also ignore loopback (e.g., log) messages.
+  if (!m->get_connection()->is_connected() &&
+      m->get_connection() != mon->con_self &&
+      m->get_connection()->get_messenger() != NULL) {
+    dout(10) << " discarding message from disconnected client "
+	     << m->get_source_inst() << " " << *m << dendl;
+    m->put();
+    return true;
+  }
+
   // make sure our map is readable and up to date
   if (!is_readable(m->version)) {
     dout(10) << " waiting for paxos -> readable (v" << m->version << ")" << dendl;
     wait_for_readable(new C_RetryMessage(this, m), m->version);
     return true;
   }
-
-  // make sure service has latest from paxos.
-  update_from_paxos();
 
   // preprocess
   if (preprocess_query(m)) 
@@ -80,11 +95,11 @@ bool PaxosService::dispatch(PaxosServiceMessage *m)
       } else {
 	// delay a bit
 	if (!proposal_timer) {
-	  dout(10) << " setting propose timer with delay of " << delay << dendl;
 	  proposal_timer = new C_Propose(this);
+	  dout(10) << " setting proposal_timer " << proposal_timer << " with delay of " << delay << dendl;
 	  mon->timer.add_event_after(delay, proposal_timer);
 	} else { 
-	  dout(10) << " propose timer already set" << dendl;
+	  dout(10) << " proposal_timer already set" << dendl;
 	}
       }
     } else {
@@ -94,7 +109,26 @@ bool PaxosService::dispatch(PaxosServiceMessage *m)
   return true;
 }
 
-void PaxosService::scrub()
+void PaxosService::refresh(bool *need_bootstrap)
+{
+  // update cached versions
+  cached_first_committed = mon->store->get(get_service_name(), first_committed_name);
+  cached_last_committed = mon->store->get(get_service_name(), last_committed_name);
+
+  version_t new_format = get_value("format_version");
+  if (new_format != format_version) {
+    dout(1) << __func__ << " upgraded, format " << format_version << " -> " << new_format << dendl;
+    on_upgrade();
+  }
+  format_version = new_format;
+
+  dout(10) << __func__ << dendl;
+
+  update_from_paxos(need_bootstrap);
+}
+
+
+void PaxosService::remove_legacy_versions()
 {
   dout(10) << __func__ << dendl;
   if (!mon->store->exists(get_service_name(), "conversion_first"))
@@ -135,14 +169,14 @@ void PaxosService::propose_pending()
 {
   dout(10) << "propose_pending" << dendl;
   assert(have_pending);
+  assert(!proposing);
   assert(mon->is_leader());
   assert(is_active());
-  if (!is_active())
-    return;
 
   if (proposal_timer) {
+    dout(10) << " canceling proposal_timer " << proposal_timer << dendl;
     mon->timer.cancel_event(proposal_timer);
-    proposal_timer = 0;
+    proposal_timer = NULL;
   }
 
   /**
@@ -156,16 +190,15 @@ void PaxosService::propose_pending()
   MonitorDBStore::Transaction t;
   bufferlist bl;
 
-  update_trim();
   if (should_stash_full())
     encode_full(&t);
 
-  if (should_trim()) {
-    encode_trim(&t);
-  }
-
   encode_pending(&t);
   have_pending = false;
+
+  if (format_version > 0) {
+    t.put(get_service_name(), "format_version", format_version);
+  }
 
   dout(30) << __func__ << " transaction dump:\n";
   JSONFormatter f(true);
@@ -176,7 +209,7 @@ void PaxosService::propose_pending()
   t.encode(bl);
 
   // apply to paxos
-  proposing.set(1);
+  proposing = true;
   paxos->propose_new_value(bl, new C_Committed(this));
 }
 
@@ -190,18 +223,25 @@ bool PaxosService::should_stash_full()
    */
   return (!latest_full ||
 	  (latest_full <= get_trim_to()) ||
-	  (get_version() - latest_full > (unsigned)g_conf->paxos_stash_full_interval));
+	  (get_last_committed() - latest_full > (unsigned)g_conf->paxos_stash_full_interval));
 }
 
 void PaxosService::restart()
 {
   dout(10) << "restart" << dendl;
   if (proposal_timer) {
+    dout(10) << " canceling proposal_timer " << proposal_timer << dendl;
     mon->timer.cancel_event(proposal_timer);
     proposal_timer = 0;
   }
 
   finish_contexts(g_ceph_context, waiting_for_finished_proposal, -EAGAIN);
+
+  if (have_pending) {
+    discard_pending();
+    have_pending = false;
+  }
+  proposing = false;
 
   on_restart();
 }
@@ -210,28 +250,18 @@ void PaxosService::election_finished()
 {
   dout(10) << "election_finished" << dendl;
 
-  if (proposal_timer) {
-    mon->timer.cancel_event(proposal_timer);
-    proposal_timer = 0;
-  }
-
-  if (have_pending) {
-    discard_pending();
-    have_pending = false;
-  }
-  proposing.set(0);
-
   finish_contexts(g_ceph_context, waiting_for_finished_proposal, -EAGAIN);
 
   // make sure we update our state
-  if (is_active())
-    _active();
-  else
-    wait_for_active(new C_Active(this));
+  _active();
 }
 
 void PaxosService::_active()
 {
+  if (is_proposing()) {
+    dout(10) << "_acting - proposing" << dendl;
+    return;
+  }
   if (!is_active()) {
     dout(10) << "_active - not active" << dendl;
     wait_for_active(new C_Active(this));
@@ -239,10 +269,7 @@ void PaxosService::_active()
   }
   dout(10) << "_active" << dendl;
 
-  // pull latest from paxos
-  update_from_paxos();
-
-  scrub();
+  remove_legacy_versions();
 
   // create pending state?
   if (mon->is_leader() && is_active()) {
@@ -252,7 +279,7 @@ void PaxosService::_active()
       have_pending = true;
     }
 
-    if (get_version() == 0) {
+    if (get_last_committed() == 0) {
       // create initial state
       create_initial();
       propose_pending();
@@ -271,6 +298,9 @@ void PaxosService::_active()
   // on this list; it is on Paxos's.
   finish_contexts(g_ceph_context, waiting_for_finished_proposal, 0);
 
+  if (is_active() && mon->is_leader())
+    upgrade_format();
+
   // NOTE: it's possible that this will get called twice if we commit
   // an old paxos value.  Implementations should be mindful of that.
   if (is_active())
@@ -283,30 +313,53 @@ void PaxosService::shutdown()
   cancel_events();
 
   if (proposal_timer) {
+    dout(10) << " canceling proposal_timer " << proposal_timer << dendl;
     mon->timer.cancel_event(proposal_timer);
     proposal_timer = 0;
   }
 
   finish_contexts(g_ceph_context, waiting_for_finished_proposal, -EAGAIN);
+
+  on_shutdown();
 }
 
-void PaxosService::put_version(MonitorDBStore::Transaction *t,
-			       const string& prefix, version_t ver,
-			       bufferlist& bl)
+void PaxosService::maybe_trim()
 {
-  ostringstream os;
-  os << ver;
-  string key = mon->store->combine_strings(prefix, os.str());
-  t->put(get_service_name(), key, bl);
-}
+  if (!is_writeable())
+    return;
 
-int PaxosService::get_version(const string& prefix, version_t ver,
-			      bufferlist& bl)
-{
-  ostringstream os;
-  os << ver;
-  string key = mon->store->combine_strings(prefix, os.str());
-  return mon->store->get(get_service_name(), key, bl);
+  version_t trim_to = get_trim_to();
+  if (trim_to < get_first_committed())
+    return;
+
+  version_t to_remove = trim_to - get_first_committed();
+  if (g_conf->paxos_service_trim_min > 0 &&
+      to_remove < (version_t)g_conf->paxos_service_trim_min) {
+    dout(10) << __func__ << " trim_to " << trim_to << " would only trim " << to_remove
+	     << " < paxos_service_trim_min " << g_conf->paxos_service_trim_min << dendl;
+    return;
+  }
+
+  if (g_conf->paxos_service_trim_max > 0 &&
+      to_remove > (version_t)g_conf->paxos_service_trim_max) {
+    dout(10) << __func__ << " trim_to " << trim_to << " would only trim " << to_remove
+	     << " > paxos_service_trim_max, limiting to " << g_conf->paxos_service_trim_max
+	     << dendl;
+    trim_to = get_first_committed() + g_conf->paxos_service_trim_max;
+    to_remove = trim_to - get_first_committed();
+  }
+
+  dout(10) << __func__ << " trimming to " << trim_to << ", " << to_remove << " states" << dendl;
+  MonitorDBStore::Transaction t;
+  trim(&t, get_first_committed(), trim_to);
+  put_first_committed(&t, trim_to);
+
+  // let the service add any extra stuff
+  encode_trim_extra(&t, trim_to);
+
+  bufferlist bl;
+  t.encode(bl);
+  paxos->propose_new_value(bl, NULL);
 }
 
 void PaxosService::trim(MonitorDBStore::Transaction *t,
@@ -314,11 +367,12 @@ void PaxosService::trim(MonitorDBStore::Transaction *t,
 {
   dout(10) << __func__ << " from " << from << " to " << to << dendl;
   assert(from != to);
-  for (; from < to; from++) {
-    dout(20) << __func__ << " " << from << dendl;
-    t->erase(get_service_name(), from);
 
-    string full_key = mon->store->combine_strings("full", from);
+  for (version_t v = from; v < to; ++v) {
+    dout(20) << __func__ << " " << v << dendl;
+    t->erase(get_service_name(), v);
+
+    string full_key = mon->store->combine_strings("full", v);
     if (mon->store->exists(get_service_name(), full_key)) {
       dout(20) << __func__ << " " << full_key << dendl;
       t->erase(get_service_name(), full_key);
@@ -326,35 +380,7 @@ void PaxosService::trim(MonitorDBStore::Transaction *t,
   }
   if (g_conf->mon_compact_on_trim) {
     dout(20) << " compacting prefix " << get_service_name() << dendl;
-    t->compact_prefix(get_service_name());
+    t->compact_range(get_service_name(), stringify(from - 1), stringify(to));
   }
-}
-
-void PaxosService::encode_trim(MonitorDBStore::Transaction *t)
-{
-  version_t first_committed = get_first_committed();
-  version_t latest_full = get_version("full", "latest");
-  version_t trim_to = get_trim_to();
-
-  dout(10) << __func__ << " " << trim_to << " (was " << first_committed << ")"
-	   << ", latest full " << latest_full << dendl;
-
-  if (first_committed >= trim_to)
-    return;
-
-  version_t trim_to_max = trim_to;
-  if ((g_conf->paxos_service_trim_max > 0)
-      && (trim_to - first_committed > (size_t)g_conf->paxos_service_trim_max)) {
-    trim_to_max = first_committed + g_conf->paxos_service_trim_max;
-  }
-
-  dout(10) << __func__ << " trimming versions " << first_committed
-           << " to " << trim_to_max << dendl;
-
-  trim(t, first_committed, trim_to_max);
-  put_first_committed(t, trim_to_max);
-
-  if (trim_to_max == trim_to)
-    set_trim_to(0);
 }
 

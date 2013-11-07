@@ -1,11 +1,17 @@
+#include "gtest/gtest.h"
+
 #include "mds/mdstypes.h"
 #include "include/buffer.h"
 #include "include/rbd_types.h"
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
+#include "include/stringify.h"
+#include "global/global_context.h"
+#include "global/global_init.h"
+#include "common/ceph_argparse.h"
+#include "common/common_init.h"
 #include "test/librados/test.h"
 
-#include "gtest/gtest.h"
 #include <errno.h>
 #include <map>
 #include <sstream>
@@ -365,6 +371,47 @@ TEST(LibRadosMisc, Operate2PP) {
   ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
 }
 
+TEST(LibRadosMisc, BigObjectPP) {
+  Rados cluster;
+  std::string pool_name = get_temp_pool_name();
+  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
+  IoCtx ioctx;
+  cluster.ioctx_create(pool_name.c_str(), ioctx);
+
+  bufferlist bl;
+  bl.append("abcdefg");
+  ASSERT_EQ((int)bl.length(), ioctx.write("foo", bl, bl.length(), 0));
+
+  {
+    ObjectWriteOperation o;
+    o.truncate(500000000000ull);
+    ASSERT_EQ(-EFBIG, ioctx.operate("foo", &o));
+  }
+  {
+    ObjectWriteOperation o;
+    o.zero(500000000000ull, 1);
+    ASSERT_EQ(-EFBIG, ioctx.operate("foo", &o));
+  }
+  {
+    ObjectWriteOperation o;
+    o.zero(1, 500000000000ull);
+    ASSERT_EQ(-EFBIG, ioctx.operate("foo", &o));
+  }
+  {
+    ObjectWriteOperation o;
+    o.zero(500000000000ull, 500000000000ull);
+    ASSERT_EQ(-EFBIG, ioctx.operate("foo", &o));
+  }
+
+#ifdef __LP64__
+  // this test only works on 64-bit platforms
+  ASSERT_EQ(-EFBIG, ioctx.write("foo", bl, bl.length(), 500000000000ull));
+#endif
+
+  ioctx.close();
+  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+}
+
 void set_completion_complete(rados_completion_t cb, void *arg)
 {
   bool *my_aio_complete = (bool*)arg;
@@ -473,4 +520,109 @@ TEST(LibRadosMisc, AssertExistsPP) {
 
   ioctx.close();
   ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+}
+
+TEST(LibRadosMisc, BigAttrPP) {
+  Rados cluster;
+  std::string pool_name = get_temp_pool_name();
+  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
+  IoCtx ioctx;
+  ASSERT_EQ(0, cluster.ioctx_create(pool_name.c_str(), ioctx));
+
+  char buf[64];
+  memset(buf, 0xcc, sizeof(buf));
+  bufferlist bl;
+  bl.append(buf, sizeof(buf));
+
+  ASSERT_EQ(0, ioctx.create("foo", true));
+
+  bufferlist got;
+
+  bl.clear();
+  got.clear();
+  bl.append(buffer::create(g_conf->osd_max_attr_size));
+  ASSERT_EQ(0, ioctx.setxattr("foo", "one", bl));
+  ASSERT_EQ((int)bl.length(), ioctx.getxattr("foo", "one", got));
+  ASSERT_TRUE(bl.contents_equal(got));
+
+  bl.clear();
+  bl.append(buffer::create(g_conf->osd_max_attr_size+1));
+  ASSERT_EQ(-EFBIG, ioctx.setxattr("foo", "one", bl));
+
+  for (int i=0; i<1000; i++) {
+    bl.clear();
+    got.clear();
+    bl.append(buffer::create(g_conf->osd_max_attr_size));
+    char n[10];
+    snprintf(n, sizeof(n), "a%d", i);
+    ASSERT_EQ(0, ioctx.setxattr("foo", n, bl));
+    ASSERT_EQ((int)bl.length(), ioctx.getxattr("foo", n, got));
+    ASSERT_TRUE(bl.contents_equal(got));
+  }
+
+  ioctx.close();
+  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+}
+
+TEST(LibRadosMisc, CopyPP) {
+  Rados cluster;
+  std::string pool_name = get_temp_pool_name();
+  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
+  IoCtx ioctx;
+  ASSERT_EQ(0, cluster.ioctx_create(pool_name.c_str(), ioctx));
+
+  bufferlist bl, x;
+  bl.append("hi there");
+  x.append("bar");
+
+  // small object
+  bufferlist blc = bl;
+  bufferlist xc = x;
+  ASSERT_EQ(0, ioctx.write_full("foo", blc));
+  ASSERT_EQ(0, ioctx.setxattr("foo", "myattr", xc));
+
+  ObjectWriteOperation op;
+  op.copy_from("foo", ioctx, ioctx.get_last_version());
+  ASSERT_EQ(0, ioctx.operate("foo.copy", &op));
+
+  bufferlist bl2, x2;
+  ASSERT_EQ((int)bl.length(), ioctx.read("foo.copy", bl2, 10000, 0));
+  ASSERT_TRUE(bl.contents_equal(bl2));
+  ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
+  ASSERT_TRUE(x.contents_equal(x2));
+
+  // do a big object
+  bl.append(buffer::create(8000000));
+  bl.zero();
+  bl.append("tail");
+  blc = bl;
+  xc = x;
+  ASSERT_EQ(0, ioctx.write_full("big", blc));
+  ASSERT_EQ(0, ioctx.setxattr("big", "myattr", xc));
+
+  ObjectWriteOperation op2;
+  op.copy_from("big", ioctx, ioctx.get_last_version());
+  ASSERT_EQ(0, ioctx.operate("big.copy", &op));
+
+  bl2.clear();
+  ASSERT_EQ((int)bl.length(), ioctx.read("big.copy", bl2, bl.length(), 0));
+  ASSERT_TRUE(bl.contents_equal(bl2));
+  ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
+  ASSERT_TRUE(x.contents_equal(x2));
+
+  ioctx.close();
+  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+}
+
+int main(int argc, char **argv)
+{
+  ::testing::InitGoogleTest(&argc, argv);
+
+  vector<const char*> args;
+  argv_to_vec(argc, (const char **)argv, args);
+
+  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  common_init_finish(g_ceph_context);
+
+  return RUN_ALL_TESTS();
 }

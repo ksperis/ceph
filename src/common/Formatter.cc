@@ -14,11 +14,12 @@
 
 #define LARGE_SIZE 1024
 
+#include "include/int_types.h"
+
 #include "assert.h"
 #include "Formatter.h"
 #include "common/escape.h"
 
-#include <inttypes.h>
 #include <iostream>
 #include <sstream>
 #include <stdarg.h>
@@ -61,6 +62,24 @@ Formatter::~Formatter()
 {
 }
 
+Formatter *
+new_formatter(const std::string type)
+{
+    std::string mytype = type;
+    if (mytype == "")
+      mytype = "json-pretty";
+
+    if (mytype == "json")
+      return new JSONFormatter(false);
+    else if (mytype == "json-pretty")
+      return new JSONFormatter(true);
+    else if (mytype == "xml")
+      return new XMLFormatter(false);
+    else if (mytype == "xml-pretty")
+      return new XMLFormatter(true);
+    else
+      return (Formatter *)NULL;
+}
 // -----------------------
 JSONFormatter::JSONFormatter(bool p)
   : m_pretty(p), m_is_pending_string(false)
@@ -236,6 +255,18 @@ void JSONFormatter::dump_format(const char *name, const char *fmt, ...)
   print_quoted_string(buf);
 }
 
+void JSONFormatter::dump_format_unquoted(const char *name, const char *fmt, ...)
+{
+  char buf[LARGE_SIZE];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, LARGE_SIZE, fmt, ap);
+  va_end(ap);
+
+  print_name(name);
+  m_ss << buf;
+}
+
 int JSONFormatter::get_len() const
 {
   return m_ss.str().size();
@@ -365,7 +396,6 @@ void XMLFormatter::dump_string_with_attrs(const char *name, std::string s, const
 
 std::ostream& XMLFormatter::dump_stream(const char *name)
 {
-  assert(m_pending_string_name.empty());
   print_spaces();
   m_pending_string_name = name;
   m_ss << "<" << m_pending_string_name << ">";
@@ -383,6 +413,21 @@ void XMLFormatter::dump_format(const char *name, const char *fmt, ...)
   std::string e(name);
   print_spaces();
   m_ss << "<" << e << ">" << escape_xml_str(buf) << "</" << e << ">";
+  if (m_pretty)
+    m_ss << "\n";
+}
+
+void XMLFormatter::dump_format_unquoted(const char *name, const char *fmt, ...)
+{
+  char buf[LARGE_SIZE];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, LARGE_SIZE, fmt, ap);
+  va_end(ap);
+
+  std::string e(name);
+  print_spaces();
+  m_ss << "<" << e << ">" << buf << "</" << e << ">";
   if (m_pretty)
     m_ss << "\n";
 }

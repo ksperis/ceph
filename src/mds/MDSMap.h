@@ -56,7 +56,6 @@ using namespace std;
 
 */
 
-class md_config_t;
 class CephContext;
 
 extern CompatSet get_mdsmap_compat_set();
@@ -309,6 +308,13 @@ public:
       if (p->second.state >= STATE_REPLAY && p->second.state <= STATE_STOPPING)
 	s.insert(p->second.rank);
   }
+  void get_clientreplay_or_active_or_stopping_mds_set(set<int>& s) {
+    for (map<uint64_t,mds_info_t>::const_iterator p = mds_info.begin();
+	 p != mds_info.end();
+	 ++p)
+      if (p->second.state >= STATE_CLIENTREPLAY && p->second.state <= STATE_STOPPING)
+	s.insert(p->second.rank);
+  }
   void get_mds_set(set<int>& s, int state) {
     for (map<uint64_t,mds_info_t>::const_iterator p = mds_info.begin();
 	 p != mds_info.end();
@@ -523,7 +529,7 @@ public:
 
 
   void print(ostream& out);
-  void print_summary(ostream& out);
+  void print_summary(Formatter *f, ostream *out);
 
   void dump(Formatter *f) const;
   static void generate_test_instances(list<MDSMap*>& ls);
@@ -532,7 +538,7 @@ WRITE_CLASS_ENCODER_FEATURES(MDSMap::mds_info_t)
 WRITE_CLASS_ENCODER_FEATURES(MDSMap)
 
 inline ostream& operator<<(ostream& out, MDSMap& m) {
-  m.print_summary(out);
+  m.print_summary(NULL, &out);
   return out;
 }
 

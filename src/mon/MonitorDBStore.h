@@ -38,31 +38,50 @@ class MonitorDBStore
   struct Op {
     uint8_t type;
     string prefix;
-    string key;
+    string key, endkey;
     bufferlist bl;
 
-    Op() { }
+    Op()
+      : type(0) { }
     Op(int t, string p, string k)
       : type(t), prefix(p), key(k) { }
     Op(int t, const string& p, string k, bufferlist& b)
       : type(t), prefix(p), key(k), bl(b) { }
+    Op(int t, const string& p, string start, string end)
+      : type(t), prefix(p), key(start), endkey(end) { }
 
     void encode(bufferlist& encode_bl) const {
-      ENCODE_START(1, 1, encode_bl);
+      ENCODE_START(2, 1, encode_bl);
       ::encode(type, encode_bl);
       ::encode(prefix, encode_bl);
       ::encode(key, encode_bl);
       ::encode(bl, encode_bl);
+      ::encode(endkey, encode_bl);
       ENCODE_FINISH(encode_bl);
     }
 
     void decode(bufferlist::iterator& decode_bl) {
-      DECODE_START(1, decode_bl);
+      DECODE_START(2, decode_bl);
       ::decode(type, decode_bl);
       ::decode(prefix, decode_bl);
       ::decode(key, decode_bl);
       ::decode(bl, decode_bl);
+      if (struct_v >= 2)
+	::decode(endkey, decode_bl);
       DECODE_FINISH(decode_bl);
+    }
+
+    void dump(Formatter *f) const {
+      f->dump_int("type", type);
+      f->dump_string("prefix", prefix);
+      f->dump_string("key", key);
+      if (endkey.length())
+	f->dump_string("endkey", endkey);
+    }
+
+    static void generate_test_instances(list<Op*>& ls) {
+      ls.push_back(new Op);
+      // we get coverage here from the Transaction instances
     }
   };
 
@@ -72,7 +91,7 @@ class MonitorDBStore
     enum {
       OP_PUT	= 1,
       OP_ERASE	= 2,
-      OP_COMPACT_PREFIX = 3,
+      OP_COMPACT = 3,
     };
 
     void put(string prefix, string key, bufferlist& bl) {
@@ -102,7 +121,11 @@ class MonitorDBStore
     }
 
     void compact_prefix(string prefix) {
-      ops.push_back(Op(OP_COMPACT_PREFIX, prefix, string()));
+      ops.push_back(Op(OP_COMPACT, prefix, string()));
+    }
+
+    void compact_range(string prefix, string start, string end) {
+      ops.push_back(Op(OP_COMPACT, prefix, start, end));
     }
 
     void encode(bufferlist& bl) const {
@@ -115,6 +138,17 @@ class MonitorDBStore
       DECODE_START(1, bl);
       ::decode(ops, bl);
       DECODE_FINISH(bl);
+    }
+
+    static void generate_test_instances(list<Transaction*>& ls) {
+      ls.push_back(new Transaction);
+      ls.push_back(new Transaction);
+      bufferlist bl;
+      bl.append("value");
+      ls.back()->put("prefix", "key", bl);
+      ls.back()->erase("prefix2", "key2");
+      ls.back()->compact_prefix("prefix3");
+      ls.back()->compact_range("prefix4", "from", "to");
     }
 
     void append(Transaction& other) {
@@ -136,13 +170,13 @@ class MonitorDBStore
       return ops.size();
     }
 
-    void dump(ceph::Formatter *f) {
+    void dump(ceph::Formatter *f, bool dump_val=false) const {
       f->open_object_section("transaction");
       f->open_array_section("ops");
-      list<Op>::iterator it;
+      list<Op>::const_iterator it;
       int op_num = 0;
       for (it = ops.begin(); it != ops.end(); ++it) {
-	Op& op = *it;
+	const Op& op = *it;
 	f->open_object_section("op");
 	f->dump_int("op_num", op_num++);
 	switch (op.type) {
@@ -151,10 +185,12 @@ class MonitorDBStore
 	    f->dump_string("type", "PUT");
 	    f->dump_string("prefix", op.prefix);
 	    f->dump_string("key", op.key);
-	    ostringstream os;
-	    op.bl.hexdump(os);
 	    f->dump_unsigned("length", op.bl.length());
-	    f->dump_string("bl", os.str());
+	    if (dump_val) {
+	      ostringstream os;
+	      op.bl.hexdump(os);
+	      f->dump_string("bl", os.str());
+	    }
 	  }
 	  break;
 	case OP_ERASE:
@@ -164,10 +200,12 @@ class MonitorDBStore
 	    f->dump_string("key", op.key);
 	  }
 	  break;
-	case OP_COMPACT_PREFIX:
+	case OP_COMPACT:
 	  {
-	    f->dump_string("type", "COMPACT_PREFIX");
+	    f->dump_string("type", "COMPACT");
 	    f->dump_string("prefix", op.prefix);
+	    f->dump_string("start", op.key);
+	    f->dump_string("end", op.endkey);
 	  }
 	  break;
 	default:
@@ -184,7 +222,7 @@ class MonitorDBStore
     }
   };
 
-  int apply_transaction(MonitorDBStore::Transaction& t) {
+  int apply_transaction(const MonitorDBStore::Transaction& t) {
     KeyValueDB::Transaction dbt = db->get_transaction();
 
     if (do_dump) {
@@ -193,9 +231,15 @@ class MonitorDBStore
       bl.write_fd(dump_fd);
     }
 
+<<<<<<< HEAD
     list<string> compact_prefixes;
     for (list<Op>::iterator it = t.ops.begin(); it != t.ops.end(); ++it) {
       Op& op = *it;
+=======
+    list<pair<string, pair<string,string> > > compact;
+    for (list<Op>::const_iterator it = t.ops.begin(); it != t.ops.end(); ++it) {
+      const Op& op = *it;
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
       switch (op.type) {
       case Transaction::OP_PUT:
 	dbt->set(op.prefix, op.key, op.bl);
@@ -203,8 +247,8 @@ class MonitorDBStore
       case Transaction::OP_ERASE:
 	dbt->rmkey(op.prefix, op.key);
 	break;
-      case Transaction::OP_COMPACT_PREFIX:
-	compact_prefixes.push_back(op.prefix);
+      case Transaction::OP_COMPACT:
+	compact.push_back(make_pair(op.prefix, make_pair(op.key, op.endkey)));
 	break;
       default:
 	derr << __func__ << " unknown op type " << op.type << dendl;
@@ -214,9 +258,13 @@ class MonitorDBStore
     }
     int r = db->submit_transaction_sync(dbt);
     if (r >= 0) {
-      while (!compact_prefixes.empty()) {
-	db->compact_prefix(compact_prefixes.front());
-	compact_prefixes.pop_front();
+      while (!compact.empty()) {
+	if (compact.front().second.first == string() &&
+	    compact.front().second.second == string())
+	  db->compact_prefix_async(compact.front().first);
+	else
+	  db->compact_range_async(compact.front().first, compact.front().second.first, compact.front().second.second);
+	compact.pop_front();
       }
     }
     return r;
@@ -234,7 +282,8 @@ class MonitorDBStore
     bool add_chunk_entry(Transaction &tx,
 			 string &prefix,
 			 string &key,
-			 bufferlist &value) {
+			 bufferlist &value,
+			 uint64_t max) {
       Transaction tmp;
       bufferlist tmp_bl;
       tmp.put(prefix, key, value);
@@ -245,7 +294,7 @@ class MonitorDBStore
 
       size_t len = tx_bl.length() + tmp_bl.length();
 
-      if (!tx.empty() && (len > g_conf->mon_sync_max_payload_size)) {
+      if (!tx.empty() && (len > max)) {
 	return false;
       }
 
@@ -262,7 +311,6 @@ class MonitorDBStore
       return true;
     }
 
-    virtual void _get_chunk(Transaction &tx) = 0;
     virtual bool _is_valid() = 0;
 
   public:
@@ -277,12 +325,8 @@ class MonitorDBStore
     virtual bool has_next_chunk() {
       return !done && _is_valid();
     }
-    virtual void get_chunk(bufferlist &bl) {
-      Transaction tx;
-      _get_chunk(tx);
-      if (!tx.empty())
-	tx.encode(bl);
-    }
+    virtual void get_chunk_tx(Transaction &tx, uint64_t max) = 0;
+    virtual pair<string,string> get_next_key() = 0;
   };
   typedef std::tr1::shared_ptr<StoreIteratorImpl> Synchronizer;
 
@@ -309,7 +353,7 @@ class MonitorDBStore
      *			    differ from the one passed on to the function)
      * @param last_key[out] Last key in the chunk
      */
-    virtual void _get_chunk(Transaction &tx) {
+    virtual void get_chunk_tx(Transaction &tx, uint64_t max) {
       assert(done == false);
       assert(iter->valid() == true);
 
@@ -318,7 +362,7 @@ class MonitorDBStore
 	string key(iter->raw_key().second);
 	if (sync_prefixes.count(prefix)) {
 	  bufferlist value = iter->value();
-	  if (!add_chunk_entry(tx, prefix, key, value))
+	  if (!add_chunk_entry(tx, prefix, key, value, max))
 	    return;
 	}
 	iter->next();
@@ -327,38 +371,13 @@ class MonitorDBStore
       done = true;
     }
 
-    virtual bool _is_valid() {
-      return iter->valid();
-    }
-  };
-
-  class SinglePrefixStoreIteratorImpl : public StoreIteratorImpl {
-    KeyValueDB::Iterator iter;
-    string prefix;
-
-  public:
-    SinglePrefixStoreIteratorImpl(KeyValueDB::Iterator iter, string prefix)
-      : StoreIteratorImpl(),
-	iter(iter),
-	prefix(prefix)
-    { }
-
-    virtual ~SinglePrefixStoreIteratorImpl() { }
-
-  private:
-    virtual void _get_chunk(Transaction &tx) {
-      assert(done == false);
-      assert(iter->valid() == true);
-
-      while (iter->valid()) {
-	string key(iter->key());
-	bufferlist value = iter->value();
-	if (!add_chunk_entry(tx, prefix, key, value))
-	  return;
+    virtual pair<string,string> get_next_key() {
+      assert(iter->valid());
+      pair<string,string> r = iter->raw_key();
+      do {
 	iter->next();
-      }
-      assert(iter->valid() == false);
-      done = true;
+      } while (iter->valid() && sync_prefixes.count(iter->raw_key().first) == 0);
+      return r;
     }
 
     virtual bool _is_valid() {
@@ -381,21 +400,16 @@ class MonitorDBStore
     );
   }
 
-  Synchronizer get_synchronizer(string &prefix) {
-    assert(!prefix.empty());
-
-    KeyValueDB::Iterator iter;
-    iter = db->get_snapshot_iterator(prefix);
-    iter->seek_to_first();
-
-    return std::tr1::shared_ptr<StoreIteratorImpl>(
-	new SinglePrefixStoreIteratorImpl(iter, prefix)
-    );
-  }
-
   KeyValueDB::Iterator get_iterator(const string &prefix) {
     assert(!prefix.empty());
     KeyValueDB::Iterator iter = db->get_snapshot_iterator(prefix);
+    iter->seek_to_first();
+    return iter;
+  }
+
+  KeyValueDB::WholeSpaceIterator get_iterator() {
+    KeyValueDB::WholeSpaceIterator iter;
+    iter = db->get_snapshot_iterator();
     iter->seek_to_first();
     return iter;
   }
@@ -479,6 +493,14 @@ class MonitorDBStore
   }
 
   int open(ostream &out) {
+    db->options.write_buffer_size = g_conf->mon_leveldb_write_buffer_size;
+    db->options.cache_size = g_conf->mon_leveldb_cache_size;
+    db->options.block_size = g_conf->mon_leveldb_block_size;
+    db->options.bloom_size = g_conf->mon_leveldb_bloom_size;
+    db->options.compression_enabled = g_conf->mon_leveldb_compression;
+    db->options.max_open_files = g_conf->mon_leveldb_max_open_files;
+    db->options.paranoid_checks = g_conf->mon_leveldb_paranoid;
+    db->options.log_file = g_conf->mon_leveldb_log;
     return db->open(out);
   }
 
@@ -494,6 +516,13 @@ class MonitorDBStore
     db->compact_prefix(prefix);
   }
 
+<<<<<<< HEAD
+=======
+  uint64_t get_estimated_size(map<string, uint64_t> &extras) {
+    return db->get_estimated_size(extras);
+  }
+
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
   MonitorDBStore(const string& path) :
     db(0), do_dump(false), dump_fd(-1) {
     string::const_reverse_iterator rit;
@@ -506,13 +535,14 @@ class MonitorDBStore
     os << path.substr(0, path.size() - pos) << "/store.db";
     string full_path = os.str();
 
-    LevelDBStore *db_ptr = new LevelDBStore(full_path);
+    LevelDBStore *db_ptr = new LevelDBStore(g_ceph_context, full_path);
     if (!db_ptr) {
-      std::cout << __func__ << " error initializing level db back storage in "
-		<< full_path << std::endl;
+      derr << __func__ << " error initializing level db back storage in "
+		<< full_path << dendl;
       assert(0 != "MonitorDBStore: error initializing level db back storage");
     }
     db.reset(db_ptr);
+<<<<<<< HEAD
     db->options.write_buffer_size = g_conf->mon_leveldb_write_buffer_size;
     db->options.cache_size = g_conf->mon_leveldb_cache_size;
     db->options.block_size = g_conf->mon_leveldb_block_size;
@@ -521,6 +551,8 @@ class MonitorDBStore
     db->options.max_open_files = g_conf->mon_leveldb_max_open_files;
     db->options.paranoid_checks = g_conf->mon_leveldb_paranoid;
     db->options.log_file = g_conf->mon_leveldb_log;
+=======
+>>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
 
     if (g_conf->mon_debug_dump_transactions) {
       do_dump = true;

@@ -3,13 +3,14 @@
 #define TIME_BUF_SIZE 128
 
 #include "rgw_op.h"
-#include "rgw_html_errors.h"
+#include "rgw_http_errors.h"
 #include "rgw_acl_s3.h"
 #include "rgw_policy_s3.h"
+#include "rgw_keystone.h"
 
 #define RGW_AUTH_GRACE_MINS 15
 
-void rgw_get_errno_s3(struct rgw_html_errors *e, int err_no);
+void rgw_get_errno_s3(struct rgw_http_errors *e, int err_no);
 
 class RGWGetObj_ObjStore_S3 : public RGWGetObj_ObjStore
 {
@@ -143,12 +144,14 @@ public:
 };
 
 class RGWCopyObj_ObjStore_S3 : public RGWCopyObj_ObjStore {
+  bool sent_header;
 public:
-  RGWCopyObj_ObjStore_S3() {}
+  RGWCopyObj_ObjStore_S3() : sent_header(false) {}
   ~RGWCopyObj_ObjStore_S3() {}
 
   int init_dest_policy();
   int get_params();
+  void send_partial_response(off_t ofs);
   void send_response();
 };
 
@@ -182,6 +185,7 @@ public:
   RGWPutCORS_ObjStore_S3() {}
   ~RGWPutCORS_ObjStore_S3() {}
 
+  int get_params();
   void send_response();
 };
 
@@ -255,6 +259,57 @@ public:
   void end_response();
 };
 
+class RGW_Auth_S3_Keystone_ValidateToken : public RGWHTTPClient {
+private:
+  bufferlist rx_buffer;
+  bufferlist tx_buffer;
+  bufferlist::iterator tx_buffer_it;
+  list<string> roles_list;
+
+public:
+  KeystoneToken response;
+
+private:
+  void set_tx_buffer(const string& d) {
+    tx_buffer.clear();
+    tx_buffer.append(d);
+    tx_buffer_it = tx_buffer.begin();
+    set_send_length(tx_buffer.length());
+  }
+
+public:
+  RGW_Auth_S3_Keystone_ValidateToken(CephContext *_cct)
+      : RGWHTTPClient(_cct) {
+    get_str_list(cct->_conf->rgw_keystone_accepted_roles, roles_list);
+  }
+
+  int receive_header(void *ptr, size_t len) {
+    return 0;
+  }
+  int receive_data(void *ptr, size_t len) {
+    rx_buffer.append((char *)ptr, len);
+    return 0;
+  }
+
+  int send_data(void *ptr, size_t len) {
+    if (!tx_buffer_it.get_remaining())
+      return 0; // nothing left to send
+
+    int l = MIN(tx_buffer_it.get_remaining(), len);
+    memcpy(ptr, tx_buffer_it.get_current_ptr().c_str(), l);
+    try {
+      tx_buffer_it.advance(l);
+    } catch (buffer::end_of_buffer &e) {
+      assert(0);
+    }
+
+    return l;
+  }
+
+  int validate_s3token(const string& auth_id, const string& auth_token, const string& auth_sign);
+
+};
+
 class RGW_Auth_S3 {
 public:
   static int authorize(RGWRados *store, struct req_state *s);
@@ -306,10 +361,10 @@ public:
 class RGWHandler_ObjStore_Bucket_S3 : public RGWHandler_ObjStore_S3 {
 protected:
   bool is_acl_op() {
-    return s->args.exists("acl");
+    return s->info.args.exists("acl");
   }
   bool is_cors_op() {
-      return s->args.exists("cors");
+      return s->info.args.exists("cors");
   }
   bool is_obj_update_op() {
     return is_acl_op() || is_cors_op();
@@ -330,10 +385,10 @@ public:
 class RGWHandler_ObjStore_Obj_S3 : public RGWHandler_ObjStore_S3 {
 protected:
   bool is_acl_op() {
-    return s->args.exists("acl");
+    return s->info.args.exists("acl");
   }
   bool is_cors_op() {
-      return s->args.exists("cors");
+      return s->info.args.exists("cors");
   }
   bool is_obj_update_op() {
     return is_acl_op();

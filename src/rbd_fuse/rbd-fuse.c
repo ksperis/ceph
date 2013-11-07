@@ -3,6 +3,8 @@
  */
 #define FUSE_USE_VERSION 26
 
+#include "include/int_types.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -15,7 +17,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <getopt.h>
-#include <inttypes.h>
 
 #include "include/rbd/librbd.h"
 
@@ -130,8 +131,7 @@ open_rbd_image(const char *image_name)
 {
 	struct rbd_image *im;
 	struct rbd_openimage *rbd;
-	int fd, i;
-	int ret;
+	int fd;
 
 	if (image_name == (char *)NULL) 
 		return -1;
@@ -149,6 +149,7 @@ open_rbd_image(const char *image_name)
 	if ((fd = find_openrbd(image_name)) != -1) {
 		rbd = &opentbl[fd];
 	} else {
+		int i;
 		// allocate an opentbl[] and open the image
 		for (i = 0; i < MAX_RBD_IMAGES; i++) {
 			if (opentbl[i].image == NULL) {
@@ -160,7 +161,7 @@ open_rbd_image(const char *image_name)
 		}
 		if (i == MAX_RBD_IMAGES)
 			return -1;
-		ret = rbd_open(ioctx, rbd->image_name, &(rbd->image), NULL);
+		int ret = rbd_open(ioctx, rbd->image_name, &(rbd->image), NULL);
 		if (ret < 0) {
 			simple_err("open_rbd_image: can't open: ", ret);
 			return ret;

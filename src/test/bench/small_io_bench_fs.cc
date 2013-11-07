@@ -21,7 +21,7 @@
 #include "distribution.h"
 #include "global/global_init.h"
 #include "os/FileStore.h"
-#include "filestore_backend.h"
+#include "testfilestore_backend.h"
 #include "common/perf_counters.h"
 
 namespace po = boost::program_options;
@@ -32,7 +32,10 @@ struct MorePrinting : public DetailedStatCollector::AdditionalPrinting {
   MorePrinting(CephContext *cct) : cct(cct) {}
   void operator()(std::ostream *out) {
     bufferlist bl;
-    cct->get_perfcounters_collection()->write_json_to_buf(bl, 0);
+    Formatter *f = new_formatter("json-pretty");
+    cct->get_perfcounters_collection()->dump_formatted(f, 0);
+    f->flush(bl);
+    delete f;
     bl.append('\0');
     *out << bl.c_str() << std::endl;
   }
@@ -125,8 +128,16 @@ int main(int argc, char **argv)
 
   FileStore fs(vm["filestore-path"].as<string>(),
 	       vm["journal-path"].as<string>());
-  fs.mkfs();
-  fs.mount();
+
+  if (fs.mkfs() < 0) {
+    cout << "mkfs failed" << std::endl;
+    return 1;
+  }
+
+  if (fs.mount() < 0) {
+    cout << "mount failed" << std::endl;
+    return 1;
+  }
 
   ostream *detailed_ops = 0;
   ofstream myfile;
@@ -206,7 +217,7 @@ int main(int argc, char **argv)
     Bencher *bencher = new Bencher(
       gen,
       col,
-      new FileStoreBackend(&fs, vm["write-infos"].as<bool>()),
+      new TestFileStoreBackend(&fs, vm["write-infos"].as<bool>()),
       vm["num-concurrent-ops"].as<unsigned>(),
       vm["duration"].as<unsigned>(),
       vm["max-ops"].as<unsigned>());

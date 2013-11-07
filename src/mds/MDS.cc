@@ -386,8 +386,9 @@ void MDS::forward_message_mds(Message *m, int mds)
 
 void MDS::send_message_client_counted(Message *m, client_t client)
 {
-  if (sessionmap.have_session(entity_name_t::CLIENT(client.v))) {
-    send_message_client_counted(m, sessionmap.get_session(entity_name_t::CLIENT(client.v)));
+  Session *session =  sessionmap.get_session(entity_name_t::CLIENT(client.v));
+  if (session) {
+    send_message_client_counted(m, session);
   } else {
     dout(10) << "send_message_client_counted no session for client." << client << " " << *m << dendl;
   }
@@ -975,6 +976,8 @@ void MDS::handle_mds_map(MMDSMap *m)
         resolve_start();
       } else if (is_reconnect()) {
         reconnect_start();
+      } else if (is_rejoin()) {
+	rejoin_start();
       } else if (is_clientreplay()) {
         clientreplay_start();
       } else if (is_creating()) {
@@ -1011,12 +1014,7 @@ void MDS::handle_mds_map(MMDSMap *m)
     if (g_conf->mds_dump_cache_after_rejoin &&
 	oldmap->is_rejoining() && !mdsmap->is_rejoining()) 
       mdcache->dump_cache();      // for DEBUG only
-  }
-  if (oldmap->is_degraded() && !mdsmap->is_degraded() && state >= MDSMap::STATE_ACTIVE)
-    dout(1) << "cluster recovered." << dendl;
   
-  // did someone go active?
-  if (is_clientreplay() || is_active() || is_stopping()) {
     // ACTIVE|CLIENTREPLAY|REJOIN => we can discover from them.
     set<int> olddis, dis;
     oldmap->get_mds_set(olddis, MDSMap::STATE_ACTIVE);
@@ -1027,9 +1025,17 @@ void MDS::handle_mds_map(MMDSMap *m)
     mdsmap->get_mds_set(dis, MDSMap::STATE_REJOIN);
     for (set<int>::iterator p = dis.begin(); p != dis.end(); ++p) 
       if (*p != whoami &&            // not me
-	  olddis.count(*p) == 0)  // newly so?
+	  olddis.count(*p) == 0) {  // newly so?
 	mdcache->kick_discovers(*p);
+	mdcache->kick_open_ino_peers(*p);
+      }
+  }
 
+  if (oldmap->is_degraded() && !mdsmap->is_degraded() && state >= MDSMap::STATE_ACTIVE)
+    dout(1) << "cluster recovered." << dendl;
+
+  // did someone go active?
+  if (is_clientreplay() || is_active() || is_stopping()) {
     set<int> oldactive, active;
     oldmap->get_mds_set(oldactive, MDSMap::STATE_ACTIVE);
     oldmap->get_mds_set(oldactive, MDSMap::STATE_CLIENTREPLAY);
@@ -1134,7 +1140,9 @@ void MDS::boot_create()
   // start with a fresh journal
   dout(10) << "boot_create creating fresh journal" << dendl;
   mdlog->create(fin.new_sub());
-  mdlog->start_new_segment(fin.new_sub());
+
+  // open new journal segment, but do not journal subtree map (yet)
+  mdlog->prepare_new_segment();
 
   if (whoami == mdsmap->get_root()) {
     dout(3) << "boot_create creating fresh hierarchy" << dendl;
@@ -1164,6 +1172,12 @@ void MDS::boot_create()
     snapserver->save(fin.new_sub());
     snapserver->handle_mds_recovery(whoami);
   }
+
+  // ok now journal it
+  mdlog->journal_segment_subtree_map();
+  mdlog->wait_for_safe(fin.new_sub());
+  mdlog->flush();
+
   fin.activate();
 }
 
@@ -1171,9 +1185,6 @@ void MDS::creating_done()
 {
   dout(1)<< "creating_done" << dendl;
   request_state(MDSMap::STATE_ACTIVE);
-
-  // start new segment
-  mdlog->start_new_segment(0);
 }
 
 
@@ -1328,16 +1339,21 @@ public:
   C_MDS_StandbyReplayRestartFinish(MDS *mds_, uint64_t old_read_pos_) :
     mds(mds_), old_read_pos(old_read_pos_) {}
   void finish(int r) {
-    if (old_read_pos < mds->mdlog->get_journaler()->get_trimmed_pos()) {
-      cerr << "standby MDS fell behind active MDS journal's expire_pos, restarting" << std::endl;
-      mds->respawn(); /* we're too far back, and this is easier than
-                         trying to reset everything in the cache, etc */
-    } else {
-      mds->mdlog->standby_trim_segments();
-      mds->boot_start(3, r);
-    }
+    mds->_standby_replay_restart_finish(r, old_read_pos);
   }
 };
+
+void MDS::_standby_replay_restart_finish(int r, uint64_t old_read_pos)
+{
+  if (old_read_pos < mdlog->get_journaler()->get_trimmed_pos()) {
+    dout(0) << "standby MDS fell behind active MDS journal's expire_pos, restarting" << dendl;
+    respawn(); /* we're too far back, and this is easier than
+		  trying to reset everything in the cache, etc */
+  } else {
+    mdlog->standby_trim_segments();
+    boot_start(3, r);
+  }
+}
 
 inline void MDS::standby_replay_restart()
 {
@@ -1460,8 +1476,12 @@ void MDS::reconnect_done()
 void MDS::rejoin_joint_start()
 {
   dout(1) << "rejoin_joint_start" << dendl;
-  mdcache->finish_committed_masters();
   mdcache->rejoin_send_rejoins();
+}
+void MDS::rejoin_start()
+{
+  dout(1) << "rejoin_start" << dendl;
+  mdcache->rejoin_start();
 }
 void MDS::rejoin_done()
 {
@@ -1613,19 +1633,18 @@ void MDS::suicide()
   }
   timer.cancel_all_events();
   //timer.join();
+  timer.shutdown();
   
   // shut down cache
   mdcache->shutdown();
 
   if (objecter->initialized)
     objecter->shutdown_locked();
-  
-  // shut down messenger
-  messenger->shutdown();
 
   monc->shutdown();
 
-  timer.shutdown();
+  // shut down messenger
+  messenger->shutdown();
 }
 
 void MDS::respawn()
@@ -1875,8 +1894,7 @@ bool MDS::_dispatch(Message *m)
     ls.swap(finished_queue);
     while (!ls.empty()) {
       dout(10) << " finish " << ls.front() << dendl;
-      ls.front()->finish(0);
-      delete ls.front();
+      ls.front()->complete(0);
       ls.pop_front();
       
       // give other threads (beacon!) a chance
@@ -2162,10 +2180,10 @@ bool MDS::ms_verify_authorizer(Connection *con, int peer_type,
 
 void MDS::ms_handle_accept(Connection *con)
 {
+  Mutex::Locker l(mds_lock);
   Session *s = static_cast<Session *>(con->get_priv());
   dout(10) << "ms_handle_accept " << con->get_peer_addr() << " con " << con << " session " << s << dendl;
   if (s) {
-    s->put();
     if (s->connection != con) {
       dout(10) << " session connection " << s->connection << " -> " << con << dendl;
       s->connection = con;
@@ -2176,5 +2194,6 @@ void MDS::ms_handle_accept(Connection *con)
 	s->preopen_out_queue.pop_front();
       }
     }
+    s->put();
   }
 }

@@ -12,9 +12,12 @@
  * 
  */
 
+#include "include/int_types.h"
+
 #include "common/Thread.h"
 #include "common/admin_socket.h"
 #include "common/config.h"
+#include "common/cmdparse.h"
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
@@ -25,7 +28,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <map>
 #include <poll.h>
 #include <set>
@@ -43,6 +45,7 @@
 #define dout_subsys ceph_subsys_asok
 #undef dout_prefix
 #define dout_prefix *_dout << "asok(" << (void*)m_cct << ") "
+
 
 using std::ostringstream;
 
@@ -251,7 +254,6 @@ void* AdminSocket::entry()
 
 bool AdminSocket::do_accept()
 {
-  int ret;
   struct sockaddr_un address;
   socklen_t address_length = sizeof(address);
   ldout(m_cct, 30) << "AdminSocket: calling accept" << dendl;
@@ -269,7 +271,7 @@ bool AdminSocket::do_accept()
   int pos = 0;
   string c;
   while (1) {
-    ret = safe_read(connection_fd, &cmd[pos], 1);
+    int ret = safe_read(connection_fd, &cmd[pos], 1);
     if (ret <= 0) {
       lderr(m_cct) << "AdminSocket: error reading request code: "
 		   << cpp_strerror(ret) << dendl;
@@ -309,6 +311,18 @@ bool AdminSocket::do_accept()
 
   bool rval = false;
 
+  map<string, cmd_vartype> cmdmap;
+  string format;
+  vector<string> cmdvec;
+  stringstream errss;
+  cmdvec.push_back(cmd);
+  if (!cmdmap_from_json(cmdvec, &cmdmap, errss)) {
+    ldout(m_cct, 0) << "AdminSocket: " << errss << dendl;
+    return false;
+  }
+  cmd_getval(m_cct, cmdmap, "format", format);
+  cmd_getval(m_cct, cmdmap, "prefix", c);
+
   string firstword;
   if (c.find(" ") == string::npos)
     firstword = c;
@@ -340,7 +354,7 @@ bool AdminSocket::do_accept()
     string args;
     if (match != c)
       args = c.substr(match.length() + 1);
-    bool success = p->second->call(match, args, out);
+    bool success = p->second->call(match, cmdmap, format, out);
     if (!success) {
       ldout(m_cct, 0) << "AdminSocket: request '" << match << "' args '" << args
 		      << "' to " << p->second << " failed" << dendl;
@@ -356,8 +370,7 @@ bool AdminSocket::do_accept()
       lderr(m_cct) << "AdminSocket: error writing response length "
 		   << cpp_strerror(ret) << dendl;
     } else {
-      ret = out.write_fd(connection_fd);
-      if (ret >= 0)
+      if (out.write_fd(connection_fd) >= 0)
 	rval = true;
     }
   }
@@ -367,7 +380,7 @@ bool AdminSocket::do_accept()
   return rval;
 }
 
-int AdminSocket::register_command(std::string command, AdminSocketHook *hook, std::string help)
+int AdminSocket::register_command(std::string command, std::string cmddesc, AdminSocketHook *hook, std::string help)
 {
   int ret;
   m_lock.Lock();
@@ -377,8 +390,8 @@ int AdminSocket::register_command(std::string command, AdminSocketHook *hook, st
   } else {
     ldout(m_cct, 5) << "register_command " << command << " hook " << hook << dendl;
     m_hooks[command] = hook;
-    if (help.length())
-      m_help[command] = help;
+    m_descs[command] = cmddesc;
+    m_help[command] = help;
     ret = 0;
   }  
   m_lock.Unlock();
@@ -392,6 +405,7 @@ int AdminSocket::unregister_command(std::string command)
   if (m_hooks.count(command)) {
     ldout(m_cct, 5) << "unregister_command " << command << dendl;
     m_hooks.erase(command);
+    m_descs.erase(command);
     m_help.erase(command);
     ret = 0;
   } else {
@@ -404,7 +418,8 @@ int AdminSocket::unregister_command(std::string command)
 
 class VersionHook : public AdminSocketHook {
 public:
-  virtual bool call(std::string command, std::string args, bufferlist& out) {
+  virtual bool call(std::string command, cmdmap_t &cmdmap, std::string format,
+		    bufferlist& out) {
     if (command == "0") {
       out.append(CEPH_ADMIN_SOCK_VERSION);
     } else {
@@ -427,15 +442,44 @@ class HelpHook : public AdminSocketHook {
   AdminSocket *m_as;
 public:
   HelpHook(AdminSocket *as) : m_as(as) {}
-  bool call(string command, string args, bufferlist& out) {
-    JSONFormatter jf(true);
-    jf.open_object_section("help");
+  bool call(string command, cmdmap_t &cmdmap, string format, bufferlist& out) {
+    Formatter *f = new_formatter(format);
+    f->open_object_section("help");
     for (map<string,string>::iterator p = m_as->m_help.begin();
 	 p != m_as->m_help.end();
 	 ++p) {
-      jf.dump_string(p->first.c_str(), p->second);
+      if (p->second.length())
+	f->dump_string(p->first.c_str(), p->second);
     }
-    jf.close_section();
+    f->close_section();
+    ostringstream ss;
+    f->flush(ss);
+    out.append(ss.str());
+    delete f;
+    return true;
+  }
+};
+
+class GetdescsHook : public AdminSocketHook {
+  AdminSocket *m_as;
+public:
+  GetdescsHook(AdminSocket *as) : m_as(as) {}
+  bool call(string command, cmdmap_t &cmdmap, string format, bufferlist& out) {
+    int cmdnum = 0;
+    JSONFormatter jf(false);
+    jf.open_object_section("command_descriptions");
+    for (map<string,string>::iterator p = m_as->m_descs.begin();
+	 p != m_as->m_descs.end();
+	 ++p) {
+      ostringstream secname;
+      secname << "cmd" << setfill('0') << std::setw(3) << cmdnum;
+      dump_cmd_and_help_to_json(&jf,
+				secname.str().c_str(),
+				p->second.c_str(),
+				m_as->m_help[p->first]);
+      cmdnum++;
+    }
+    jf.close_section(); // command_descriptions
     ostringstream ss;
     jf.flush(ss);
     out.append(ss.str());
@@ -471,11 +515,14 @@ bool AdminSocket::init(const std::string &path)
   m_path = path;
 
   m_version_hook = new VersionHook;
-  register_command("0", m_version_hook, "");
-  register_command("version", m_version_hook, "get ceph version");
-  register_command("git_version", m_version_hook, "get git sha1");
+  register_command("0", "0", m_version_hook, "");
+  register_command("version", "version", m_version_hook, "get ceph version");
+  register_command("git_version", "git_version", m_version_hook, "get git sha1");
   m_help_hook = new HelpHook(this);
-  register_command("help", m_help_hook, "list available commands");
+  register_command("help", "help", m_help_hook, "list available commands");
+  m_getdescs_hook = new GetdescsHook(this);
+  register_command("get_command_descriptions", "get_command_descriptions",
+		   m_getdescs_hook, "list available commands");
 
   create();
   add_cleanup_file(m_path.c_str());
@@ -508,6 +555,8 @@ void AdminSocket::shutdown()
   delete m_version_hook;
   unregister_command("help");
   delete m_help_hook;
+  unregister_command("get_command_descriptions");
+  delete m_getdescs_hook;
 
   remove_cleanup_file(m_path.c_str());
   m_path.clear();

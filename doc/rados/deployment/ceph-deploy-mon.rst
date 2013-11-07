@@ -8,15 +8,14 @@ add or remove one or more monitors on the command line with one command. Before
 numerous manual steps. Using ``ceph-deploy`` imposes a restriction:  **you may
 only install one monitor per host.**
 
-.. note:: We **DO NOT** recommend commingling monitors and OSDs on 
+.. note:: We do not recommend comingling monitors and OSDs on 
    the same host.
 
 For high availability, you should run a production Ceph cluster with **AT
 LEAST** three monitors. Ceph uses the Paxos algorithm, which requires a
-consensus among the majority of monitors in a quorum. You can establish a
-monitor quorum with only one monitor; however, you can not determine a majority
-with two monitors. A majority of monitors must be counted as such: 1:1, 2:3,
-3:4, 3:5, 4:6, etc.
+consensus among the majority of monitors in a quorum. With Paxos, the monitors
+cannot determine a majority for establishing a quorum with only two monitors. A
+majority of monitors must be counted as such: 1:1, 2:3, 3:4, 3:5, 4:6, etc.
 
 See `Monitor Config Reference`_ for details on configuring monitors.
 
@@ -34,6 +33,9 @@ the tool enforces a single monitor per host. ::
 .. note:: Ensure that you add monitors such that they may arrive at a consensus
    among a majority of monitors.
 
+.. note::  When adding a monitor on a host that was not in hosts intially defined
+   with the ``ceph-deploy new`` command, a ``public network`` statement needs
+   to be be added to the ceph.conf file.
 
 Remove a Monitor
 ================

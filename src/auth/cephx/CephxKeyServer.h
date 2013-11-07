@@ -231,7 +231,12 @@ public:
     ::decode(data, bl);
   }
   bool contains(const EntityName& name) const;
-  void list_secrets(stringstream& ss) const;
+  int encode_secrets(Formatter *f, stringstream *ds) const;
+  void encode_formatted(string label, Formatter *f, bufferlist &bl);
+  void encode_plaintext(bufferlist &bl);
+  int list_secrets(stringstream& ds) const {
+    return encode_secrets(NULL, &ds);
+  }
   version_t get_ver() const {
     Mutex::Locker l(lock);
     return data.version;    
@@ -263,6 +268,9 @@ public:
     map<EntityName, EntityAuth>::const_iterator b = data.secrets_begin();
     return (b != data.secrets_end());
   }
+  int get_num_secrets() {
+    return data.secrets.size();
+  }
 
   /*void add_rotating_secret(uint32_t service_id, ExpiringCryptoKey& key) {
     Mutex::Locker l(lock);
@@ -289,6 +297,10 @@ public:
   bool get_service_caps(const EntityName& name, uint32_t service_id,
 			AuthCapsInfo& caps) const;
 
+  map<EntityName, EntityAuth>::iterator secrets_begin()
+  { return data.secrets_begin(); }
+  map<EntityName, EntityAuth>::iterator secrets_end()
+  { return data.secrets_end(); }
 };
 WRITE_CLASS_ENCODER(KeyServer);
 

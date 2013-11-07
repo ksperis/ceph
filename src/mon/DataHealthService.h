@@ -14,9 +14,6 @@
 #ifndef CEPH_MON_DATA_HEALTH_SERVICE_H
 #define CEPH_MON_DATA_HEALTH_SERVICE_H
 
-#include <boost/intrusive_ptr.hpp>
-// Because intusive_ptr clobbers our assert...
-#include "include/assert.h"
 #include <errno.h>
 
 #include "include/types.h"
@@ -28,7 +25,7 @@
 #include "common/config.h"
 #include "global/signal_handler.h"
 
-class MMonHealth;
+struct MMonHealth;
 
 class DataHealthService :
   public HealthService
@@ -37,6 +34,7 @@ class DataHealthService :
   int last_warned_percent;
 
   void handle_tell(MMonHealth *m);
+  int update_store_stats(DataStats &ours);
   int update_stats();
   void share_stats();
 
@@ -66,9 +64,6 @@ public:
     set_update_period(g_conf->mon_health_data_update_interval);
   }
   virtual ~DataHealthService() { }
-  DataHealthService *get() {
-    return static_cast<DataHealthService *>(RefCountedObject::get());
-  }
 
   virtual void init() {
     generic_dout(20) << "data_health " << __func__ << dendl;
@@ -86,6 +81,5 @@ public:
     return "data_health";
   }
 };
-typedef boost::intrusive_ptr<DataHealthService> DataHealthServiceRef;
 
 #endif /* CEPH_MON_DATA_HEALTH_SERVICE_H */

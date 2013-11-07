@@ -19,10 +19,9 @@
 #include "common/Mutex.h"
 #include "common/snap_types.h"
 #include "include/atomic.h"
-#include "include/rados.h"
+#include "include/types.h"
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
-#include "include/types.h"
 #include "include/xlist.h"
 #include "osd/osd_types.h"
 #include "osdc/Objecter.h"
@@ -38,7 +37,7 @@ struct librados::IoCtxImpl {
   ::SnapContext snapc;
   uint64_t assert_ver;
   map<object_t, uint64_t> assert_src_version;
-  eversion_t last_objver;
+  version_t last_objver;
   uint32_t notify_timeout;
   object_locator_t oloc;
 
@@ -140,7 +139,8 @@ struct librados::IoCtxImpl {
   int operate_read(const object_t& oid, ::ObjectOperation *o, bufferlist *pbl);
   int aio_operate(const object_t& oid, ::ObjectOperation *o,
 		  AioCompletionImpl *c, const SnapContext& snap_context);
-  int aio_operate_read(const object_t& oid, ::ObjectOperation *o, AioCompletionImpl *c, bufferlist *pbl);
+  int aio_operate_read(const object_t& oid, ::ObjectOperation *o,
+		       AioCompletionImpl *c, int flags, bufferlist *pbl);
 
   struct C_aio_Ack : public Context {
     librados::AioCompletionImpl *c;
@@ -153,16 +153,6 @@ struct librados::IoCtxImpl {
     time_t *pmtime;
     utime_t mtime;
     C_aio_stat_Ack(AioCompletionImpl *_c, time_t *pm);
-    void finish(int r);
-  };
-
-  struct C_aio_sparse_read_Ack : public Context {
-    AioCompletionImpl *c;
-    bufferlist *data_bl;
-    std::map<uint64_t, uint64_t> *m;
-    C_aio_sparse_read_Ack(AioCompletionImpl *_c,
-			  bufferlist *data,
-			  std::map<uint64_t, uint64_t> *extents);
     void finish(int r);
   };
 
@@ -193,7 +183,7 @@ struct librados::IoCtxImpl {
   int pool_change_auid(unsigned long long auid);
   int pool_change_auid_async(unsigned long long auid, PoolAsyncCompletionImpl *c);
 
-  void set_sync_op_version(eversion_t& ver);
+  void set_sync_op_version(version_t ver);
   int watch(const object_t& oid, uint64_t ver, uint64_t *cookie, librados::WatchCtx *ctx);
   int unwatch(const object_t& oid, uint64_t cookie);
   int notify(const object_t& oid, uint64_t ver, bufferlist& bl);
@@ -201,7 +191,7 @@ struct librados::IoCtxImpl {
     const object_t& oid, uint64_t notify_id, uint64_t ver,
     uint64_t cookie);
 
-  eversion_t last_version();
+  version_t last_version();
   void set_assert_version(uint64_t ver);
   void set_assert_src_version(const object_t& oid, uint64_t ver);
   void set_notify_timeout(uint32_t timeout);

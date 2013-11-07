@@ -26,6 +26,7 @@
 #include "common/Formatter.h"
 #include "log/Log.h"
 #include "auth/Crypto.h"
+#include "include/str_list.h"
 
 #include <iostream>
 #include <pthread.h>
@@ -51,19 +52,19 @@ public:
   {
     while (1) {
       if (_cct->_conf->heartbeat_interval) {
-	struct timespec timeout;
-	clock_gettime(CLOCK_REALTIME, &timeout);
-	timeout.tv_sec += _cct->_conf->heartbeat_interval;
-	sem_timedwait(&_sem, &timeout);
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += _cct->_conf->heartbeat_interval;
+        sem_timedwait(&_sem, &timeout);
       } else {
-	sem_wait(&_sem);
+        sem_wait(&_sem);
       }
       if (_exit_thread) {
-	break;
+        break;
       }
       if (_reopen_logs) {
-	_cct->_log->reopen_log_file();
-	_reopen_logs = false;
+        _cct->_log->reopen_log_file();
+        _reopen_logs = false;
       }
       _cct->_heartbeat_map->check_touch_file();
     }
@@ -118,7 +119,7 @@ public:
   }
 
   void handle_conf_change(const md_config_t *conf,
-			  const std::set <std::string> &changed) {
+                          const std::set <std::string> &changed) {
     // stderr
     if (changed.count("log_to_stderr") || changed.count("err_to_stderr")) {
       int l = conf->log_to_stderr ? 99 : (conf->err_to_stderr ? -1 : -2);
@@ -156,48 +157,73 @@ class CephContextHook : public AdminSocketHook {
 public:
   CephContextHook(CephContext *cct) : m_cct(cct) {}
 
-  bool call(std::string command, std::string args, bufferlist& out) {
-    m_cct->do_command(command, args, &out);
+  bool call(std::string command, cmdmap_t& cmdmap, std::string format,
+	    bufferlist& out) {
+    m_cct->do_command(command, cmdmap, format, &out);
     return true;
   }
 };
 
-void CephContext::do_command(std::string command, std::string args, bufferlist *out)
+void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
+			     std::string format, bufferlist *out)
 {
-  lgeneric_dout(this, 1) << "do_command '" << command << "' '" << args << "'" << dendl;
+  Formatter *f = new_formatter(format);
+  stringstream ss;
+  for (cmdmap_t::iterator it = cmdmap.begin(); it != cmdmap.end(); ++it) {
+    if (it->first != "prefix") {
+      ss << it->first  << ":" << cmd_vartype_stringify(it->second) << " ";
+    }
+  }
+  lgeneric_dout(this, 1) << "do_command '" << command << "' '"
+			 << ss.str() << dendl;
   if (command == "perfcounters_dump" || command == "1" ||
       command == "perf dump") {
-    _perf_counters_collection->write_json_to_buf(*out, false);
+    _perf_counters_collection->dump_formatted(f, false);
   }
   else if (command == "perfcounters_schema" || command == "2" ||
-	   command == "perf schema") {
-    _perf_counters_collection->write_json_to_buf(*out, true);
+    command == "perf schema") {
+    _perf_counters_collection->dump_formatted(f, true);
   }
   else {
-    JSONFormatter jf(true);
-    jf.open_object_section(command.c_str());
+    f->open_object_section(command.c_str());
     if (command == "config show") {
-      _conf->show_config(&jf);
+      _conf->show_config(f);
     }
     else if (command == "config set") {
-      std::string var = args;
-      size_t pos = var.find(' ');
-      if (pos == string::npos) {
-	jf.dump_string("error", "syntax error: 'config set <var> <value>'");
+      std::string var;
+      std::vector<std::string> val;
+
+      if (!(cmd_getval(this, cmdmap, "var", var)) ||
+          !(cmd_getval(this, cmdmap, "val", val))) {
+        f->dump_string("error", "syntax error: 'config set <var> <value>'");
       } else {
-	std::string val = var.substr(pos+1);
-	var.resize(pos);
-	int r = _conf->set_val(var.c_str(), val.c_str());
+	// val may be multiple words
+	string valstr = str_join(val, " ");
+        int r = _conf->set_val(var.c_str(), valstr.c_str());
+        if (r < 0) {
+          f->dump_stream("error") << "error setting '" << var << "' to '" << valstr << "': " << cpp_strerror(r);
+        } else {
+          ostringstream ss;
+          _conf->apply_changes(&ss);
+          f->dump_string("success", ss.str());
+        }
+      }
+    } else if (command == "config get") {
+      std::string var;
+      if (!cmd_getval(this, cmdmap, "var", var)) {
+	f->dump_string("error", "syntax error: 'config get <var>'");
+      } else {
+	char buf[4096];
+	memset(buf, 0, sizeof(buf));
+	char *tmp = buf;
+	int r = _conf->get_val(var.c_str(), &tmp, sizeof(buf));
 	if (r < 0) {
-	  jf.dump_stream("error") << "error setting '" << var << "' to '" << val << "': " << cpp_strerror(r);
+	    f->dump_stream("error") << "error getting '" << var << "': " << cpp_strerror(r);
 	} else {
-	  ostringstream ss;
-	  _conf->apply_changes(&ss);
-	  jf.dump_string("success", ss.str());
+	    f->dump_string(var.c_str(), buf);
 	}
       }
-    }
-    else if (command == "log flush") {
+    } else if (command == "log flush") {
       _log->flush();
     }
     else if (command == "log dump") {
@@ -209,12 +235,12 @@ void CephContext::do_command(std::string command, std::string args, bufferlist *
     else {
       assert(0 == "registered under wrong command?");    
     }
-    ostringstream ss;
-    jf.close_section();
-    jf.flush(ss);
-    out->append(ss.str());
+    f->close_section();
   }
-  lgeneric_dout(this, 1) << "do_command '" << command << "' '" << args << "' result is " << out->length() << " bytes" << dendl;
+  f->flush(*out);
+  delete f;
+  lgeneric_dout(this, 1) << "do_command '" << command << "' '" << ss.str()
+		         << "result is " << out->length() << " bytes" << dendl;
 };
 
 
@@ -245,17 +271,18 @@ CephContext::CephContext(uint32_t module_type_)
   _heartbeat_map = new HeartbeatMap(this);
 
   _admin_hook = new CephContextHook(this);
-  _admin_socket->register_command("perfcounters_dump", _admin_hook, "");
-  _admin_socket->register_command("1", _admin_hook, "");
-  _admin_socket->register_command("perf dump", _admin_hook, "dump perfcounters value");
-  _admin_socket->register_command("perfcounters_schema", _admin_hook, "");
-  _admin_socket->register_command("2", _admin_hook, "");
-  _admin_socket->register_command("perf schema", _admin_hook, "dump perfcounters schema");
-  _admin_socket->register_command("config show", _admin_hook, "dump current config settings");
-  _admin_socket->register_command("config set", _admin_hook, "config set <field> <val>: set a config variable");
-  _admin_socket->register_command("log flush", _admin_hook, "flush log entries to log file");
-  _admin_socket->register_command("log dump", _admin_hook, "dump recent log entries to log file");
-  _admin_socket->register_command("log reopen", _admin_hook, "reopen log file");
+  _admin_socket->register_command("perfcounters_dump", "perfcounters_dump", _admin_hook, "");
+  _admin_socket->register_command("1", "1", _admin_hook, "");
+  _admin_socket->register_command("perf dump", "perf dump", _admin_hook, "dump perfcounters value");
+  _admin_socket->register_command("perfcounters_schema", "perfcounters_schema", _admin_hook, "");
+  _admin_socket->register_command("2", "2", _admin_hook, "");
+  _admin_socket->register_command("perf schema", "perf schema", _admin_hook, "dump perfcounters schema");
+  _admin_socket->register_command("config show", "config show", _admin_hook, "dump current config settings");
+  _admin_socket->register_command("config set", "config set name=var,type=CephString name=val,type=CephString,n=N",  _admin_hook, "config set <field> <val> [<val> ...]: set a config variable");
+  _admin_socket->register_command("config get", "config get name=var,type=CephString", _admin_hook, "config get <field>: get the config value");
+  _admin_socket->register_command("log flush", "log flush", _admin_hook, "flush log entries to log file");
+  _admin_socket->register_command("log dump", "log dump", _admin_hook, "dump recent log entries to log file");
+  _admin_socket->register_command("log reopen", "log reopen", _admin_hook, "reopen log file");
 
   _crypto_none = new CryptoNone;
   _crypto_aes = new CryptoAES;
@@ -277,6 +304,7 @@ CephContext::~CephContext()
   _admin_socket->unregister_command("2");
   _admin_socket->unregister_command("config show");
   _admin_socket->unregister_command("config set");
+  _admin_socket->unregister_command("config get");
   _admin_socket->unregister_command("log flush");
   _admin_socket->unregister_command("log dump");
   _admin_socket->unregister_command("log reopen");

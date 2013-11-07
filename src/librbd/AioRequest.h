@@ -3,9 +3,9 @@
 #ifndef CEPH_LIBRBD_AIOREQUEST_H
 #define CEPH_LIBRBD_AIOREQUEST_H
 
-#include <map>
+#include "include/int_types.h"
 
-#include "inttypes.h"
+#include <map>
 
 #include "common/snap_types.h"
 #include "include/buffer.h"
@@ -14,8 +14,8 @@
 
 namespace librbd {
 
-  class AioCompletion;
-  class ImageCtx;
+  struct AioCompletion;
+  struct ImageCtx;
 
   /**
    * This class represents an I/O operation to a single RBD data object.
@@ -66,7 +66,8 @@ namespace librbd {
 	    vector<pair<uint64_t,uint64_t> >& be,
 	    librados::snap_t snap_id, bool sparse,
 	    Context *completion)
-      : AioRequest(ictx, oid, objectno, offset, len, snap_id, completion, false),
+      : AioRequest(ictx, oid, objectno, offset, len, snap_id, completion,
+		   false),
 	m_buffer_extents(be),
 	m_tried_parent(false), m_sparse(sparse) {
     }

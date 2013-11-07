@@ -16,6 +16,8 @@ extern void rgw_flush_formatter_and_reset(struct req_state *s,
 extern void rgw_flush_formatter(struct req_state *s,
                                          ceph::Formatter *formatter);
 
+extern int rgw_rest_read_all_input(struct req_state *s, char **data, int *plen, int max_len);
+
 class RESTArgs {
 public:
   static int get_string(struct req_state *s, const string& name, const string& def_val, string *val, bool *existed = NULL);
@@ -31,15 +33,17 @@ public:
 
 class RGWRESTFlusher : public RGWFormatterFlusher {
   struct req_state *s;
+  RGWOp *op;
 protected:
   virtual void do_flush();
   virtual void do_start(int ret);
 public:
-  RGWRESTFlusher(struct req_state *_s) : RGWFormatterFlusher(_s->formatter), s(_s) {}
-  RGWRESTFlusher() : RGWFormatterFlusher(NULL), s(NULL) {}
+  RGWRESTFlusher(struct req_state *_s, RGWOp *_op) : RGWFormatterFlusher(_s->formatter), s(_s), op(_op) {}
+  RGWRESTFlusher() : RGWFormatterFlusher(NULL), s(NULL), op(NULL) {}
 
-  void init(struct req_state *_s) {
+  void init(struct req_state *_s, RGWOp *_op) {
     s = _s;
+    op = _op;
     set_formatter(s->formatter);
   }
 };
@@ -160,8 +164,6 @@ class RGWPutCORS_ObjStore : public RGWPutCORS {
 public:
   RGWPutCORS_ObjStore() {}
   ~RGWPutCORS_ObjStore() {}
-
-  int get_params();
 };
 
 class RGWDeleteCORS_ObjStore : public RGWDeleteCORS {
@@ -228,7 +230,7 @@ public:
   RGWRESTOp() : http_ret(0) {}
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *dialect_handler) {
     RGWOp::init(store, s, dialect_handler);
-    flusher.init(s);
+    flusher.init(s, this);
   }
   virtual void send_response();
   virtual int check_caps(RGWUserCaps& caps) { return -EPERM; } /* should to be implemented! */
@@ -263,21 +265,25 @@ class RGWHandler_SWIFT_Auth;
 class RGWHandler_ObjStore_S3;
 
 class RGWRESTMgr {
+  bool should_log;
 protected:
   map<string, RGWRESTMgr *> resource_mgrs;
   multimap<size_t, string> resources_by_size;
   RGWRESTMgr *default_mgr;
 
 public:
-  RGWRESTMgr() : default_mgr(NULL) {}
+  RGWRESTMgr() : should_log(false), default_mgr(NULL) {}
   virtual ~RGWRESTMgr();
 
   void register_resource(string resource, RGWRESTMgr *mgr);
   void register_default_mgr(RGWRESTMgr *mgr);
 
-  virtual RGWRESTMgr *get_resource_mgr(struct req_state *s, const string& uri);
+  virtual RGWRESTMgr *get_resource_mgr(struct req_state *s, const string& uri, string *out_uri);
   virtual RGWHandler *get_handler(struct req_state *s) { return NULL; }
   virtual void put_handler(RGWHandler *handler) { delete handler; }
+
+  void set_logging(bool _should_log) { should_log = _should_log; }
+  bool get_logging() { return should_log; }
 };
 
 class RGWREST {
@@ -287,7 +293,7 @@ class RGWREST {
 public:
   RGWREST() {}
   RGWHandler *get_handler(RGWRados *store, struct req_state *s, RGWClientIO *cio,
-			  int *init_error);
+			  RGWRESTMgr **pmgr, int *init_error);
   void put_handler(RGWHandler *handler) {
     mgr.put_handler(handler);
   }
@@ -306,14 +312,15 @@ public:
 extern void set_req_state_err(struct req_state *s, int err_no);
 extern void dump_errno(struct req_state *s);
 extern void dump_errno(struct req_state *s, int ret);
-extern void end_header(struct req_state *s, const char *content_type = NULL);
+extern void end_header(struct req_state *s, RGWOp *op = NULL, const char *content_type = NULL);
 extern void dump_start(struct req_state *s);
 extern void list_all_buckets_start(struct req_state *s);
 extern void dump_owner(struct req_state *s, string& id, string& name, const char *section = NULL);
 extern void dump_content_length(struct req_state *s, uint64_t len);
 extern void dump_etag(struct req_state *s, const char *etag);
+extern void dump_epoch_header(struct req_state *s, const char *name, time_t t);
 extern void dump_last_modified(struct req_state *s, time_t t);
-extern void abort_early(struct req_state *s, int err);
+extern void abort_early(struct req_state *s, RGWOp *op, int err);
 extern void dump_range(struct req_state *s, uint64_t ofs, uint64_t end, uint64_t total_size);
 extern void dump_continue(struct req_state *s);
 extern void list_all_buckets_end(struct req_state *s);
@@ -326,6 +333,7 @@ extern void dump_pair(struct req_state *s, const char *key, const char *value);
 extern bool is_valid_url(const char *url);
 extern void dump_access_control(struct req_state *s, const char *origin, const char *meth,
                          const char *hdr, const char *exp_hdr, uint32_t max_age);
+extern void dump_access_control(req_state *s, RGWOp *op);
 
 
 #endif

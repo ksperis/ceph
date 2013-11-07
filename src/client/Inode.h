@@ -13,10 +13,10 @@
 #include "osdc/ObjectCacher.h"
 #include "include/assert.h"
 
-class MetaSession;
+struct MetaSession;
 class Dentry;
 class Dir;
-class SnapRealm;
+struct SnapRealm;
 class Inode;
 
 struct Cap {
@@ -181,13 +181,15 @@ class Inode {
     lsubdout(cct, mds, 15) << "inode.get on " << this << " " <<  ino << '.' << snapid
 		   << " now " << _ref << dendl;
   }
-  int put(int n=1) { 
+  /// private method to put a reference; see Client::put_inode()
+  int _put(int n=1) {
     _ref -= n; 
     lsubdout(cct, mds, 15) << "inode.put on " << this << " " << ino << '.' << snapid
 		   << " now " << _ref << dendl;
     assert(_ref >= 0);
     return _ref;
   }
+
   int get_num_ref() {
     return _ref;
   }

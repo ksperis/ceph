@@ -171,14 +171,16 @@ public:
   }
   void confirm_receipt(ceph_seq_t seq, unsigned caps) {
     if (seq == last_sent) {
-      _pending = caps;
       _revokes.clear();
       _issued = caps;
+      // don't add bits
+      _pending &= caps;
     } else {
       // can i forget any revocations?
-      while (!_revokes.empty() &&
-	     _revokes.front().seq <= seq)
+      while (!_revokes.empty() && _revokes.front().seq < seq)
 	_revokes.pop_front();
+      if (!_revokes.empty() && _revokes.front().seq == seq)
+	_revokes.begin()->before = caps;
       _calc_issued();
     }
     //check_rdcaps_list();
@@ -273,7 +275,7 @@ public:
     return Export(_wanted, issued(), pending(), client_follows, mseq+1, last_issue_stamp);
   }
   void rejoin_import() { mseq++; }
-  void merge(Export& other) {
+  void merge(Export& other, bool auth_cap) {
     // issued + pending
     int newpending = other.pending | pending();
     if (other.issued & ~newpending)
@@ -286,7 +288,8 @@ public:
 
     // wanted
     _wanted = _wanted | other.wanted;
-    mseq = other.mseq;
+    if (auth_cap)
+      mseq = other.mseq;
   }
   void merge(int otherwanted, int otherissued) {
     // issued + pending

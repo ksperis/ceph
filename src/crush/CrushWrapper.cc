@@ -255,14 +255,14 @@ int CrushWrapper::get_full_location_ordered(int id, vector<pair<string, string> 
   string high_type_name = type_map[high_type];
 
   path.push_back(parent_coord);
-  parent_id = get_item_id( (parent_coord.second).c_str() );
+  parent_id = get_item_id(parent_coord.second);
 
 
   while (parent_coord.first != high_type_name) {
     parent_coord = get_immediate_parent(parent_id);
     path.push_back(parent_coord);
     if ( parent_coord.first != high_type_name ){
-      parent_id = get_item_id( (parent_coord.second).c_str() );
+      parent_id = get_item_id(parent_coord.second);
     }
   }
 
@@ -291,7 +291,7 @@ map<int, string> CrushWrapper::get_parent_hierarchy(int id)
       high_type = (*it).first;
   }
 
-  parent_id = get_item_id((parent_coord.second).c_str());
+  parent_id = get_item_id(parent_coord.second);
 
   while (type_counter < high_type) {
     type_counter++;
@@ -300,7 +300,7 @@ map<int, string> CrushWrapper::get_parent_hierarchy(int id)
     if (type_counter < high_type){
       // get the coordinate information for the next parent
       parent_coord = get_immediate_parent(parent_id);
-      parent_id = get_item_id(parent_coord.second.c_str());
+      parent_id = get_item_id(parent_coord.second);
     }
   }
 
@@ -333,6 +333,9 @@ int CrushWrapper::insert_item(CephContext *cct, int item, float weight, string n
   ldout(cct, 5) << "insert_item item " << item << " weight " << weight
 		<< " name " << name << " loc " << loc << dendl;
 
+  if (!is_valid_crush_name(name))
+    return -EINVAL;
+
   if (name_exists(name)) {
     if (get_item_id(name) != item) {
       ldout(cct, 10) << "device name '" << name << "' already exists as id "
@@ -360,9 +363,15 @@ int CrushWrapper::insert_item(CephContext *cct, int item, float weight, string n
 
     if (!name_exists(q->second)) {
       ldout(cct, 5) << "insert_item creating bucket " << q->second << dendl;
-      int empty = 0;
-      cur = add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT, p->first, 1, &cur, &empty);
-      set_item_name(cur, q->second);
+      int empty = 0, newid;
+      int r = add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT, p->first, 1, &cur, &empty, &newid);
+      if (r < 0) {
+        char buf[128]; 
+        ldout(cct, 1) << "add_bucket failure error: " << strerror_r(-r, buf, sizeof(buf)) << dendl;
+        return r;
+      }
+      set_item_name(newid, q->second);
+      cur = newid;
       continue;
     }
 
@@ -473,6 +482,10 @@ int CrushWrapper::create_or_move_item(CephContext *cct, int item, float weight, 
 {
   int ret = 0;
   int old_iweight;
+
+  if (!is_valid_crush_name(name))
+    return -EINVAL;
+
   if (check_item_loc(cct, item, loc, &old_iweight)) {
     ldout(cct, 5) << "create_or_move_item " << item << " already at " << loc << dendl;
   } else {
@@ -496,6 +509,9 @@ int CrushWrapper::update_item(CephContext *cct, int item, float weight, string n
   ldout(cct, 5) << "update_item item " << item << " weight " << weight
 		<< " name " << name << " loc " << loc << dendl;
   int ret = 0;
+
+  if (!is_valid_crush_name(name))
+    return -EINVAL;
 
   // compare quantized (fixed-point integer) weights!  
   int iweight = (int)(weight * (float)0x10000);
@@ -631,18 +647,28 @@ void CrushWrapper::reweight(CephContext *cct)
   }
 }
 
-int CrushWrapper::add_simple_rule(string name, string root_name, string failure_domain_name)
+int CrushWrapper::add_simple_rule(string name, string root_name, string failure_domain_name,
+				  ostream *err)
 {
-  if (rule_exists(name))
+  if (rule_exists(name)) {
+    if (err)
+      *err << "rule " << name << " exists";
     return -EEXIST;
-  if (!name_exists(root_name))
+  }
+  if (!name_exists(root_name)) {
+    if (err)
+      *err << "root item " << root_name << " does not exist";
     return -ENOENT;
+  }
   int root = get_item_id(root_name);
   int type = 0;
   if (failure_domain_name.length()) {
     type = get_type_id(failure_domain_name);
-    if (type <= 0) // bah, returns 0 on error; but its ok, device isn't a domain really
+    if (type < 0) {
+      if (err)
+	*err << "unknown type " << failure_domain_name;
       return -EINVAL;
+    }
   }
 
   int ruleset = 0;
@@ -1017,6 +1043,13 @@ void CrushWrapper::dump(Formatter *f) const
   f->open_array_section("rules");
   dump_rules(f);
   f->close_section();
+
+  f->open_object_section("tunables");
+  f->dump_int("choose_local_tries", get_choose_local_tries());
+  f->dump_int("choose_local_fallback_tries", get_choose_local_fallback_tries());
+  f->dump_int("choose_total_tries", get_choose_total_tries());
+  f->dump_int("chooseleaf_descend_once", get_chooseleaf_descend_once());
+  f->close_section();
 }
 
 void CrushWrapper::dump_rules(Formatter *f) const
@@ -1091,4 +1124,21 @@ void CrushWrapper::generate_test_instances(list<CrushWrapper*>& o)
 {
   o.push_back(new CrushWrapper);
   // fixme
+}
+
+
+bool CrushWrapper::is_valid_crush_name(const string& s)
+{
+  if (s.empty())
+    return false;
+  for (string::const_iterator p = s.begin(); p != s.end(); ++p) {
+    if (!(*p == '-') &&
+	!(*p == '_') &&
+	!(*p == '.') &&
+	!(*p >= '0' && *p <= '9') &&
+	!(*p >= 'A' && *p <= 'Z') &&
+	!(*p >= 'a' && *p <= 'z'))
+      return false;
+  }
+  return true;
 }

@@ -11,8 +11,8 @@
  * Foundation.  See file COPYING.
  * 
  */
+#include "include/int_types.h"
 
-#include <inttypes.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -25,18 +25,13 @@
 
 #if defined(__linux__)
 #include <linux/fs.h>
-#include <syscall.h>
 #endif
 
 #include <iostream>
 #include <map>
 
-#if defined(__FreeBSD__)
-#include "include/inttypes.h"
-#endif
-
 #include "include/compat.h"
-#include "include/fiemap.h"
+#include "include/linux_fiemap.h"
 
 #include "common/xattr.h"
 #include "chain_xattr.h"
@@ -51,6 +46,9 @@
 #include <sstream>
 
 #include "FileStore.h"
+#include "GenericFileStoreBackend.h"
+#include "BtrfsFileStoreBackend.h"
+#include "ZFSFileStoreBackend.h"
 #include "common/BackTrace.h"
 #include "include/types.h"
 #include "FileJournal.h"
@@ -74,10 +72,6 @@
 #include "common/ceph_crypto.h"
 using ceph::crypto::SHA1;
 
-#ifndef __CYGWIN__
-#  include "btrfs_ioctl.h"
-#endif
-
 #include "include/assert.h"
 
 #include "common/config.h"
@@ -86,41 +80,23 @@ using ceph::crypto::SHA1;
 #undef dout_prefix
 #define dout_prefix *_dout << "filestore(" << basedir << ") "
 
-#if defined(__linux__)
-# ifndef BTRFS_SUPER_MAGIC
-static const __SWORD_TYPE BTRFS_SUPER_MAGIC(0x9123683E);
-# endif
-#endif
-
 #define COMMIT_SNAP_ITEM "snap_%lld"
 #define CLUSTER_SNAP_ITEM "clustersnap_%s"
 
 #define REPLAY_GUARD_XATTR "user.cephos.seq"
+#define GLOBAL_REPLAY_GUARD_XATTR "user.cephos.gseq"
 
-/*
- * long file names will have the following format:
- *
- * prefix_hash_index_cookie
- *
- * The prefix will just be the first X bytes of the original file name.
- * The cookie is a constant string that shows whether this file name
- * is hashed
- */
 
-#define FILENAME_LFN_DIGEST_SIZE CEPH_CRYPTO_SHA1_DIGESTSIZE
-
-#define FILENAME_MAX_LEN        4096    // the long file name size
-#define FILENAME_SHORT_LEN      255     // the short file name size
-#define FILENAME_COOKIE         "long"  // ceph long file name
-#define FILENAME_HASH_LEN       FILENAME_LFN_DIGEST_SIZE
-#define FILENAME_EXTRA	        4       // underscores and digit
-
-#define LFN_ATTR "user.cephos.lfn"
-
-#define FILENAME_PREFIX_LEN (FILENAME_SHORT_LEN - FILENAME_HASH_LEN - (sizeof(FILENAME_COOKIE) - 1) - FILENAME_EXTRA)
-#define ALIGN_DOWN(x, by) ((x) - ((x) % (by)))
-#define ALIGNED(x, by) (!((x) % (by)))
-#define ALIGN_UP(x, by) (ALIGNED((x), (by)) ? (x) : (ALIGN_DOWN((x), (by)) + (by)))
+void FileStore::FSPerfTracker::update_from_perfcounters(
+  PerfCounters &logger)
+{
+  os_commit_latency.consume_next(
+    logger.get_tavg_ms(
+      l_os_commit_lat));
+  os_apply_latency.consume_next(
+    logger.get_tavg_ms(
+      l_os_apply_lat));
+}
 
 
 ostream& operator<<(ostream& out, const FileStore::OpSequencer& s)
@@ -196,22 +172,35 @@ int FileStore::lfn_stat(coll_t cid, const hobject_t& oid, struct stat *buf)
   return r;
 }
 
-int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode,
+int FileStore::lfn_open(coll_t cid,
+			const hobject_t& oid,
+			bool create,
+			FDRef *outfd,
 			IndexedPath *path,
 			Index *index) 
 {
+  assert(outfd);
+  int flags = O_RDWR;
+  if (create)
+    flags |= O_CREAT;
   Index index2;
+  if (!index) {
+    index = &index2;
+  }
+  int r = 0;
+  if (!(*index)) {
+    r = get_index(cid, index);
+  }
+  Mutex::Locker l(fdcache_lock);
+  if (!replaying)
+    *outfd = fdcache.lookup(oid);
+  if (*outfd) {
+    return 0;
+  }
   IndexedPath path2;
   if (!path)
     path = &path2;
   int fd, exist;
-  int r = 0;
-  if (!index) {
-    index = &index2;
-  }
-  if (!(*index)) {
-    r = get_index(cid, index);
-  }
   if (r < 0) {
     derr << "error getting collection index for " << cid
 	 << ": " << cpp_strerror(-r) << dendl;
@@ -224,16 +213,16 @@ int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode
     goto fail;
   }
 
-  r = ::open((*path)->path(), flags, mode);
+  r = ::open((*path)->path(), flags, 0644);
   if (r < 0) {
     r = -errno;
     dout(10) << "error opening file " << (*path)->path() << " with flags="
-	     << flags << " and mode=" << mode << ": " << cpp_strerror(-r) << dendl;
+	     << flags << ": " << cpp_strerror(-r) << dendl;
     goto fail;
   }
   fd = r;
 
-  if ((flags & O_CREAT) && (!exist)) {
+  if (create && (!exist)) {
     r = (*index)->created(oid, (*path)->path());
     if (r < 0) {
       TEMP_FAILURE_RETRY(::close(fd));
@@ -242,31 +231,19 @@ int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode
       goto fail;
     }
   }
-  return fd;
+  if (!replaying)
+    *outfd = fdcache.add(oid, fd);
+  else
+    *outfd = FDRef(new FDCache::FD(fd));
+  return 0;
 
  fail:
   assert(!m_filestore_fail_eio || r != -EIO);
   return r;
 }
 
-int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode, IndexedPath *path)
+void FileStore::lfn_close(FDRef fd)
 {
-  return lfn_open(cid, oid, flags, mode, path, 0);
-}
-
-int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags, mode_t mode)
-{
-  return lfn_open(cid, oid, flags, mode, 0, 0);
-}
-
-int FileStore::lfn_open(coll_t cid, const hobject_t& oid, int flags)
-{
-  return lfn_open(cid, oid, flags, 0);
-}
-
-void FileStore::lfn_close(int fd)
-{
-  TEMP_FAILURE_RETRY(::close(fd));
 }
 
 int FileStore::lfn_link(coll_t c, coll_t cid, const hobject_t& o) 
@@ -328,6 +305,7 @@ int FileStore::lfn_unlink(coll_t cid, const hobject_t& o,
   int r = get_index(cid, &index);
   if (r < 0)
     return r;
+  Mutex::Locker l(fdcache_lock);
   {
     IndexedPath path;
     int exist;
@@ -355,11 +333,13 @@ int FileStore::lfn_unlink(coll_t cid, const hobject_t& o,
       if (g_conf->filestore_debug_inject_read_err) {
 	debug_obj_on_delete(o);
       }
+      wbthrottle.clear_object(o); // should be only non-cache ref
+      fdcache.clear(o);
     } else {
       /* Ensure that replay of this op doesn't result in the object_map
        * going away.
        */
-      if (!btrfs_stable_commits)
+      if (!backend->can_checkpoint())
 	object_map->sync(&o, &spos);
     }
   }
@@ -369,17 +349,10 @@ int FileStore::lfn_unlink(coll_t cid, const hobject_t& o,
 FileStore::FileStore(const std::string &base, const std::string &jdev, const char *name, bool do_update) :
   internal_name(name),
   basedir(base), journalpath(jdev),
-  btrfs(false),
-  btrfs_stable_commits(false),
   blk_size(0),
-  btrfs_trans_start_end(false), btrfs_clone_range(false),
-  btrfs_snap_create(false),
-  btrfs_snap_destroy(false),
-  btrfs_snap_create_v2(false),
-  btrfs_wait_sync(false),
-  ioctl_fiemap(false),
   fsid_fd(-1), op_fd(-1),
   basedir_fd(-1), current_fd(-1),
+  generic_backend(NULL), backend(NULL),
   index_manager(do_update),
   ondisk_finisher(g_ceph_context),
   lock("FileStore::lock"),
@@ -387,6 +360,9 @@ FileStore::FileStore(const std::string &base, const std::string &jdev, const cha
   sync_entry_timeo_lock("sync_entry_timeo_lock"),
   timer(g_ceph_context, sync_entry_timeo_lock),
   stop(false), sync_thread(this),
+  fdcache_lock("fdcache_lock"),
+  fdcache(g_ceph_context),
+  wbthrottle(g_ceph_context),
   default_osr("default"),
   op_queue_len(0), op_queue_bytes(0),
   op_throttle_lock("FileStore::op_throttle_lock"),
@@ -394,22 +370,13 @@ FileStore::FileStore(const std::string &base, const std::string &jdev, const cha
   op_tp(g_ceph_context, "FileStore::op_tp", g_conf->filestore_op_threads, "filestore_op_threads"),
   op_wq(this, g_conf->filestore_op_thread_timeout,
 	g_conf->filestore_op_thread_suicide_timeout, &op_tp),
-  flusher_queue_len(0), flusher_thread(this),
   logger(NULL),
   read_error_lock("FileStore::read_error_lock"),
-  m_filestore_btrfs_clone_range(g_conf->filestore_btrfs_clone_range),
-  m_filestore_btrfs_snap (g_conf->filestore_btrfs_snap ),
   m_filestore_commit_timeout(g_conf->filestore_commit_timeout),
-  m_filestore_fiemap(g_conf->filestore_fiemap),
-  m_filestore_flusher (g_conf->filestore_flusher ),
-  m_filestore_fsync_flushes_journal_data(g_conf->filestore_fsync_flushes_journal_data),
   m_filestore_journal_parallel(g_conf->filestore_journal_parallel ),
   m_filestore_journal_trailing(g_conf->filestore_journal_trailing),
   m_filestore_journal_writeahead(g_conf->filestore_journal_writeahead),
   m_filestore_fiemap_threshold(g_conf->filestore_fiemap_threshold),
-  m_filestore_sync_flush(g_conf->filestore_sync_flush),
-  m_filestore_flusher_max_fds(g_conf->filestore_flusher_max_fds),
-  m_filestore_flush_min(g_conf->filestore_flush_min),
   m_filestore_max_sync_interval(g_conf->filestore_max_sync_interval),
   m_filestore_min_sync_interval(g_conf->filestore_min_sync_interval),
   m_filestore_fail_eio(g_conf->filestore_fail_eio),
@@ -466,12 +433,24 @@ FileStore::FileStore(const std::string &base, const std::string &jdev, const cha
   plb.add_time_avg(l_os_commit_len, "commitcycle_interval");
   plb.add_time_avg(l_os_commit_lat, "commitcycle_latency");
   plb.add_u64_counter(l_os_j_full, "journal_full");
+  plb.add_time_avg(l_os_queue_lat, "queue_transaction_latency_avg");
 
   logger = plb.create_perf_counters();
+
+  g_ceph_context->get_perfcounters_collection()->add(logger);
+  g_ceph_context->_conf->add_observer(this);
+
+  generic_backend = new GenericFileStoreBackend(this);
+  backend = generic_backend;
 }
 
 FileStore::~FileStore()
 {
+  g_ceph_context->_conf->remove_observer(this);
+  g_ceph_context->get_perfcounters_collection()->remove(logger);
+
+  delete generic_backend;
+
   if (journal)
     journal->logger = NULL;
   delete logger;
@@ -493,57 +472,6 @@ bool parse_attrname(char **name)
     return true;
   }
   return false;
-}
-
-static int do_fiemap(int fd, off_t start, size_t len, struct fiemap **pfiemap)
-{
-  struct fiemap *fiemap = NULL;
-  struct fiemap *_realloc_fiemap = NULL;
-  int size;
-  int ret;
-
-  fiemap = (struct fiemap*)calloc(sizeof(struct fiemap), 1);
-  if (!fiemap)
-    return -ENOMEM;
-
-  fiemap->fm_start = start;
-  fiemap->fm_length = len;
-
-  fsync(fd); /* flush extents to disk if needed */
-
-  if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
-    ret = -errno;
-    goto done_err;
-  }
-
-  size = sizeof(struct fiemap_extent) * (fiemap->fm_mapped_extents);
-
-  _realloc_fiemap = (struct fiemap *)realloc(fiemap, sizeof(struct fiemap) +
-                                    size);
-  if (!_realloc_fiemap) {
-    ret = -ENOMEM;
-    goto done_err;
-  } else {
-    fiemap = _realloc_fiemap;
-  }
-
-  memset(fiemap->fm_extents, 0, size);
-
-  fiemap->fm_extent_count = fiemap->fm_mapped_extents;
-  fiemap->fm_mapped_extents = 0;
-
-  if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
-    ret = -errno;
-    goto done_err;
-  }
-  *pfiemap = fiemap;
-
-  return 0;
-
-done_err:
-  *pfiemap = NULL;
-  free(fiemap);
-  return ret;
 }
 
 int FileStore::statfs(struct statfs *buf)
@@ -585,15 +513,8 @@ int FileStore::dump_journal(ostream& out)
 int FileStore::mkfs()
 {
   int ret = 0;
-  int basedir_fd;
   char fsid_fn[PATH_MAX];
-  struct stat st;
   uuid_d old_fsid;
-
-#if defined(__linux__)
-  struct btrfs_ioctl_vol_args volargs;
-  memset(&volargs, 0, sizeof(volargs));
-#endif
 
   dout(1) << "mkfs in " << basedir << dendl;
   basedir_fd = ::open(basedir.c_str(), O_RDONLY);
@@ -675,72 +596,20 @@ int FileStore::mkfs()
     goto close_fsid_fd;
   }
 
-  // current
-  ret = ::stat(current_fn.c_str(), &st);
-  if (ret == 0) {
-    // current/ exists
-    if (!S_ISDIR(st.st_mode)) {
-      ret = -EINVAL;
-      derr << "mkfs current/ exists but is not a directory" << dendl;
-      goto close_fsid_fd;
-    }
-
+  if (basefs.f_type == BTRFS_SUPER_MAGIC) {
 #if defined(__linux__)
-    // is current/ a btrfs subvolume?
-    //  check fsid, and compare st_dev to see if it's a subvolume.
-    struct stat basest;
-    struct statfs currentfs;
-    ret = ::fstat(basedir_fd, &basest);
-    if (ret < 0) {
-      ret = -errno;
-      derr << "mkfs cannot fstat basedir "
-	   << cpp_strerror(ret) << dendl;
-      goto close_fsid_fd;
-    }
-    ret = ::statfs(current_fn.c_str(), &currentfs);
-    if (ret < 0) {
-      ret = -errno;
-      derr << "mkfs cannot statsf basedir "
-	   << cpp_strerror(ret) << dendl;
-      goto close_fsid_fd;
-    }
-    if (basefs.f_type == BTRFS_SUPER_MAGIC &&
-	currentfs.f_type == BTRFS_SUPER_MAGIC &&
-	basest.st_dev != st.st_dev) {
-      dout(2) << " current appears to be a btrfs subvolume" << dendl;
-      btrfs_stable_commits = true;
-    }
+    backend = new BtrfsFileStoreBackend(this);
 #endif
-  } else {
-#if defined(__linux__)
-    if (basefs.f_type == BTRFS_SUPER_MAGIC) {
-      volargs.fd = 0;
-      strcpy(volargs.name, "current");
-      if (::ioctl(basedir_fd, BTRFS_IOC_SUBVOL_CREATE, (unsigned long int)&volargs) < 0) {
-	ret = -errno;
-	derr << "mkfs: BTRFS_IOC_SUBVOL_CREATE failed with error "
-	     << cpp_strerror(ret) << dendl;
-	goto close_fsid_fd;
-      }
+  } else if (basefs.f_type == ZFS_SUPER_MAGIC) {
+#ifdef HAVE_LIBZFS
+    backend = new ZFSFileStoreBackend(this);
+#endif
+  }
 
-      dout(2) << " created btrfs subvol " << current_fn << dendl;
-      if (::chmod(current_fn.c_str(), 0755) < 0) {
-	ret = -errno;
-	derr << "mkfs: failed to chmod " << current_fn << " to 0755: "
-	     << cpp_strerror(ret) << dendl;
-	goto close_fsid_fd;
-      }
-      btrfs_stable_commits = true;
-    } else
-#endif
-    {
-      if (::mkdir(current_fn.c_str(), 0755) < 0) {
-	ret = -errno;
-	derr << "mkfs: mkdir " << current_fn << " failed: "
-	     << cpp_strerror(ret) << dendl;
-	goto close_fsid_fd;
-      }
-    }
+  ret = backend->create_current();
+  if (ret < 0) {
+    derr << "mkfs: failed to create current/ " << cpp_strerror(ret) << dendl;
+    goto close_fsid_fd;
   }
 
   // write initial op_seq
@@ -761,30 +630,19 @@ int FileStore::mkfs()
 	goto close_fsid_fd;
       }
 
-      if (btrfs_stable_commits) {
+      if (backend->can_checkpoint()) {
 	// create snap_1 too
-	snprintf(volargs.name, sizeof(volargs.name), COMMIT_SNAP_ITEM, 1ull);
-	volargs.fd = ::open(current_fn.c_str(), O_RDONLY);
-	assert(volargs.fd >= 0);
-	if (::ioctl(basedir_fd, BTRFS_IOC_SNAP_CREATE, (unsigned long int)&volargs)) {
-	  ret = -errno;
-	  if (ret != -EEXIST) {
-	    TEMP_FAILURE_RETRY(::close(fd));  
-	    TEMP_FAILURE_RETRY(::close(volargs.fd));
-	    derr << "mkfs: failed to create " << volargs.name << ": "
-		 << cpp_strerror(ret) << dendl;
-	    goto close_fsid_fd;
-	  }
-	}
-	if (::fchmod(volargs.fd, 0755)) {
+	current_fd = ::open(current_fn.c_str(), O_RDONLY);
+	assert(current_fd >= 0);
+	char s[NAME_MAX];
+	snprintf(s, sizeof(s), COMMIT_SNAP_ITEM, 1ull);
+	ret = backend->create_checkpoint(s, NULL);
+	TEMP_FAILURE_RETRY(::close(current_fd));
+	if (ret < 0 && ret != -EEXIST) {
 	  TEMP_FAILURE_RETRY(::close(fd));  
-	  TEMP_FAILURE_RETRY(::close(volargs.fd));
-	  ret = -errno;
-	  derr << "mkfs: failed to chmod " << basedir << "/" << volargs.name << " to 0755: "
-	       << cpp_strerror(ret) << dendl;
+	  derr << "mkfs: failed to create snap_1: " << cpp_strerror(ret) << dendl;
 	  goto close_fsid_fd;
 	}
-	TEMP_FAILURE_RETRY(::close(volargs.fd));
       }
     }
     TEMP_FAILURE_RETRY(::close(fd));  
@@ -818,6 +676,10 @@ int FileStore::mkfs()
   fsid_fd = -1;
  close_basedir_fd:
   TEMP_FAILURE_RETRY(::close(basedir_fd));
+  if (backend != generic_backend) {
+    delete backend;
+    backend = generic_backend;
+  }
   return ret;
 }
 
@@ -915,90 +777,48 @@ bool FileStore::test_mount_in_use()
   return inuse;
 }
 
-int FileStore::_test_fiemap()
-{
-  char fn[PATH_MAX];
-  snprintf(fn, sizeof(fn), "%s/fiemap_test", basedir.c_str());
-
-  int fd = ::open(fn, O_CREAT|O_RDWR|O_TRUNC, 0644);
-  if (fd < 0) {
-    fd = -errno;
-    derr << "_test_fiemap unable to create " << fn << ": " << cpp_strerror(fd) << dendl;
-    return fd;
-  }
-
-  // ext4 has a bug in older kernels where fiemap will return an empty
-  // result in some cases.  this is a file layout that triggers the bug
-  // on 2.6.34-rc5.
-  int v[] = {
-    0x0000000000016000, 0x0000000000007000,
-    0x000000000004a000, 0x0000000000007000,
-    0x0000000000060000, 0x0000000000001000,
-    0x0000000000061000, 0x0000000000008000,
-    0x0000000000069000, 0x0000000000007000,
-    0x00000000000a3000, 0x000000000000c000,
-    0x000000000024e000, 0x000000000000c000,
-    0x000000000028b000, 0x0000000000009000,
-    0x00000000002b1000, 0x0000000000003000,
-    0, 0
-  };
-  for (int i=0; v[i]; i++) {
-    int off = v[i++];
-    int len = v[i];
-
-    // write a large extent
-    char buf[len];
-    memset(buf, 1, sizeof(buf));
-    int r = ::lseek(fd, off, SEEK_SET);
-    if (r < 0) {
-      r = -errno;
-      derr << "_test_fiemap failed to lseek " << fn << ": " << cpp_strerror(r) << dendl;
-      TEMP_FAILURE_RETRY(::close(fd));
-      return r;
-    }
-    r = safe_write(fd, buf, sizeof(buf));
-    if (r < 0) {
-      derr << "_test_fiemap failed to write to " << fn << ": " << cpp_strerror(r) << dendl;
-      TEMP_FAILURE_RETRY(::close(fd));
-      return r;
-    }
-  }
-  ::fsync(fd);
-
-  // fiemap an extent inside that
-  struct fiemap *fiemap;
-  int r = do_fiemap(fd, 2430421, 59284, &fiemap);
-  if (r < 0) {
-    dout(0) << "mount FIEMAP ioctl is NOT supported" << dendl;
-    ioctl_fiemap = false;
-  } else {
-    if (fiemap->fm_mapped_extents == 0) {
-      dout(0) << "mount FIEMAP ioctl is supported, but buggy -- upgrade your kernel" << dendl;
-      ioctl_fiemap = false;
-    } else {
-      dout(0) << "mount FIEMAP ioctl is supported and appears to work" << dendl;
-      ioctl_fiemap = true;
-    }
-  }
-  if (!m_filestore_fiemap) {
-    dout(0) << "mount FIEMAP ioctl is disabled via 'filestore fiemap' config option" << dendl;
-    ioctl_fiemap = false;
-  }
-  free(fiemap);
-
-  ::unlink(fn);
-  TEMP_FAILURE_RETRY(::close(fd));
-  return 0;
-}
-
 int FileStore::_detect_fs()
 {
+  struct statfs st;
+  int r = ::fstatfs(basedir_fd, &st);
+  if (r < 0)
+    return -errno;
+
+  blk_size = st.f_bsize;
+
+#if defined(__linux__)
+  if (st.f_type == BTRFS_SUPER_MAGIC) {
+    dout(0) << "mount detected btrfs" << dendl;
+    backend = new BtrfsFileStoreBackend(this);
+
+    wbthrottle.set_fs(WBThrottle::BTRFS);
+  } else if (st.f_type == XFS_SUPER_MAGIC) {
+    dout(1) << "mount detected xfs" << dendl;
+    if (m_filestore_replica_fadvise) {
+      dout(1) << " disabling 'filestore replica fadvise' due to known issues with fadvise(DONTNEED) on xfs" << dendl;
+      g_conf->set_val("filestore_replica_fadvise", "false");
+      g_conf->apply_changes(NULL);
+      assert(m_filestore_replica_fadvise == false);
+    }
+  }
+#endif
+#ifdef HAVE_LIBZFS
+  if (st.f_type == ZFS_SUPER_MAGIC) {
+    backend = new ZFSFileStoreBackend(this);
+  }
+#endif
+
+  r = backend->detect_features();
+  if (r < 0) {
+    derr << "_detect_fs: detect_features error: " << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  // test xattrs
   char fn[PATH_MAX];
   int x = rand();
   int y = x+1;
-
   snprintf(fn, sizeof(fn), "%s/xattr_test", basedir.c_str());
-
   int tmpfd = ::open(fn, O_CREAT|O_WRONLY|O_TRUNC, 0700);
   if (tmpfd < 0) {
     int ret = -errno;
@@ -1029,12 +849,12 @@ int FileStore::_detect_fs()
   ret = chain_fsetxattr(tmpfd, "user.test5", &buf, sizeof(buf));
   if (ret == -ENOSPC) {
     if (!g_conf->filestore_xattr_use_omap) {
-      derr << "limited size xattrs -- enable filestore_xattr_use_omap" << dendl;
-      ::unlink(fn);
-      TEMP_FAILURE_RETRY(::close(tmpfd));
-      return -ENOTSUP;
+      dout(0) << "limited size xattrs -- automatically enabling filestore_xattr_use_omap" << dendl;
+      g_conf->set_val("filestore_xattr_use_omap", "true");
+      g_conf->apply_changes(NULL);
+      assert(g_conf->filestore_xattr_use_omap == true);
     } else {
-      derr << "limited size xattrs -- filestore_xattr_use_omap enabled" << dendl;
+      dout(0) << "limited size xattrs -- filestore_xattr_use_omap already enabled" << dendl;
     }
   }
   chain_fremovexattr(tmpfd, "user.test");
@@ -1046,225 +866,6 @@ int FileStore::_detect_fs()
   ::unlink(fn);
   TEMP_FAILURE_RETRY(::close(tmpfd));
 
-  int fd = ::open(basedir.c_str(), O_RDONLY);
-  if (fd < 0)
-    return -errno;
-
-  int r = _test_fiemap();
-  if (r < 0) {
-    TEMP_FAILURE_RETRY(::close(fd));
-    return -r;
-  }
-
-  struct statfs st;
-  r = ::fstatfs(fd, &st);
-  if (r < 0) {
-    TEMP_FAILURE_RETRY(::close(fd));
-    return -errno;
-  }
-  blk_size = st.f_bsize;
-
-#if defined(__linux__)
-  if (st.f_type == BTRFS_SUPER_MAGIC) {
-    dout(0) << "mount detected btrfs" << dendl;      
-    btrfs = true;
-
-    btrfs_stable_commits = btrfs && m_filestore_btrfs_snap;
-
-    // clone_range?
-    if (m_filestore_btrfs_clone_range) {
-      btrfs_clone_range = true;
-      int r = _do_clone_range(fsid_fd, -1, 0, 1, 0);
-      if (r == -EBADF) {
-	dout(0) << "mount btrfs CLONE_RANGE ioctl is supported" << dendl;
-      } else {
-	btrfs_clone_range = false;
-	dout(0) << "mount btrfs CLONE_RANGE ioctl is NOT supported: " << cpp_strerror(r) << dendl;
-      }
-    } else {
-      dout(0) << "mount btrfs CLONE_RANGE ioctl is DISABLED via 'filestore btrfs clone range' option" << dendl;
-    }
-
-    struct btrfs_ioctl_vol_args vol_args;
-    memset(&vol_args, 0, sizeof(vol_args));
-
-    // create test source volume
-    vol_args.fd = 0;
-    strcpy(vol_args.name, "test_subvol");
-    r = ::ioctl(fd, BTRFS_IOC_SUBVOL_CREATE, &vol_args);
-    if (r != 0) {
-      r = -errno;
-      dout(0) << "mount  failed to create simple subvolume " << vol_args.name << ": " << cpp_strerror(r) << dendl;
-    }
-    int srcfd = ::openat(fd, vol_args.name, O_RDONLY);
-    if (srcfd < 0) {
-      r = -errno;
-      dout(0) << "mount  failed to open " << vol_args.name << ": " << cpp_strerror(r) << dendl;
-    }
-
-    // snap_create and snap_destroy?
-    vol_args.fd = srcfd;
-    strcpy(vol_args.name, "sync_snap_test");
-    r = ::ioctl(fd, BTRFS_IOC_SNAP_CREATE, &vol_args);
-    int err = errno;
-    if (r == 0 || errno == EEXIST) {
-      dout(0) << "mount btrfs SNAP_CREATE is supported" << dendl;
-      btrfs_snap_create = true;
-
-      r = ::ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
-      if (r == 0) {
-	dout(0) << "mount btrfs SNAP_DESTROY is supported" << dendl;
-	btrfs_snap_destroy = true;
-      } else {
-	err = -errno;
-	dout(0) << "mount btrfs SNAP_DESTROY failed: " << cpp_strerror(err) << dendl;
-
-	if (err == -EPERM && getuid() != 0) {
-	  dout(0) << "btrfs SNAP_DESTROY failed with EPERM as non-root; remount with -o user_subvol_rm_allowed" << dendl;
-	  cerr << TEXT_YELLOW
-	       << "btrfs SNAP_DESTROY failed as non-root; remount with -o user_subvol_rm_allowed"
-	       << TEXT_NORMAL
-	       << std::endl;
-	} else if (err == -EOPNOTSUPP) {
-	  derr << "btrfs SNAP_DESTROY ioctl not supported; you need a kernel newer than 2.6.32" << dendl;
-	}
-      }
-    } else {
-      dout(0) << "mount btrfs SNAP_CREATE failed: " << cpp_strerror(err) << dendl;
-    }
-
-    if (m_filestore_btrfs_snap && !btrfs_snap_destroy) {
-      dout(0) << "mount btrfs snaps enabled, but no SNAP_DESTROY ioctl; DISABLING" << dendl;
-      btrfs_stable_commits = false;
-    }
-
-    // start_sync?
-    __u64 transid = 0;
-    r = ::ioctl(fd, BTRFS_IOC_START_SYNC, &transid);
-    if (r < 0) {
-      int err = errno;
-      dout(0) << "mount btrfs START_SYNC got " << cpp_strerror(err) << dendl;
-    }
-    if (r == 0 && transid > 0) {
-      dout(0) << "mount btrfs START_SYNC is supported (transid " << transid << ")" << dendl;
-
-      // do we have wait_sync too?
-      r = ::ioctl(fd, BTRFS_IOC_WAIT_SYNC, &transid);
-      if (r == 0 || errno == ERANGE) {
-	dout(0) << "mount btrfs WAIT_SYNC is supported" << dendl;
-	btrfs_wait_sync = true;
-      } else {
-	int err = errno;
-	dout(0) << "mount btrfs WAIT_SYNC is NOT supported: " << cpp_strerror(err) << dendl;
-      }
-    } else {
-      int err = errno;
-      dout(0) << "mount btrfs START_SYNC is NOT supported: " << cpp_strerror(err) << dendl;
-    }
-
-    if (btrfs_wait_sync) {
-      // async snap creation?
-      struct btrfs_ioctl_vol_args_v2 async_args;
-      memset(&async_args, 0, sizeof(async_args));
-      async_args.fd = srcfd;
-      async_args.flags = BTRFS_SUBVOL_CREATE_ASYNC;
-      strcpy(async_args.name, "async_snap_test");
-
-      // remove old one, first
-      struct stat st;
-      strcpy(vol_args.name, async_args.name);
-      if (::fstatat(fd, vol_args.name, &st, 0) == 0) {
-	dout(0) << "mount btrfs removing old async_snap_test" << dendl;
-	r = ::ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
-	if (r != 0) {
-	  int err = errno;
-	  dout(0) << "mount  failed to remove old async_snap_test: " << cpp_strerror(err) << dendl;
-	}
-      }
-
-      r = ::ioctl(fd, BTRFS_IOC_SNAP_CREATE_V2, &async_args);
-      if (r == 0 || errno == EEXIST) {
-	dout(0) << "mount btrfs SNAP_CREATE_V2 is supported" << dendl;
-	btrfs_snap_create_v2 = true;
-      
-	// clean up
-	strcpy(vol_args.name, "async_snap_test");
-	r = ::ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
-	if (r != 0) {
-	  int err = errno;
-	  dout(0) << "mount btrfs SNAP_DESTROY failed: " << cpp_strerror(err) << dendl;
-	}
-      } else {
-	int err = errno;
-	dout(0) << "mount btrfs SNAP_CREATE_V2 is NOT supported: "
-		<< cpp_strerror(err) << dendl;
-      }
-    }
-
-    // clean up test subvol
-    if (srcfd >= 0)
-      TEMP_FAILURE_RETRY(::close(srcfd));
-
-    strcpy(vol_args.name, "test_subvol");
-    r = ::ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
-    if (r < 0) {
-      r = -errno;
-      dout(0) << "mount  failed to remove " << vol_args.name << ": " << cpp_strerror(r) << dendl;
-    }
-
-    if (m_filestore_btrfs_snap && !btrfs_snap_create_v2) {
-      dout(0) << "mount WARNING: btrfs snaps enabled, but no SNAP_CREATE_V2 ioctl (from kernel 2.6.37+)" << dendl;
-      cerr << TEXT_YELLOW
-	   << " ** WARNING: 'filestore btrfs snap' is enabled (for safe transactions,\n"	 
-	   << "             rollback), but btrfs does not support the SNAP_CREATE_V2 ioctl\n"
-	   << "             (added in Linux 2.6.37).  Expect slow btrfs sync/commit\n"
-	   << "             performance.\n"
-	   << TEXT_NORMAL;
-    }
-
-  } else
-#endif /* __linux__ */
-  {
-    dout(0) << "mount did NOT detect btrfs" << dendl;
-    btrfs = false;
-  }
-
-  bool have_syncfs = false;
-#ifdef HAVE_SYS_SYNCFS
-  if (syncfs(fd) == 0) {
-    dout(0) << "mount syncfs(2) syscall fully supported (by glibc and kernel)" << dendl;
-    have_syncfs = true;
-  } else {
-    dout(0) << "mount syncfs(2) syscall supported by glibc BUT NOT the kernel" << dendl;
-  }
-#elif defined(SYS_syncfs)
-  if (syscall(SYS_syncfs, fd) == 0) {
-    dout(0) << "mount syscall(SYS_syncfs, fd) fully supported" << dendl;
-    have_syncfs = true;
-  } else {
-    dout(0) << "mount syscall(SYS_syncfs, fd) supported by libc BUT NOT the kernel" << dendl;
-  }
-#elif defined(__NR_syncfs)
-  if (syscall(__NR_syncfs, fd) == 0) {
-    dout(0) << "mount syscall(__NR_syncfs, fd) fully supported" << dendl;
-    have_syncfs = true;
-  } else {
-    dout(0) << "mount syscall(__NR_syncfs, fd) supported by libc BUT NOT the kernel" << dendl;
-  }
-#endif
-  if (!have_syncfs) {
-    dout(0) << "mount syncfs(2) syscall not supported" << dendl;
-    if (btrfs) {
-      dout(0) << "mount no syncfs(2), but the btrfs SYNC ioctl will suffice" << dendl;
-    } else if (m_filestore_fsync_flushes_journal_data) {
-      dout(0) << "mount no syncfs(2), but 'filestore fsync flushes journal data = true', so fsync will suffice." << dendl;
-    } else {
-      dout(0) << "mount no syncfs(2), must use sync(2)." << dendl;
-      dout(0) << "mount WARNING: multiple ceph-osd daemons on the same host will be slow" << dendl;
-    }
-  }
-
-  TEMP_FAILURE_RETRY(::close(fd));
   return 0;
 }
 
@@ -1283,7 +884,7 @@ int FileStore::_sanity_check_fs()
     return -EINVAL;
   }
 
-  if (!btrfs) {
+  if (!backend->can_checkpoint()) {
     if (!journal || !m_filestore_journal_writeahead) {
       dout(0) << "mount WARNING: no btrfs, and no journal in writeahead mode; data may be lost" << dendl;
       cerr << TEXT_RED 
@@ -1434,10 +1035,6 @@ int FileStore::mount()
 
   dout(10) << "mount fsid is " << fsid << dendl;
 
-  // test for btrfs, xattrs, etc.
-  ret = _detect_fs();
-  if (ret)
-    goto close_fsid_fd;
 
   uint32_t version_stamp;
   ret = version_stamp_is_valid(&version_stamp);
@@ -1472,38 +1069,32 @@ int FileStore::mount()
     goto close_fsid_fd;
   }
 
+  // test for btrfs, xattrs, etc.
+  ret = _detect_fs();
+  if (ret < 0) {
+    derr << "FileStore::mount : error in _detect_fs: "
+	 << cpp_strerror(ret) << dendl;
+    goto close_basedir_fd;
+  }
+
   {
-    // get snap list
-    DIR *dir = ::opendir(basedir.c_str());
-    if (!dir) {
-      ret = -errno;
-      derr << "FileStore::mount: opendir '" << basedir << "' failed: "
-	   << cpp_strerror(ret) << dendl;
+    list<string> ls;
+    ret = backend->list_checkpoints(ls);
+    if (ret < 0) {
+      derr << "FileStore::mount : error in _list_snaps: "<< cpp_strerror(ret) << dendl;
       goto close_basedir_fd;
     }
 
-    struct dirent *de;
-    while (::readdir_r(dir, (struct dirent *)buf, &de) == 0) {
-      if (!de)
-	break;
-      long long unsigned c;
-      char clustersnap[PATH_MAX];
-      if (sscanf(de->d_name, COMMIT_SNAP_ITEM, &c) == 1)
+    long long unsigned c, prev = 0;
+    char clustersnap[NAME_MAX];
+    for (list<string>::iterator it = ls.begin(); it != ls.end(); ++it) {
+      if (sscanf(it->c_str(), COMMIT_SNAP_ITEM, &c) == 1) {
+	assert(c > prev);
+	prev = c;
 	snaps.push_back(c);
-      else if (sscanf(de->d_name, CLUSTER_SNAP_ITEM, clustersnap) == 1)
-	cluster_snaps.insert(clustersnap);
+      } else if (sscanf(it->c_str(), CLUSTER_SNAP_ITEM, clustersnap) == 1)
+	cluster_snaps.insert(*it);
     }
-    
-    if (::closedir(dir) < 0) {
-      ret = -errno;
-      derr << "FileStore::closedir(basedir) failed: error " << cpp_strerror(ret)
-	   << dendl;
-      goto close_basedir_fd;
-    }
-
-    dout(0) << "mount found snaps " << snaps << dendl;
-    if (!cluster_snaps.empty())
-      dout(0) << "mount found cluster snaps " << cluster_snaps << dendl;
   }
 
   if (m_osd_rollback_to_cluster_snap.length() &&
@@ -1516,13 +1107,11 @@ int FileStore::mount()
   char nosnapfn[200];
   snprintf(nosnapfn, sizeof(nosnapfn), "%s/nosnap", current_fn.c_str());
 
-  if (btrfs_stable_commits) {
+  if (backend->can_checkpoint()) {
     if (snaps.empty()) {
       dout(0) << "mount WARNING: no consistent snaps found, store may be in inconsistent state" << dendl;
-    } else if (!btrfs) {
-      dout(0) << "mount WARNING: not btrfs, store may be in inconsistent state" << dendl;
     } else {
-      char s[PATH_MAX];
+      char s[NAME_MAX];
       uint64_t curr_seq = 0;
 
       if (m_osd_rollback_to_cluster_snap.length()) {
@@ -1531,8 +1120,7 @@ int FileStore::mount()
 	     << TEXT_NORMAL
 	     << dendl;
 	assert(cluster_snaps.count(m_osd_rollback_to_cluster_snap));
-	snprintf(s, sizeof(s), "%s/" CLUSTER_SNAP_ITEM, basedir.c_str(),
-		 m_osd_rollback_to_cluster_snap.c_str());
+	snprintf(s, sizeof(s), CLUSTER_SNAP_ITEM, m_osd_rollback_to_cluster_snap.c_str());
       } else {
 	{
 	  int fd = read_op_seq(&curr_seq);
@@ -1568,45 +1156,16 @@ int FileStore::mount()
 	}
 
         dout(10) << "mount rolling back to consistent snap " << cp << dendl;
-	snprintf(s, sizeof(s), "%s/" COMMIT_SNAP_ITEM, basedir.c_str(), (long long unsigned)cp);
+	snprintf(s, sizeof(s), COMMIT_SNAP_ITEM, (long long unsigned)cp);
       }
-
-      btrfs_ioctl_vol_args vol_args;
-      memset(&vol_args, 0, sizeof(vol_args));
-      vol_args.fd = 0;
-      strcpy(vol_args.name, "current");
 
       // drop current?
-      if (curr_seq > 0) {
-	ret = ::ioctl(basedir_fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
-	if (ret) {
-	  ret = -errno;
-	  derr << "FileStore::mount: error removing old current subvol: " << cpp_strerror(ret) << dendl;
-	  char s[PATH_MAX];
-	  snprintf(s, sizeof(s), "%s/current.remove.me.%d", basedir.c_str(), rand());
-	  if (::rename(current_fn.c_str(), s)) {
-	    ret = -errno;
-	    derr << "FileStore::mount: error renaming old current subvol: "
-		 << cpp_strerror(ret) << dendl;
-	    goto close_basedir_fd;
-	  }
-	}
-      }
-
-      // roll back
-      vol_args.fd = ::open(s, O_RDONLY);
-      if (vol_args.fd < 0) {
-	ret = -errno;
-	derr << "FileStore::mount: error opening '" << s << "': " << cpp_strerror(ret) << dendl;
+      ret = backend->rollback_to(s);
+      if (ret) {
+	derr << "FileStore::mount: error rolling back to " << s << ": "
+	     << cpp_strerror(ret) << dendl;
 	goto close_basedir_fd;
       }
-      if (::ioctl(basedir_fd, BTRFS_IOC_SNAP_CREATE, &vol_args)) {
-	ret = -errno;
-	derr << "FileStore::mount: error ioctl(BTRFS_IOC_SNAP_CREATE) failed: " << cpp_strerror(ret) << dendl;
-	TEMP_FAILURE_RETRY(::close(vol_args.fd));
-	goto close_basedir_fd;
-      }
-      TEMP_FAILURE_RETRY(::close(vol_args.fd));
     }
   }
   initial_op_seq = 0;
@@ -1633,7 +1192,7 @@ int FileStore::mount()
     goto close_current_fd;
   }
 
-  if (!btrfs_stable_commits) {
+  if (!backend->can_checkpoint()) {
     // mark current/ as non-snapshotted so that we don't rollback away
     // from it.
     int r = ::creat(nosnapfn, 0644);
@@ -1648,7 +1207,7 @@ int FileStore::mount()
   }
 
   {
-    LevelDBStore *omap_store = new LevelDBStore(omap_dir);
+    LevelDBStore *omap_store = new LevelDBStore(g_ceph_context, omap_dir);
 
     omap_store->options.write_buffer_size = g_conf->osd_leveldb_write_buffer_size;
     omap_store->options.cache_size = g_conf->osd_leveldb_cache_size;
@@ -1666,6 +1225,13 @@ int FileStore::mount()
       ret = -1;
       goto close_current_fd;
     }
+
+    if (g_conf->osd_compact_leveldb_on_mount) {
+      derr << "Compacting store..." << dendl;
+      omap_store->compact();
+      derr << "...finished compacting store" << dendl;
+    }
+
     DBObjectMap *dbomap = new DBObjectMap(omap_store);
     ret = dbomap->init(do_update);
     if (ret < 0) {
@@ -1692,18 +1258,12 @@ int FileStore::mount()
     if (!m_filestore_journal_writeahead &&
 	!m_filestore_journal_parallel &&
 	!m_filestore_journal_trailing) {
-      if (!btrfs) {
+      if (!backend->can_checkpoint()) {
 	m_filestore_journal_writeahead = true;
-	dout(0) << "mount: enabling WRITEAHEAD journal mode: btrfs not detected" << dendl;
-      } else if (!btrfs_stable_commits) {
-	m_filestore_journal_writeahead = true;
-	dout(0) << "mount: enabling WRITEAHEAD journal mode: 'filestore btrfs snap' mode is not enabled" << dendl;
-      } else if (!btrfs_snap_create_v2) {
-	m_filestore_journal_writeahead = true;
-	dout(0) << "mount: enabling WRITEAHEAD journal mode: btrfs SNAP_CREATE_V2 ioctl not detected (v2.6.37+)" << dendl;
+	dout(0) << "mount: enabling WRITEAHEAD journal mode: checkpoint is not enabled" << dendl;
       } else {
 	m_filestore_journal_parallel = true;
-	dout(0) << "mount: enabling PARALLEL journal mode: btrfs, SNAP_CREATE_V2 detected and 'filestore btrfs snap' mode is enabled" << dendl;
+	dout(0) << "mount: enabling PARALLEL journal mode: fs, checkpoint is enabled" << dendl;
       }
     } else {
       if (m_filestore_journal_writeahead)
@@ -1778,15 +1338,10 @@ int FileStore::mount()
   journal_start();
 
   op_tp.start();
-  flusher_thread.create();
   op_finisher.start();
   ondisk_finisher.start();
 
   timer.init();
-
-  g_ceph_context->get_perfcounters_collection()->add(logger);
-
-  g_ceph_context->_conf->add_observer(this);
 
   // all okay.
   return 0;
@@ -1809,22 +1364,17 @@ int FileStore::umount()
 {
   dout(5) << "umount " << basedir << dendl;
   
-  g_ceph_context->_conf->remove_observer(this);
 
   start_sync();
 
   lock.Lock();
   stop = true;
   sync_cond.Signal();
-  flusher_cond.Signal();
   lock.Unlock();
   sync_thread.join();
   op_tp.stop();
-  flusher_thread.join();
 
   journal_stop();
-
-  g_ceph_context->get_perfcounters_collection()->remove(logger);
 
   op_finisher.stop();
   ondisk_finisher.stop();
@@ -1845,6 +1395,12 @@ int FileStore::umount()
     TEMP_FAILURE_RETRY(::close(basedir_fd));
     basedir_fd = -1;
   }
+
+  if (backend != generic_backend) {
+    delete backend;
+    backend = generic_backend;
+  }
+
   object_map.reset();
 
   {
@@ -1927,7 +1483,7 @@ void FileStore::op_queue_reserve_throttle(Op *o)
   uint64_t max_ops = m_filestore_queue_max_ops;
   uint64_t max_bytes = m_filestore_queue_max_bytes;
 
-  if (btrfs_stable_commits && is_committing()) {
+  if (backend->can_checkpoint() && is_committing()) {
     max_ops += m_filestore_queue_committing_max_ops;
     max_bytes += m_filestore_queue_committing_max_bytes;
   }
@@ -1935,6 +1491,7 @@ void FileStore::op_queue_reserve_throttle(Op *o)
   logger->set(l_os_oq_max_ops, max_ops);
   logger->set(l_os_oq_max_bytes, max_bytes);
 
+  utime_t start = ceph_clock_now(g_ceph_context);
   {
     Mutex::Locker l(op_throttle_lock);
     while ((max_ops && (op_queue_len + 1) > max_ops) ||
@@ -1948,6 +1505,8 @@ void FileStore::op_queue_reserve_throttle(Op *o)
     op_queue_len++;
     op_queue_bytes += o->bytes;
   }
+  utime_t end = ceph_clock_now(g_ceph_context);
+  logger->tinc(l_os_queue_lat, end - start);
 
   logger->set(l_os_oq_ops, op_queue_len);
   logger->set(l_os_oq_bytes, op_queue_bytes);
@@ -1968,6 +1527,7 @@ void FileStore::op_queue_release_throttle(Op *o)
 
 void FileStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
 {
+  wbthrottle.throttle();
   // inject a stall?
   if (g_conf->filestore_inject_stall) {
     int orig = g_conf->filestore_inject_stall;
@@ -2003,8 +1563,7 @@ void FileStore::_finish_op(OpSequencer *osr)
   logger->tinc(l_os_apply_lat, lat);
 
   if (o->onreadable_sync) {
-    o->onreadable_sync->finish(0);
-    delete o->onreadable_sync;
+    o->onreadable_sync->complete(0);
   }
   op_finisher.queue(o->onreadable);
   delete o;
@@ -2101,8 +1660,7 @@ int FileStore::queue_transactions(Sequencer *posr, list<Transaction*> &tls,
   // start on_readable finisher after we queue journal item, as on_readable callback
   // is allowed to delete the Transaction
   if (onreadable_sync) {
-    onreadable_sync->finish(r);
-    delete onreadable_sync;
+    onreadable_sync->complete(r);
   }
   op_finisher.queue(onreadable, r);
 
@@ -2158,6 +1716,79 @@ int FileStore::_do_transactions(
   return r;
 }
 
+void FileStore::_set_global_replay_guard(coll_t cid,
+					 const SequencerPosition &spos)
+{
+  if (backend->can_checkpoint())
+    return;
+
+  // sync all previous operations on this sequencer
+  sync_filesystem(basedir_fd);
+
+  char fn[PATH_MAX];
+  get_cdir(cid, fn, sizeof(fn));
+  int fd = ::open(fn, O_RDONLY);
+  if (fd < 0) {
+    int err = errno;
+    derr << __func__ << ": " << cid << " error " << cpp_strerror(err) << dendl;
+    assert(0 == "_set_global_replay_guard failed");
+  }
+
+  _inject_failure();
+
+  // then record that we did it
+  bufferlist v;
+  ::encode(spos, v);
+  int r = chain_fsetxattr(fd, GLOBAL_REPLAY_GUARD_XATTR, v.c_str(), v.length());
+  if (r < 0) {
+    derr << __func__ << ": fsetxattr " << GLOBAL_REPLAY_GUARD_XATTR
+	 << " got " << cpp_strerror(r) << dendl;
+    assert(0 == "fsetxattr failed");
+  }
+
+  // and make sure our xattr is durable.
+  ::fsync(fd);
+
+  _inject_failure();
+
+  TEMP_FAILURE_RETRY(::close(fd));
+  dout(10) << __func__ << ": " << spos << " done" << dendl;
+}
+
+int FileStore::_check_global_replay_guard(coll_t cid,
+					  const SequencerPosition& spos)
+{
+  if (!replaying || backend->can_checkpoint())
+    return 1;
+
+  char fn[PATH_MAX];
+  get_cdir(cid, fn, sizeof(fn));
+  int fd = ::open(fn, O_RDONLY);
+  if (fd < 0) {
+    dout(10) << __func__ << ": " << cid << " dne" << dendl;
+    return 1;  // if collection does not exist, there is no guard, and we can replay.
+  }
+
+  char buf[100];
+  int r = chain_fgetxattr(fd, GLOBAL_REPLAY_GUARD_XATTR, buf, sizeof(buf));
+  if (r < 0) {
+    dout(20) << __func__ << " no xattr" << dendl;
+    assert(!m_filestore_fail_eio || r != -EIO);
+    TEMP_FAILURE_RETRY(::close(fd));
+    return 1;  // no xattr
+  }
+  bufferlist bl;
+  bl.append(buf, r);
+
+  SequencerPosition opos;
+  bufferlist::iterator p = bl.begin();
+  ::decode(opos, p);
+
+  TEMP_FAILURE_RETRY(::close(fd));
+  return spos >= opos ? 1 : -1;
+}
+
+
 void FileStore::_set_replay_guard(coll_t cid,
                                   const SequencerPosition &spos,
                                   bool in_progress=false)
@@ -2166,7 +1797,8 @@ void FileStore::_set_replay_guard(coll_t cid,
   get_cdir(cid, fn, sizeof(fn));
   int fd = ::open(fn, O_RDONLY);
   if (fd < 0) {
-    derr << "_set_replay_guard " << cid << " error " << fd << dendl;
+    int err = errno;
+    derr << "_set_replay_guard " << cid << " error " << cpp_strerror(err) << dendl;
     assert(0 == "_set_replay_guard failed");
   }
   _set_replay_guard(fd, spos, 0, in_progress);
@@ -2179,7 +1811,7 @@ void FileStore::_set_replay_guard(int fd,
 				  const hobject_t *hoid,
 				  bool in_progress)
 {
-  if (btrfs_stable_commits)
+  if (backend->can_checkpoint())
     return;
 
   dout(10) << "_set_replay_guard " << spos << (in_progress ? " START" : "") << dendl;
@@ -2221,7 +1853,8 @@ void FileStore::_close_replay_guard(coll_t cid,
   get_cdir(cid, fn, sizeof(fn));
   int fd = ::open(fn, O_RDONLY);
   if (fd < 0) {
-    derr << "_set_replay_guard " << cid << " error " << fd << dendl;
+    int err = errno;
+    derr << "_close_replay_guard " << cid << " error " << cpp_strerror(err) << dendl;
     assert(0 == "_close_replay_guard failed");
   }
   _close_replay_guard(fd, spos);
@@ -2230,7 +1863,7 @@ void FileStore::_close_replay_guard(coll_t cid,
 
 void FileStore::_close_replay_guard(int fd, const SequencerPosition& spos)
 {
-  if (btrfs_stable_commits)
+  if (backend->can_checkpoint())
     return;
 
   dout(10) << "_close_replay_guard " << spos << dendl;
@@ -2258,22 +1891,27 @@ void FileStore::_close_replay_guard(int fd, const SequencerPosition& spos)
 
 int FileStore::_check_replay_guard(coll_t cid, hobject_t oid, const SequencerPosition& spos)
 {
-  if (!replaying || btrfs_stable_commits)
+  if (!replaying || backend->can_checkpoint())
     return 1;
 
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
+  int r = _check_global_replay_guard(cid, spos);
+  if (r < 0)
+    return r;
+
+  FDRef fd;
+  r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     dout(10) << "_check_replay_guard " << cid << " " << oid << " dne" << dendl;
     return 1;  // if file does not exist, there is no guard, and we can replay.
   }
-  int ret = _check_replay_guard(fd, spos);
+  int ret = _check_replay_guard(**fd, spos);
   lfn_close(fd);
   return ret;
 }
 
 int FileStore::_check_replay_guard(coll_t cid, const SequencerPosition& spos)
 {
-  if (!replaying || btrfs_stable_commits)
+  if (!replaying || backend->can_checkpoint())
     return 1;
 
   char fn[PATH_MAX];
@@ -2290,7 +1928,7 @@ int FileStore::_check_replay_guard(coll_t cid, const SequencerPosition& spos)
 
 int FileStore::_check_replay_guard(int fd, const SequencerPosition& spos)
 {
-  if (!replaying || btrfs_stable_commits)
+  if (!replaying || backend->can_checkpoint())
     return 1;
 
   char buf[100];
@@ -2595,6 +2233,16 @@ unsigned FileStore::_do_transaction(Transaction& t, uint64_t op_seq, int trans_n
 	r = _omap_rmkeys(cid, oid, keys, spos);
       }
       break;
+    case Transaction::OP_OMAP_RMKEYRANGE:
+      {
+	coll_t cid(i.get_cid());
+	hobject_t oid = i.get_oid();
+	string first, last;
+	first = i.get_key();
+	last = i.get_key();
+	r = _omap_rmkeyrange(cid, oid, first, last, spos);
+      }
+      break;
     case Transaction::OP_OMAP_SETHEADER:
       {
 	coll_t cid(i.get_cid());
@@ -2636,7 +2284,7 @@ unsigned FileStore::_do_transaction(Transaction& t, uint64_t op_seq, int trans_n
 			    op == Transaction::OP_CLONERANGE2 ||
 			    op == Transaction::OP_COLL_ADD))
 	// -ENOENT is normally okay
-	// ...including on a replayed OP_RMCOLL with !stable_commits
+	// ...including on a replayed OP_RMCOLL with checkpoint mode
 	ok = true;
       if (r == -ENOENT && (
 	  op == Transaction::OP_COLL_ADD &&
@@ -2645,17 +2293,17 @@ unsigned FileStore::_do_transaction(Transaction& t, uint64_t op_seq, int trans_n
       if (r == -ENODATA)
 	ok = true;
 
-      if (replaying && !btrfs_stable_commits) {
+      if (replaying && !backend->can_checkpoint()) {
 	if (r == -EEXIST && op == Transaction::OP_MKCOLL) {
-	  dout(10) << "tolerating EEXIST during journal replay on non-btrfs" << dendl;
+	  dout(10) << "tolerating EEXIST during journal replay since checkpoint is not enabled" << dendl;
 	  ok = true;
 	}
 	if (r == -EEXIST && op == Transaction::OP_COLL_ADD) {
-	  dout(10) << "tolerating EEXIST during journal replay since btrfs_snap is not enabled" << dendl;
+	  dout(10) << "tolerating EEXIST during journal replay since checkpoint is not enabled" << dendl;
 	  ok = true;
 	}
 	if (r == -EEXIST && op == Transaction::OP_COLL_MOVE) {
-	  dout(10) << "tolerating EEXIST during journal replay since btrfs_snap is not enabled" << dendl;
+	  dout(10) << "tolerating EEXIST during journal replay since checkpoint is not enabled" << dendl;
 	  ok = true;
 	}
 	if (r == -ERANGE) {
@@ -2760,22 +2408,24 @@ int FileStore::read(
 
   dout(15) << "read " << cid << "/" << oid << " " << offset << "~" << len << dendl;
 
-  int fd = lfn_open(cid, oid, O_RDONLY);
-  if (fd < 0) {
-    dout(10) << "FileStore::read(" << cid << "/" << oid << ") open error: " << cpp_strerror(fd) << dendl;
-    return fd;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
+    dout(10) << "FileStore::read(" << cid << "/" << oid << ") open error: "
+	     << cpp_strerror(r) << dendl;
+    return r;
   }
 
   if (len == 0) {
     struct stat st;
     memset(&st, 0, sizeof(struct stat));
-    int r = ::fstat(fd, &st);
+    int r = ::fstat(**fd, &st);
     assert(r == 0);
     len = st.st_size;
   }
 
   bufferptr bptr(len);  // prealloc space for entire read
-  got = safe_pread(fd, bptr.c_str(), len, offset);
+  got = safe_pread(**fd, bptr.c_str(), len, offset);
   if (got < 0) {
     dout(10) << "FileStore::read(" << cid << "/" << oid << ") pread error: " << cpp_strerror(got) << dendl;
     lfn_close(fd);
@@ -2800,7 +2450,7 @@ int FileStore::fiemap(coll_t cid, const hobject_t& oid,
                     uint64_t offset, size_t len,
                     bufferlist& bl)
 {
-  if (!ioctl_fiemap || len <= (size_t)m_filestore_fiemap_threshold) {
+  if (!backend->has_fiemap() || len <= (size_t)m_filestore_fiemap_threshold) {
     map<uint64_t, uint64_t> m;
     m[offset] = len;
     ::encode(m, bl);
@@ -2813,15 +2463,14 @@ int FileStore::fiemap(coll_t cid, const hobject_t& oid,
 
   dout(15) << "fiemap " << cid << "/" << oid << " " << offset << "~" << len << dendl;
 
-  int r;
-  int fd = lfn_open(cid, oid, O_RDONLY);
-  if (fd < 0) {
-    r = fd;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     dout(10) << "read couldn't open " << cid << "/" << oid << ": " << cpp_strerror(r) << dendl;
   } else {
     uint64_t i;
 
-    r = do_fiemap(fd, offset, len, &fiemap);
+    r = backend->do_fiemap(**fd, offset, len, &fiemap);
     if (r < 0)
       goto done;
 
@@ -2863,10 +2512,10 @@ int FileStore::fiemap(coll_t cid, const hobject_t& oid,
   }
 
 done:
-  if (fd >= 0)
+  if (r >= 0) {
     lfn_close(fd);
-  if (r >= 0)
     ::encode(exomap, bl);
+  }
 
   dout(10) << "fiemap " << cid << "/" << oid << " " << offset << "~" << len << " = " << r << " num_extents=" << exomap.size() << " " << exomap << dendl;
   free(fiemap);
@@ -2897,14 +2546,13 @@ int FileStore::_touch(coll_t cid, const hobject_t& oid)
 {
   dout(15) << "touch " << cid << "/" << oid << dendl;
 
-  int flags = O_WRONLY|O_CREAT;
-  int fd = lfn_open(cid, oid, flags, 0644);
-  int r;
-  if (fd >= 0) {
+  FDRef fd;
+  int r = lfn_open(cid, oid, true, &fd);
+  if (r < 0) {
+    return r;
+  } else {
     lfn_close(fd);
-    r = 0;
-  } else
-    r = fd;
+  }
   dout(10) << "touch " << cid << "/" << oid << " = " << r << dendl;
   return r;
 }
@@ -2918,17 +2566,17 @@ int FileStore::_write(coll_t cid, const hobject_t& oid,
 
   int64_t actual;
 
-  int flags = O_WRONLY|O_CREAT;
-  int fd = lfn_open(cid, oid, flags, 0644);
-  if (fd < 0) {
-    r = fd;
-    dout(0) << "write couldn't open " << cid << "/" << oid << " flags " << flags << ": "
+  FDRef fd;
+  r = lfn_open(cid, oid, true, &fd);
+  if (r < 0) {
+    dout(0) << "write couldn't open " << cid << "/"
+	    << oid << ": "
 	    << cpp_strerror(r) << dendl;
     goto out;
   }
     
   // seek
-  actual = ::lseek64(fd, offset, SEEK_SET);
+  actual = ::lseek64(**fd, offset, SEEK_SET);
   if (actual < 0) {
     r = -errno;
     dout(0) << "write lseek64 to " << offset << " failed: " << cpp_strerror(r) << dendl;
@@ -2943,43 +2591,15 @@ int FileStore::_write(coll_t cid, const hobject_t& oid,
   }
 
   // write
-  r = bl.write_fd(fd);
+  r = bl.write_fd(**fd);
   if (r == 0)
     r = bl.length();
 
   // flush?
-  {
-    bool should_flush = (ssize_t)len >= m_filestore_flush_min;
-    bool local_flush = false;
-#ifdef HAVE_SYNC_FILE_RANGE
-    bool async_done = false;
-    if (!should_flush ||
-	!m_filestore_flusher ||
-       !(async_done = queue_flusher(fd, offset, len, replica))) {
-      if (should_flush && m_filestore_sync_flush) {
-	::sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE);
-	local_flush = true;
-      }
-    }
-    //Both lfn_close() and possible posix_fadvise() done by flusher
-    if (async_done) fd = -1;
-#else
-    // no sync_file_range; (maybe) flush inline and close.
-    if (should_flush && m_filestore_sync_flush) {
-      ::fdatasync(fd);
-      local_flush = true;
-    }
-#endif
-    if (local_flush && replica && m_filestore_replica_fadvise) {
-      int fa_r = posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);
-      if (fa_r) {
-	dout(0) << "posic_fadvise failed: " << cpp_strerror(fa_r) << dendl;
-      } else {
-	dout(10) << "posix_fadvise performed after local flush" << dendl;
-      }
-    }
-  }
-  if (fd >= 0) lfn_close(fd);
+  if (!replaying &&
+      g_conf->filestore_wbthrottle_enable)
+    wbthrottle.queue_wb(fd, oid, offset, len, replica);
+  lfn_close(fd);
 
  out:
   dout(10) << "write " << cid << "/" << oid << " " << offset << "~" << len << " = " << r << dendl;
@@ -2994,14 +2614,14 @@ int FileStore::_zero(coll_t cid, const hobject_t& oid, uint64_t offset, size_t l
 #ifdef CEPH_HAVE_FALLOCATE
 # if !defined(DARWIN) && !defined(__FreeBSD__)
   // first try to punch a hole.
-  int fd = lfn_open(cid, oid, O_RDONLY);
-  if (fd < 0) {
-    ret = -errno;
+  FDRef fd;
+  ret = lfn_open(cid, oid, false, &fd);
+  if (ret < 0) {
     goto out;
   }
 
   // first try fallocate
-  ret = fallocate(fd, FALLOC_FL_PUNCH_HOLE, offset, len);
+  ret = fallocate(**fd, FALLOC_FL_PUNCH_HOLE, offset, len);
   if (ret < 0)
     ret = -errno;
   lfn_close(fd);
@@ -3037,23 +2657,26 @@ int FileStore::_clone(coll_t cid, const hobject_t& oldoid, const hobject_t& newo
   if (_check_replay_guard(cid, newoid, spos) < 0)
     return 0;
 
-  int o, n, r;
+  int r;
+  FDRef o, n;
   {
     Index index;
     IndexedPath from, to;
-    o = lfn_open(cid, oldoid, O_RDONLY, 0, &from, &index);
-    if (o < 0) {
-      r = o;
+    r = lfn_open(cid, oldoid, false, &o, &from, &index);
+    if (r < 0) {
       goto out2;
     }
-    n = lfn_open(cid, newoid, O_CREAT|O_TRUNC|O_WRONLY, 0644, &to, &index);
-    if (n < 0) {
-      r = n;
+    r = lfn_open(cid, newoid, true, &n, &to, &index);
+    if (r < 0) {
+      goto out;
+    }
+    r = ::ftruncate(**n, 0);
+    if (r < 0) {
       goto out;
     }
     struct stat st;
-    ::fstat(o, &st);
-    r = _do_clone_range(o, n, 0, st.st_size, 0);
+    ::fstat(**o, &st);
+    r = _do_clone_range(**o, **n, 0, st.st_size, 0);
     if (r < 0) {
       r = -errno;
       goto out3;
@@ -3066,17 +2689,17 @@ int FileStore::_clone(coll_t cid, const hobject_t& oldoid, const hobject_t& newo
 
   {
     map<string, bufferptr> aset;
-    r = _fgetattrs(o, aset, false);
+    r = _fgetattrs(**o, aset, false);
     if (r < 0)
       goto out3;
 
-    r = _fsetattrs(n, aset);
+    r = _fsetattrs(**n, aset);
     if (r < 0)
       goto out3;
   }
 
   // clone is non-idempotent; record our work.
-  _set_replay_guard(n, spos, &newoid);
+  _set_replay_guard(**n, spos, &newoid);
 
  out3:
   lfn_close(n);
@@ -3090,84 +2713,8 @@ int FileStore::_clone(coll_t cid, const hobject_t& oldoid, const hobject_t& newo
 
 int FileStore::_do_clone_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff)
 {
-  dout(20) << "_do_clone_range " << srcoff << "~" << len << " to " << dstoff << dendl;
-  if (!btrfs_clone_range ||
-      srcoff % blk_size != dstoff % blk_size) {
-    dout(20) << "_do_clone_range using copy" << dendl;
-    return _do_copy_range(from, to, srcoff, len, dstoff);
-  }
-  int err = 0;
-  int r = 0;
-
-  uint64_t srcoffclone = ALIGN_UP(srcoff, blk_size);
-  uint64_t dstoffclone = ALIGN_UP(dstoff, blk_size);
-  if (srcoffclone >= srcoff + len) {
-    dout(20) << "_do_clone_range using copy, extent too short to align srcoff" << dendl;
-    return _do_copy_range(from, to, srcoff, len, dstoff);
-  }
-
-  uint64_t lenclone = len - (srcoffclone - srcoff);
-  if (!ALIGNED(lenclone, blk_size)) {
-    struct stat from_stat, to_stat;
-    err = ::fstat(from, &from_stat);
-    if (err) return -errno;
-    err = ::fstat(to , &to_stat);
-    if (err) return -errno;
-    
-    if (srcoff + len != (uint64_t)from_stat.st_size ||
-	dstoff + len < (uint64_t)to_stat.st_size) {
-      // Not to the end of the file, need to align length as well
-      lenclone = ALIGN_DOWN(lenclone, blk_size);
-    }
-  }
-  if (lenclone == 0) {
-    // too short
-    return _do_copy_range(from, to, srcoff, len, dstoff);
-  }
-  
-  dout(20) << "_do_clone_range cloning " << srcoffclone << "~" << lenclone 
-	   << " to " << dstoffclone << " = " << r << dendl;
-  btrfs_ioctl_clone_range_args a;
-  a.src_fd = from;
-  a.src_offset = srcoffclone;
-  a.src_length = lenclone;
-  a.dest_offset = dstoffclone;
-  err = ::ioctl(to, BTRFS_IOC_CLONE_RANGE, &a);
-  if (err >= 0) {
-    r += err;
-  } else if (errno == EINVAL) {
-    // Still failed, might be compressed
-    dout(20) << "_do_clone_range failed CLONE_RANGE call with -EINVAL, using copy" << dendl;
-    return _do_copy_range(from, to, srcoff, len, dstoff);
-  } else {
-    return -errno;
-  }
-
-  // Take care any trimmed from front
-  if (srcoffclone != srcoff) {
-    err = _do_copy_range(from, to, srcoff, srcoffclone - srcoff, dstoff);
-    if (err >= 0) {
-      r += err;
-    } else {
-      return err;
-    }
-  }
-
-  // Copy end
-  if (srcoffclone + lenclone != srcoff + len) {
-    err = _do_copy_range(from, to, 
-			 srcoffclone + lenclone, 
-			 (srcoff + len) - (srcoffclone + lenclone), 
-			 dstoffclone + lenclone);
-    if (err >= 0) {
-      r += err;
-    } else {
-      return err;
-    }
-  }
-  dout(20) << "_do_clone_range finished " << srcoff << "~" << len 
-	   << " to " << dstoff << " = " << r << dendl;
-  return r;
+  dout(20) << "_do_clone_range copy " << srcoff << "~" << len << " to " << dstoff << dendl;
+  return backend->clone_range(from, to, srcoff, len, dstoff);
 }
 
 int FileStore::_do_copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff)
@@ -3246,21 +2793,19 @@ int FileStore::_clone_range(coll_t cid, const hobject_t& oldoid, const hobject_t
     return 0;
 
   int r;
-  int o, n;
-  o = lfn_open(cid, oldoid, O_RDONLY);
-  if (o < 0) {
-    r = o;
+  FDRef o, n;
+  r = lfn_open(cid, oldoid, false, &o);
+  if (r < 0) {
     goto out2;
   }
-  n = lfn_open(cid, newoid, O_CREAT|O_WRONLY, 0644);
-  if (n < 0) {
-    r = n;
+  r = lfn_open(cid, newoid, true, &n);
+  if (r < 0) {
     goto out;
   }
-  r = _do_clone_range(o, n, srcoff, len, dstoff);
+  r = _do_clone_range(**o, **n, srcoff, len, dstoff);
 
   // clone is non-idempotent; record our work.
-  _set_replay_guard(n, spos, &newoid);
+  _set_replay_guard(**n, spos, &newoid);
 
   lfn_close(n);
  out:
@@ -3269,89 +2814,6 @@ int FileStore::_clone_range(coll_t cid, const hobject_t& oldoid, const hobject_t
   dout(10) << "clone_range " << cid << "/" << oldoid << " -> " << cid << "/" << newoid << " "
 	   << srcoff << "~" << len << " to " << dstoff << " = " << r << dendl;
   return r;
-}
-
-
-bool FileStore::queue_flusher(int fd, uint64_t off, uint64_t len, bool replica)
-{
-  bool queued;
-  lock.Lock();
-  if (flusher_queue_len < m_filestore_flusher_max_fds) {
-    flusher_queue.push_back(sync_epoch);
-    flusher_queue.push_back(fd);
-    flusher_queue.push_back(off);
-    flusher_queue.push_back(len);
-    flusher_queue.push_back(replica);
-    flusher_queue_len++;
-    flusher_cond.Signal();
-    dout(10) << "queue_flusher ep " << sync_epoch << " fd " << fd << " " << off << "~" << len
-	     << " qlen " << flusher_queue_len
-	     << dendl;
-    queued = true;
-  } else {
-    dout(10) << "queue_flusher ep " << sync_epoch << " fd " << fd << " " << off << "~" << len
-	     << " qlen " << flusher_queue_len 
-	     << " hit flusher_max_fds " << m_filestore_flusher_max_fds
-	     << ", skipping async flush" << dendl;
-    queued = false;
-  }
-  lock.Unlock();
-  return queued;
-}
-
-void FileStore::flusher_entry()
-{
-  lock.Lock();
-  dout(20) << "flusher_entry start" << dendl;
-  while (true) {
-    if (!flusher_queue.empty()) {
-#ifdef HAVE_SYNC_FILE_RANGE
-      list<uint64_t> q;
-      q.swap(flusher_queue);
-
-      int num = flusher_queue_len;  // see how many we're taking, here
-
-      lock.Unlock();
-      while (!q.empty()) {
-	uint64_t ep = q.front();
-	q.pop_front();
-	int fd = q.front();
-	q.pop_front();
-	uint64_t off = q.front();
-	q.pop_front();
-	uint64_t len = q.front();
-	q.pop_front();
-	bool replica = q.front();
-	q.pop_front();
-	if (!stop && ep == sync_epoch) {
-	  dout(10) << "flusher_entry flushing+closing " << fd << " ep " << ep << dendl;
-	  ::sync_file_range(fd, off, len, SYNC_FILE_RANGE_WRITE);
-	  if (replica && m_filestore_replica_fadvise) {
-	    int fa_r = posix_fadvise(fd, off, len, POSIX_FADV_DONTNEED);
-	    if (fa_r) {
-	      dout(0) << "posic_fadvise failed: " << cpp_strerror(fa_r) << dendl;
-	    } else {
-	      dout(10) << "posix_fadvise performed after local flush" << dendl;
-	    }
-	  }
-	} else 
-	  dout(10) << "flusher_entry JUST closing " << fd << " (stop=" << stop << ", ep=" << ep
-		   << ", sync_epoch=" << sync_epoch << ")" << dendl;
-	lfn_close(fd);
-      }
-      lock.Lock();
-      flusher_queue_len -= num;   // they're definitely closed, forget
-#endif
-    } else {
-      if (stop)
-	break;
-      dout(20) << "flusher_entry sleeping" << dendl;
-      flusher_cond.Wait(lock);
-      dout(20) << "flusher_entry awoke" << dendl;
-    }
-  }
-  dout(20) << "flusher_entry finish" << dendl;
-  lock.Unlock();
 }
 
 class SyncEntryTimeout : public Context {
@@ -3436,95 +2898,48 @@ void FileStore::sync_entry()
 	assert(0);
       }
 
-      if (btrfs_stable_commits) {
+      if (backend->can_checkpoint()) {
 	int err = write_op_seq(op_fd, cp);
 	if (err < 0) {
 	  derr << "Error during write_op_seq: " << cpp_strerror(err) << dendl;
 	  assert(0 == "error during write_op_seq");
 	}
 
-	if (btrfs_snap_create_v2) {
-	  // be smart!
-	  struct btrfs_ioctl_vol_args_v2 async_args;
-	  memset(&async_args, 0, sizeof(async_args));
-	  async_args.fd = current_fd;
-	  async_args.flags = BTRFS_SUBVOL_CREATE_ASYNC;
-	  snprintf(async_args.name, sizeof(async_args.name), COMMIT_SNAP_ITEM,
-		   (long long unsigned)cp);
-
-	  dout(10) << "taking async snap '" << async_args.name << "'" << dendl;
-	  int r = ::ioctl(basedir_fd, BTRFS_IOC_SNAP_CREATE_V2, &async_args);
-	  if (r < 0) {
+	char s[NAME_MAX];
+	snprintf(s, sizeof(s), COMMIT_SNAP_ITEM, (long long unsigned)cp);
+	uint64_t cid = 0;
+	err = backend->create_checkpoint(s, &cid);
+	if (err < 0) {
 	    int err = errno;
-	    derr << "async snap create '" << async_args.name << "' transid " << async_args.transid
-		 << " got " << cpp_strerror(err) << dendl;
-	    assert(0 == "async snap ioctl error");
-	  }
-	  dout(20) << "async snap create '" << async_args.name << "' transid " << async_args.transid << dendl;
+	    derr << "snap create '" << s << "' got error " << err << dendl;
+	    assert(err == 0);
+	}
 
-	  snaps.push_back(cp);
+	snaps.push_back(cp);
+	apply_manager.commit_started();
+	op_tp.unpause();
 
-	  apply_manager.commit_started();
-	  op_tp.unpause();
-
-	  // wait for commit
-	  dout(20) << " waiting for transid " << async_args.transid << " to complete" << dendl;
-	  r = ::ioctl(op_fd, BTRFS_IOC_WAIT_SYNC, &async_args.transid);
-	  if (r < 0) {
-	    int err = errno;
+	if (cid > 0) {
+	  dout(20) << " waiting for checkpoint " << cid << " to complete" << dendl;
+	  err = backend->sync_checkpoint(cid);
+	  if (err < 0) {
 	    derr << "ioctl WAIT_SYNC got " << cpp_strerror(err) << dendl;
 	    assert(0 == "wait_sync got error");
 	  }
-	  dout(20) << " done waiting for transid " << async_args.transid << " to complete" << dendl;
-
-	} else {
-	  // the synchronous snap create does a sync.
-	  struct btrfs_ioctl_vol_args vol_args;
-	  memset(&vol_args, 0, sizeof(vol_args));
-	  vol_args.fd = current_fd;
-	  snprintf(vol_args.name, sizeof(vol_args.name), COMMIT_SNAP_ITEM,
-		   (long long unsigned)cp);
-
-	  dout(10) << "taking snap '" << vol_args.name << "'" << dendl;
-	  int r = ::ioctl(basedir_fd, BTRFS_IOC_SNAP_CREATE, &vol_args);
-	  if (r != 0) {
-	    int err = errno;
-	    derr << "snap create '" << vol_args.name << "' got error " << err << dendl;
-	    assert(r == 0);
-	  }
-	  dout(20) << "snap create '" << vol_args.name << "' succeeded." << dendl;
-	  assert(r == 0);
-	  snaps.push_back(cp);
-	  
-	  apply_manager.commit_started();
-	  op_tp.unpause();
+	  dout(20) << " done waiting for checkpoint" << cid << " to complete" << dendl;
 	}
       } else
       {
 	apply_manager.commit_started();
 	op_tp.unpause();
 
-	if (btrfs) {
-	  dout(15) << "sync_entry doing btrfs SYNC" << dendl;
-	  // do a full btrfs commit
-	  int r = ::ioctl(op_fd, BTRFS_IOC_SYNC);
-	  if (r < 0) {
-	    r = -errno;
-	    derr << "sync_entry btrfs IOC_SYNC got " << cpp_strerror(r) << dendl;
-	    assert(0 == "btrfs sync ioctl returned error");
-	  }
-	} else
-        if (m_filestore_fsync_flushes_journal_data) {
-	  dout(15) << "sync_entry doing fsync on " << current_op_seq_fn << dendl;
-	  // make the file system's journal commit.
-	  //  this works with ext3, but NOT ext4
-	  ::fsync(op_fd);  
-	} else {
-	  dout(15) << "sync_entry doing a full sync (syncfs(2) if possible)" << dendl;
-	  sync_filesystem(basedir_fd);
+	int err = backend->syncfs();
+	if (err < 0) {
+	  derr << "syncfs got " << cpp_strerror(err) << dendl;
+	  assert(0 == "syncfs returned error");
 	}
 
-	int err = write_op_seq(op_fd, cp);
+	err = write_op_seq(op_fd, cp);
 	if (err < 0) {
 	  derr << "Error during write_op_seq: " << cpp_strerror(err) << dendl;
 	  assert(0 == "error during write_op_seq");
@@ -3546,24 +2961,21 @@ void FileStore::sync_entry()
       logger->tinc(l_os_commit_len, dur);
 
       apply_manager.commit_finish();
+      wbthrottle.clear();
 
       logger->set(l_os_committing, 0);
 
       // remove old snaps?
-      if (btrfs_stable_commits) {
+      if (backend->can_checkpoint()) {
+	char s[NAME_MAX];
 	while (snaps.size() > 2) {
-	  btrfs_ioctl_vol_args vol_args;
-	  memset(&vol_args, 0, sizeof(vol_args));
-	  vol_args.fd = 0;
-	  snprintf(vol_args.name, sizeof(vol_args.name), COMMIT_SNAP_ITEM,
-		   (long long unsigned)snaps.front());
-
+	  snprintf(s, sizeof(s), COMMIT_SNAP_ITEM, (long long unsigned)snaps.front());
 	  snaps.pop_front();
-	  dout(10) << "removing snap '" << vol_args.name << "'" << dendl;
-	  int r = ::ioctl(basedir_fd, BTRFS_IOC_SNAP_DESTROY, &vol_args);
+	  dout(10) << "removing snap '" << s << "'" << dendl;
+	  int r = backend->destroy_checkpoint(s);
 	  if (r) {
 	    int err = errno;
-	    derr << "unable to destroy snap '" << vol_args.name << "' got " << cpp_strerror(err) << dendl;
+	    derr << "unable to destroy snap '" << s << "' got " << cpp_strerror(err) << dendl;
 	  }
 	}
       }
@@ -3695,16 +3107,15 @@ int FileStore::snapshot(const string& name)
   dout(10) << "snapshot " << name << dendl;
   sync_and_flush();
 
-  if (!btrfs) {
-    dout(0) << "snapshot " << name << " failed, no btrfs" << dendl;
+  if (!backend->can_checkpoint()) {
+    dout(0) << "snapshot " << name << " failed, not supported" << dendl;
     return -EOPNOTSUPP;
   }
 
-  btrfs_ioctl_vol_args vol_args;
-  vol_args.fd = current_fd;
-  snprintf(vol_args.name, sizeof(vol_args.name), CLUSTER_SNAP_ITEM, name.c_str());
+  char s[NAME_MAX];
+  snprintf(s, sizeof(s), CLUSTER_SNAP_ITEM, name.c_str());
 
-  int r = ::ioctl(basedir_fd, BTRFS_IOC_SNAP_CREATE, &vol_args);
+  int r = backend->create_checkpoint(s, NULL);
   if (r) {
     r = -errno;
     derr << "snapshot " << name << " failed: " << cpp_strerror(r) << dendl;
@@ -3854,15 +3265,14 @@ bool FileStore::debug_mdata_eio(const hobject_t &oid) {
 int FileStore::getattr(coll_t cid, const hobject_t& oid, const char *name, bufferptr &bp)
 {
   dout(15) << "getattr " << cid << "/" << oid << " '" << name << "'" << dendl;
-  int r;
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
-    r = -errno;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     goto out;
   }
   char n[CHAIN_XATTR_MAX_NAME_LEN];
   get_attrname(name, n, CHAIN_XATTR_MAX_NAME_LEN);
-  r = _fgetattr(fd, n, bp);
+  r = _fgetattr(**fd, n, bp);
   lfn_close(fd);
   if (r == -ENODATA && g_conf->filestore_xattr_use_omap) {
     map<string, bufferlist> got;
@@ -3901,13 +3311,12 @@ int FileStore::getattr(coll_t cid, const hobject_t& oid, const char *name, buffe
 int FileStore::getattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>& aset, bool user_only) 
 {
   dout(15) << "getattrs " << cid << "/" << oid << dendl;
-  int r;
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
-    r = -errno;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     goto out;
   }
-  r = _fgetattrs(fd, aset, user_only);
+  r = _fgetattrs(**fd, aset, user_only);
   lfn_close(fd);
   if (g_conf->filestore_xattr_use_omap) {
     set<string> omap_attrs;
@@ -3965,14 +3374,13 @@ int FileStore::_setattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>
   set<string> omap_remove;
   map<string, bufferptr> inline_set;
   map<string, bufferptr> inline_to_set;
-  int r = 0;
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
-    r = -errno;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     goto out;
   }
   if (g_conf->filestore_xattr_use_omap) {
-    r = _fgetattrs(fd, inline_set, false);
+    r = _fgetattrs(**fd, inline_set, false);
     assert(!m_filestore_fail_eio || r != -EIO);
   }
   dout(15) << "setattrs " << cid << "/" << oid << dendl;
@@ -3986,7 +3394,7 @@ int FileStore::_setattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>
       if (p->second.length() > g_conf->filestore_max_inline_xattr_size) {
 	if (inline_set.count(p->first)) {
 	  inline_set.erase(p->first);
-	  r = chain_fremovexattr(fd, n);
+	  r = chain_fremovexattr(**fd, n);
 	  if (r < 0)
 	    goto out_close;
 	}
@@ -3998,7 +3406,7 @@ int FileStore::_setattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>
 	  inline_set.size() >= g_conf->filestore_max_inline_xattrs) {
 	if (inline_set.count(p->first)) {
 	  inline_set.erase(p->first);
-	  r = chain_fremovexattr(fd, n);
+	  r = chain_fremovexattr(**fd, n);
 	  if (r < 0)
 	    goto out_close;
 	}
@@ -4013,9 +3421,9 @@ int FileStore::_setattrs(coll_t cid, const hobject_t& oid, map<string,bufferptr>
 
   }
 
-  r = _fsetattrs(fd, inline_to_set);
+  r = _fsetattrs(**fd, inline_to_set);
   if (r < 0)
-    return r;
+    goto out_close;
 
   if (!omap_remove.empty()) {
     assert(g_conf->filestore_xattr_use_omap);
@@ -4048,15 +3456,14 @@ int FileStore::_rmattr(coll_t cid, const hobject_t& oid, const char *name,
 		       const SequencerPosition &spos)
 {
   dout(15) << "rmattr " << cid << "/" << oid << " '" << name << "'" << dendl;
-  int r = 0;
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
-    r = -errno;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     goto out;
   }
   char n[CHAIN_XATTR_MAX_NAME_LEN];
   get_attrname(name, n, CHAIN_XATTR_MAX_NAME_LEN);
-  r = chain_fremovexattr(fd, n);
+  r = chain_fremovexattr(**fd, n);
   if (r == -ENODATA && g_conf->filestore_xattr_use_omap) {
     Index index;
     r = get_index(cid, &index);
@@ -4086,18 +3493,17 @@ int FileStore::_rmattrs(coll_t cid, const hobject_t& oid,
   dout(15) << "rmattrs " << cid << "/" << oid << dendl;
 
   map<string,bufferptr> aset;
-  int r = 0;
-  int fd = lfn_open(cid, oid, 0);
-  if (fd < 0) {
-    r = -errno;
+  FDRef fd;
+  int r = lfn_open(cid, oid, false, &fd);
+  if (r < 0) {
     goto out;
   }
-  r = _fgetattrs(fd, aset, false);
+  r = _fgetattrs(**fd, aset, false);
   if (r >= 0) {
     for (map<string,bufferptr>::iterator p = aset.begin(); p != aset.end(); ++p) {
       char n[CHAIN_XATTR_MAX_NAME_LEN];
       get_attrname(p->first.c_str(), n, CHAIN_XATTR_MAX_NAME_LEN);
-      r = chain_fremovexattr(fd, n);
+      r = chain_fremovexattr(**fd, n);
       if (r < 0)
 	break;
     }
@@ -4311,9 +3717,19 @@ int FileStore::_collection_rename(const coll_t &cid, const coll_t &ncid,
     return _collection_remove_recursive(cid, spos);
   }
 
+  if (!collection_exists(cid)) {
+    if (replaying) {
+      // already happened
+      return 0;
+    } else {
+      return -ENOENT;
+    }
+  }
+  _set_global_replay_guard(cid, spos);
+
   int ret = 0;
   if (::rename(old_coll, new_coll)) {
-    if (replaying && !btrfs_stable_commits &&
+    if (replaying && !backend->can_checkpoint() &&
 	(errno == EEXIST || errno == ENOTEMPTY))
       ret = _collection_remove_recursive(cid, spos);
     else
@@ -4368,8 +3784,9 @@ int FileStore::list_collections(vector<coll_t>& ls)
     return r;
   }
 
-  struct dirent sde, *de;
-  while ((r = ::readdir_r(dir, &sde, &de)) == 0) {
+  char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
+  struct dirent *de;
+  while ((r = ::readdir_r(dir, (struct dirent *)&buf, &de)) == 0) {
     if (!de)
       break;
     if (de->d_type == DT_UNKNOWN) {
@@ -4451,13 +3868,12 @@ bool FileStore::collection_empty(coll_t c)
 int FileStore::collection_list_range(coll_t c, hobject_t start, hobject_t end,
                                      snapid_t seq, vector<hobject_t> *ls)
 {
-  int r = 0;
   bool done = false;
   hobject_t next = start;
 
   while (!done) {
     vector<hobject_t> next_objects;
-    r = collection_list_partial(c, next,
+    int r = collection_list_partial(c, next,
                                 get_ideal_list_min(), get_ideal_list_max(),
                                 seq, &next_objects, &next);
     if (r < 0)
@@ -4686,22 +4102,22 @@ int FileStore::_collection_add(coll_t c, coll_t oldcid, const hobject_t& o,
 
   // open guard on object so we don't any previous operations on the
   // new name that will modify the source inode.
-  int fd = lfn_open(oldcid, o, 0);
-  if (fd < 0) {
+  FDRef fd;
+  int r = lfn_open(oldcid, o, 0, &fd);
+  if (r < 0) {
     // the source collection/object does not exist. If we are replaying, we
     // should be safe, so just return 0 and move on.
     assert(replaying);
     dout(10) << "collection_add " << c << "/" << o << " from "
-        << oldcid << "/" << o << " (dne, continue replay) " << dendl;
+	     << oldcid << "/" << o << " (dne, continue replay) " << dendl;
     return 0;
   }
-  assert(fd >= 0);
   if (dstcmp > 0) {      // if dstcmp == 0 the guard already says "in-progress"
-    _set_replay_guard(fd, spos, &o, true);
+    _set_replay_guard(**fd, spos, &o, true);
   }
 
-  int r = lfn_link(oldcid, c, o);
-  if (replaying && !btrfs_stable_commits &&
+  r = lfn_link(oldcid, c, o);
+  if (replaying && !backend->can_checkpoint() &&
       r == -EEXIST)    // crashed between link() and set_replay_guard()
     r = 0;
 
@@ -4709,7 +4125,7 @@ int FileStore::_collection_add(coll_t c, coll_t oldcid, const hobject_t& o,
 
   // close guard on object so we don't do this again
   if (r == 0) {
-    _close_replay_guard(fd, spos);
+    _close_replay_guard(**fd, spos);
   }
   lfn_close(fd);
 
@@ -4768,6 +4184,23 @@ int FileStore::_omap_rmkeys(coll_t cid, const hobject_t &hoid,
   return 0;
 }
 
+int FileStore::_omap_rmkeyrange(coll_t cid, const hobject_t &hoid,
+				const string& first, const string& last,
+				const SequencerPosition &spos) {
+  dout(15) << __func__ << " " << cid << "/" << hoid << " [" << first << "," << last << "]" << dendl;
+  set<string> keys;
+  {
+    ObjectMap::ObjectMapIterator iter = get_omap_iterator(cid, hoid);
+    if (!iter)
+      return -ENOENT;
+    for (iter->lower_bound(first); iter->valid() && iter->key() < last;
+	 iter->next()) {
+      keys.insert(iter->key());
+    }
+  }
+  return _omap_rmkeys(cid, hoid, keys, spos);
+}
+
 int FileStore::_omap_setheader(coll_t cid, const hobject_t &hoid,
 			       const bufferlist &bl,
 			       const SequencerPosition &spos)
@@ -4810,6 +4243,7 @@ int FileStore::_split_collection(coll_t cid,
     if (srccmp < 0)
       return 0;
 
+    _set_global_replay_guard(cid, spos);
     _set_replay_guard(cid, spos, true);
     _set_replay_guard(dest, spos, true);
 
@@ -4918,9 +4352,6 @@ const char** FileStore::get_tracked_conf_keys() const
     "filestore_queue_max_bytes",
     "filestore_queue_committing_max_ops",
     "filestore_queue_committing_max_bytes",
-    "filestore_flusher",
-    "filestore_flusher_max_fds",
-    "filestore_sync_flush",
     "filestore_commit_timeout",
     "filestore_dump_file",
     "filestore_kill_at",
@@ -4940,9 +4371,6 @@ void FileStore::handle_conf_change(const struct md_config_t *conf,
       changed.count("filestore_queue_max_bytes") ||
       changed.count("filestore_queue_committing_max_ops") ||
       changed.count("filestore_queue_committing_max_bytes") ||
-      changed.count("filestore_flusher") ||
-      changed.count("filestore_flusher_max_fds") ||
-      changed.count("filestore_flush_min") ||
       changed.count("filestore_kill_at") ||
       changed.count("filestore_fail_eio") ||
       changed.count("filestore_replica_fadvise")) {
@@ -4953,10 +4381,6 @@ void FileStore::handle_conf_change(const struct md_config_t *conf,
     m_filestore_queue_max_bytes = conf->filestore_queue_max_bytes;
     m_filestore_queue_committing_max_ops = conf->filestore_queue_committing_max_ops;
     m_filestore_queue_committing_max_bytes = conf->filestore_queue_committing_max_bytes;
-    m_filestore_flusher = conf->filestore_flusher;
-    m_filestore_flusher_max_fds = conf->filestore_flusher_max_fds;
-    m_filestore_flush_min = conf->filestore_flush_min;
-    m_filestore_sync_flush = conf->filestore_sync_flush;
     m_filestore_kill_at.set(conf->filestore_kill_at);
     m_filestore_fail_eio = conf->filestore_fail_eio;
     m_filestore_replica_fadvise = conf->filestore_replica_fadvise;
