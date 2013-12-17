@@ -4,6 +4,7 @@ libcommon_la_SOURCES = \
 	common/LogClient.cc \
 	common/LogEntry.cc \
 	common/PrebufferedStreambuf.cc \
+	common/SloppyCRCMap.cc \
 	common/BackTrace.cc \
 	common/perf_counters.cc \
 	common/Mutex.cc \
@@ -59,13 +60,19 @@ libcommon_la_SOURCES = \
 	common/pick_address.cc \
 	common/util.cc \
 	common/TextTable.cc \
-	common/secret.c \
 	common/ceph_fs.cc \
 	common/ceph_hash.cc \
 	common/ceph_strings.cc \
 	common/ceph_frag.cc \
 	common/addr_parsing.c \
-	common/hobject.cc
+	common/hobject.cc \
+	common/bloom_filter.cc
+
+if LINUX
+libcommon_la_SOURCES += \
+	common/secret.c \
+	common/linux_version.c
+endif
 
 # these should go out of libcommon
 libcommon_la_SOURCES += \
@@ -74,6 +81,7 @@ libcommon_la_SOURCES += \
 	mon/MonMap.cc \
 	osd/OSDMap.cc \
 	osd/osd_types.cc \
+	osd/HitSet.cc \
 	mds/MDSMap.cc \
 	mds/inode_backtrace.cc \
 	mds/mdstypes.cc 
@@ -86,13 +94,14 @@ libcommon_crc_la_SOURCES = \
 	common/crc32c_intel_fast.c
 
 if WITH_GOOD_YASM_ELF64
-libcommon_crc_la_SOURCES += common/crc32c_intel_fast_asm.S
+libcommon_crc_la_SOURCES += common/crc32c_intel_fast_asm.S common/crc32c_intel_fast_zero_asm.S
 libcommon_crc_la_LIBTOOLFLAGS = --tag=CC
 endif
 LIBCOMMON_DEPS += libcommon_crc.la
 noinst_LTLIBRARIES += libcommon_crc.la
 
 noinst_HEADERS += \
+	common/bloom_filter.hpp \
 	common/sctp_crc32.h \
 	common/crc32c_intel_baseline.h \
 	common/crc32c_intel_fast.h
@@ -117,6 +126,7 @@ noinst_HEADERS += \
 	common/LogClient.h \
 	common/LogEntry.h \
 	common/Preforker.h \
+	common/SloppyCRCMap.h \
 	common/WorkQueue.h \
 	common/PrioritizedQueue.h \
 	common/ceph_argparse.h \
@@ -188,7 +198,8 @@ noinst_HEADERS += \
 	common/AsyncReserver.h \
 	common/sync_filesystem.h \
 	common/cmdparse.h \
-	common/hobject.h
+	common/hobject.h \
+	common/linux_version.h
 
 noinst_LTLIBRARIES += libcommon.la
 

@@ -20,6 +20,7 @@
 #include "rgw_bucket.h"
 #include "rgw_acl.h"
 #include "rgw_cors.h"
+#include "rgw_quota.h"
 
 using namespace std;
 
@@ -36,9 +37,20 @@ protected:
   RGWRados *store;
   RGWCORSConfiguration bucket_cors;
   bool cors_exist;
+  RGWQuotaInfo bucket_quota;
+
+  virtual int init_quota();
 public:
   RGWOp() : s(NULL), dialect_handler(NULL), store(NULL), cors_exist(false) {}
   virtual ~RGWOp() {}
+
+  virtual int init_processing() {
+    int ret = init_quota();
+    if (ret < 0)
+      return ret;
+
+    return 0;
+  }
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *dialect_handler) {
     this->store = store;
@@ -448,9 +460,6 @@ protected:
 
   int init_common();
 
-protected:
-  bool parse_copy_location(const char *src, string& bucket_name, string& object);
-
 public:
   RGWCopyObj() {
     if_mod = NULL;
@@ -469,6 +478,8 @@ public:
     replace_attrs = false;
     last_ofs = 0;
   }
+
+  static bool parse_copy_location(const char *src, string& bucket_name, string& object);
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
     RGWOp::init(store, s, h);

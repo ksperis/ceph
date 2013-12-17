@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 #include "gtest/gtest.h"
 
 #include "mds/mdstypes.h"
@@ -44,6 +46,16 @@ TEST(LibRadosMisc, ClusterFSID) {
             (size_t)rados_cluster_fsid(cluster, fsid, sizeof(fsid)));
 
   ASSERT_EQ(0, destroy_one_pool(pool_name, &cluster));
+}
+
+TEST(LibRadosMisc, WaitOSDMapPP) {
+  Rados cluster;
+  std::string pool_name = get_temp_pool_name();
+  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
+
+  ASSERT_EQ(0, cluster.wait_for_latest_osdmap());
+
+  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
 }
 
 static std::string read_key_from_tmap(IoCtx& ioctx, const std::string &obj,
@@ -538,21 +550,25 @@ TEST(LibRadosMisc, BigAttrPP) {
 
   bufferlist got;
 
-  bl.clear();
-  got.clear();
-  bl.append(buffer::create(g_conf->osd_max_attr_size));
-  ASSERT_EQ(0, ioctx.setxattr("foo", "one", bl));
-  ASSERT_EQ((int)bl.length(), ioctx.getxattr("foo", "one", got));
-  ASSERT_TRUE(bl.contents_equal(got));
+  if (g_conf->osd_max_attr_size) {
+    bl.clear();
+    got.clear();
+    bl.append(buffer::create(g_conf->osd_max_attr_size));
+    ASSERT_EQ(0, ioctx.setxattr("foo", "one", bl));
+    ASSERT_EQ((int)bl.length(), ioctx.getxattr("foo", "one", got));
+    ASSERT_TRUE(bl.contents_equal(got));
 
-  bl.clear();
-  bl.append(buffer::create(g_conf->osd_max_attr_size+1));
-  ASSERT_EQ(-EFBIG, ioctx.setxattr("foo", "one", bl));
+    bl.clear();
+    bl.append(buffer::create(g_conf->osd_max_attr_size+1));
+    ASSERT_EQ(-EFBIG, ioctx.setxattr("foo", "one", bl));
+  } else {
+    cout << "osd_max_attr_size == 0; skipping test" << std::endl;
+  }
 
   for (int i=0; i<1000; i++) {
     bl.clear();
     got.clear();
-    bl.append(buffer::create(g_conf->osd_max_attr_size));
+    bl.append(buffer::create(MIN(g_conf->osd_max_attr_size, 1024)));
     char n[10];
     snprintf(n, sizeof(n), "a%d", i);
     ASSERT_EQ(0, ioctx.setxattr("foo", n, bl));
@@ -581,18 +597,33 @@ TEST(LibRadosMisc, CopyPP) {
   ASSERT_EQ(0, ioctx.write_full("foo", blc));
   ASSERT_EQ(0, ioctx.setxattr("foo", "myattr", xc));
 
-  ObjectWriteOperation op;
-  op.copy_from("foo", ioctx, ioctx.get_last_version());
-  ASSERT_EQ(0, ioctx.operate("foo.copy", &op));
+  {
+    ObjectWriteOperation op;
+    op.copy_from("foo", ioctx, ioctx.get_last_version());
+    ASSERT_EQ(0, ioctx.operate("foo.copy", &op));
 
-  bufferlist bl2, x2;
-  ASSERT_EQ((int)bl.length(), ioctx.read("foo.copy", bl2, 10000, 0));
-  ASSERT_TRUE(bl.contents_equal(bl2));
-  ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
-  ASSERT_TRUE(x.contents_equal(x2));
+    bufferlist bl2, x2;
+    ASSERT_EQ((int)bl.length(), ioctx.read("foo.copy", bl2, 10000, 0));
+    ASSERT_TRUE(bl.contents_equal(bl2));
+    ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
+    ASSERT_TRUE(x.contents_equal(x2));
+  }
+
+  // small object without a version
+  {
+    ObjectWriteOperation op;
+    op.copy_from("foo", ioctx, 0);
+    ASSERT_EQ(0, ioctx.operate("foo.copy2", &op));
+
+    bufferlist bl2, x2;
+    ASSERT_EQ((int)bl.length(), ioctx.read("foo.copy2", bl2, 10000, 0));
+    ASSERT_TRUE(bl.contents_equal(bl2));
+    ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy2", "myattr", x2));
+    ASSERT_TRUE(x.contents_equal(x2));
+  }
 
   // do a big object
-  bl.append(buffer::create(8000000));
+  bl.append(buffer::create(g_conf->osd_copyfrom_max_chunk * 3));
   bl.zero();
   bl.append("tail");
   blc = bl;
@@ -600,15 +631,29 @@ TEST(LibRadosMisc, CopyPP) {
   ASSERT_EQ(0, ioctx.write_full("big", blc));
   ASSERT_EQ(0, ioctx.setxattr("big", "myattr", xc));
 
-  ObjectWriteOperation op2;
-  op.copy_from("big", ioctx, ioctx.get_last_version());
-  ASSERT_EQ(0, ioctx.operate("big.copy", &op));
+  {
+    ObjectWriteOperation op;
+    op.copy_from("big", ioctx, ioctx.get_last_version());
+    ASSERT_EQ(0, ioctx.operate("big.copy", &op));
 
-  bl2.clear();
-  ASSERT_EQ((int)bl.length(), ioctx.read("big.copy", bl2, bl.length(), 0));
-  ASSERT_TRUE(bl.contents_equal(bl2));
-  ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
-  ASSERT_TRUE(x.contents_equal(x2));
+    bufferlist bl2, x2;
+    ASSERT_EQ((int)bl.length(), ioctx.read("big.copy", bl2, bl.length(), 0));
+    ASSERT_TRUE(bl.contents_equal(bl2));
+    ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy", "myattr", x2));
+    ASSERT_TRUE(x.contents_equal(x2));
+  }
+
+  {
+    ObjectWriteOperation op;
+    op.copy_from("big", ioctx, 0);
+    ASSERT_EQ(0, ioctx.operate("big.copy2", &op));
+
+    bufferlist bl2, x2;
+    ASSERT_EQ((int)bl.length(), ioctx.read("big.copy2", bl2, bl.length(), 0));
+    ASSERT_TRUE(bl.contents_equal(bl2));
+    ASSERT_EQ((int)x.length(), ioctx.getxattr("foo.copy2", "myattr", x2));
+    ASSERT_TRUE(x.contents_equal(x2));
+  }
 
   ioctx.close();
   ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));

@@ -31,7 +31,8 @@ librgw_la_SOURCES =  \
 	rgw/rgw_auth_s3.cc \
 	rgw/rgw_metadata.cc \
 	rgw/rgw_replica_log.cc \
-	rgw/rgw_keystone.cc
+	rgw/rgw_keystone.cc \
+	rgw/rgw_quota.cc
 librgw_la_CXXFLAGS = -Woverloaded-virtual ${AM_CXXFLAGS}
 noinst_LTLIBRARIES += librgw.la
 
@@ -67,7 +68,7 @@ radosgw_SOURCES = \
 	rgw/rgw_swift.cc \
 	rgw/rgw_swift_auth.cc \
 	rgw/rgw_main.cc
-radosgw_LDADD = $(LIBRGW) $(LIBRGW_DEPS) -lresolv $(CEPH_GLOBAL)
+radosgw_LDADD = $(LIBRGW) $(LIBRGW_DEPS) $(RESOLV_LIBS) $(CEPH_GLOBAL)
 bin_PROGRAMS += radosgw
 
 radosgw_admin_SOURCES = rgw/rgw_admin.cc
@@ -93,11 +94,6 @@ DENCODER_SOURCES += \
 	rgw/rgw_common.cc \
 	rgw/rgw_env.cc \
 	rgw/rgw_json_enc.cc
-DENCODER_DEPS +=  \
-	libcls_lock_client.la \
-	libcls_rgw_client.la \
-	libcls_replica_log_client.a \
-	libcls_refcount_client.la
 
 
 endif # WITH_RADOSGW
@@ -129,6 +125,7 @@ noinst_HEADERS += \
 	rgw/rgw_http_client.h \
 	rgw/rgw_swift.h \
 	rgw/rgw_swift_auth.h \
+	rgw/rgw_quota.h \
 	rgw/rgw_rados.h \
 	rgw/rgw_replica_log.h \
 	rgw/rgw_resolve.h \

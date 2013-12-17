@@ -48,6 +48,7 @@
 #include "common/WorkQueue.h"
 #include "common/ceph_context.h"
 #include "include/str_list.h"
+#include "PGBackend.h"
 
 #include <list>
 #include <memory>
@@ -399,6 +400,8 @@ protected:
   CephContext *cct;
   OSDriver osdriver;
   SnapMapper snap_mapper;
+
+  virtual PGBackend *get_pgbackend() = 0;
 public:
   void update_snap_mapper_bits(uint32_t bits) {
     snap_mapper.update_bits(bits);
@@ -536,7 +539,7 @@ public:
 
   // primary state
  public:
-  vector<int> up, acting, want_acting;
+  vector<int> up, acting, want_acting, actingbackfill;
   map<int,eversion_t> peer_last_complete_ondisk;
   eversion_t  min_last_complete_ondisk;  // up: min over last_complete_ondisk, peer_last_complete_ondisk
   eversion_t  pg_trim_to;
@@ -620,8 +623,6 @@ protected:
   // primary-only, recovery-only state
   set<int>             might_have_unfound;  // These osds might have objects on them
 					    // which are unfound on the primary
-  bool need_flush;     // need to flush before any new activity
-
   epoch_t last_peering_reset;
 
 
@@ -645,14 +646,14 @@ protected:
    */
   struct BackfillInterval {
     // info about a backfill interval on a peer
+    eversion_t version; /// version at which the scan occurred
     map<hobject_t,eversion_t> objects;
     hobject_t begin;
     hobject_t end;
     
     /// clear content
     void clear() {
-      objects.clear();
-      begin = end = hobject_t();
+      *this = BackfillInterval();
     }
 
     void reset(hobject_t start) {
@@ -670,6 +671,14 @@ protected:
       return end == hobject_t::get_max();
     }
 
+    /// removes items <= soid and adjusts begin to the first object
+    void trim_to(const hobject_t &soid) {
+      trim();
+      while (!objects.empty() && objects.begin()->first <= soid) {
+	pop_front();
+      }
+    }
+
     /// Adjusts begin to the first object
     void trim() {
       if (!objects.empty())
@@ -682,10 +691,7 @@ protected:
     void pop_front() {
       assert(!objects.empty());
       objects.erase(objects.begin());
-      if (objects.empty())
-	begin = end;
-      else
-	begin = objects.begin()->first;
+      trim();
     }
 
     /// dump
@@ -707,14 +713,18 @@ protected:
   
   BackfillInterval backfill_info;
   BackfillInterval peer_backfill_info;
-  int backfill_target;
+  vector<int> backfill_targets;
   bool backfill_reserved;
   bool backfill_reserving;
 
   friend class OSD;
 
 public:
+  // Compatibility with single backfill target code
   int get_backfill_target() const {
+    int backfill_target = -1;
+    if (backfill_targets.size() > 0)
+      backfill_target = backfill_targets[0];
     return backfill_target;
   }
 
@@ -722,14 +732,14 @@ protected:
 
 
   // pg waiters
-  bool flushed;
+  unsigned flushes_in_progress;
 
   // Ops waiting on backfill_pos to change
-  list<OpRequestRef> waiting_for_backfill_pos;
   list<OpRequestRef>            waiting_for_active;
   list<OpRequestRef>            waiting_for_all_missing;
   map<hobject_t, list<OpRequestRef> > waiting_for_missing_object,
-                                        waiting_for_degraded_object;
+			     waiting_for_degraded_object,
+			     waiting_for_blocked_object;
   // Callbacks should assume pg (and nothing else) is locked
   map<hobject_t, list<Context*> > callbacks_for_degraded_object;
   map<eversion_t,list<OpRequestRef> > waiting_for_ack, waiting_for_ondisk;
@@ -737,6 +747,7 @@ protected:
   void split_ops(PG *child, unsigned split_bits);
 
   void requeue_object_waiters(map<hobject_t, list<OpRequestRef> >& m);
+  void requeue_op(OpRequestRef op);
   void requeue_ops(list<OpRequestRef> &l);
 
   // stats that persist lazily
@@ -767,6 +778,11 @@ public:
       if (up[i] == osd) return true;
     return false;
   }
+  bool is_actingbackfill(int osd) const {
+    for (unsigned i=0; i<actingbackfill.size(); i++)
+      if (actingbackfill[i] == osd) return true;
+    return false;
+  }
   
   bool needs_recovery() const;
   bool needs_backfill() const;
@@ -788,10 +804,11 @@ public:
 
   bool calc_min_last_complete_ondisk() {
     eversion_t min = last_complete_ondisk;
-    for (unsigned i=1; i<acting.size(); i++) {
-      if (peer_last_complete_ondisk.count(acting[i]) == 0)
+    assert(actingbackfill.size() > 0);
+    for (unsigned i=1; i<actingbackfill.size(); i++) {
+      if (peer_last_complete_ondisk.count(actingbackfill[i]) == 0)
 	return false;   // we don't have complete info
-      eversion_t a = peer_last_complete_ondisk[acting[i]];
+      eversion_t a = peer_last_complete_ondisk[actingbackfill[i]];
       if (a < min)
 	min = a;
     }
@@ -823,7 +840,7 @@ public:
   void trim_write_ahead();
 
   map<int, pg_info_t>::const_iterator find_best_info(const map<int, pg_info_t> &infos) const;
-  bool calc_acting(int& newest_update_osd, vector<int>& want) const;
+  bool calc_acting(int& newest_update_osd, vector<int>& want, vector<int>& backfill) const;
   bool choose_acting(int& newest_update_osd);
   void build_might_have_unfound();
   void replay_queued_ops();
@@ -846,9 +863,14 @@ public:
 
   virtual void check_local() = 0;
 
-  virtual int start_recovery_ops(
+  /**
+   * @param ops_begun returns how many recovery ops the function started
+   * @returns true if any useful work was accomplished; false otherwise
+   */
+  virtual bool start_recovery_ops(
     int max, RecoveryCtx *prctx,
-    ThreadPool::TPHandle &handle) = 0;
+    ThreadPool::TPHandle &handle,
+    int *ops_begun) = 0;
 
   void purge_strays();
 
@@ -1075,8 +1097,12 @@ public:
   virtual void _scrub(ScrubMap &map) { }
   virtual void _scrub_clear_state() { }
   virtual void _scrub_finish() { }
-  virtual coll_t get_temp_coll() = 0;
-  virtual bool have_temp_coll() = 0;
+  virtual void get_colls(list<coll_t> *out) = 0;
+  virtual void split_colls(
+    pg_t child,
+    int split_bits,
+    int seed,
+    ObjectStore::Transaction *t) = 0;
   virtual bool _report_snap_collection_errors(
     const hobject_t &hoid,
     const map<string, bufferptr> &attrs,
@@ -1469,7 +1495,6 @@ public:
 
     struct Peering : boost::statechart::state< Peering, Primary, GetInfo >, NamedState {
       std::auto_ptr< PriorSet > prior_set;
-      bool flushed;
 
       Peering(my_context ctx);
       void exit();
@@ -1788,10 +1813,12 @@ public:
 
     struct Incomplete : boost::statechart::state< Incomplete, Peering>, NamedState {
       typedef boost::mpl::list <
-	boost::statechart::custom_reaction< AdvMap >
+	boost::statechart::custom_reaction< AdvMap >,
+	boost::statechart::custom_reaction< MNotifyRec >
 	> reactions;
       Incomplete(my_context ctx);
       boost::statechart::result react(const AdvMap &advmap);
+      boost::statechart::result react(const MNotifyRec& infoevt);
       void exit();
     };
 
@@ -1889,6 +1916,14 @@ public:
     hobject_t &infos_oid,
     __u8 info_struct_v, bool dirty_big_info, bool force_ver = false);
   void write_if_dirty(ObjectStore::Transaction& t);
+
+  eversion_t get_next_version() const {
+    eversion_t at_version(get_osdmap()->get_epoch(),
+			  pg_log.get_head().version+1);
+    assert(at_version > info.last_update);
+    assert(at_version > pg_log.get_head());
+    return at_version;
+  }
 
   void add_log_entry(pg_log_entry_t& e, bufferlist& log_bl);
   void append_log(
@@ -1994,10 +2029,10 @@ public:
 
 
   // abstract bits
-  void do_request(
+  virtual void do_request(
     OpRequestRef op,
     ThreadPool::TPHandle &handle
-  );
+  ) = 0;
 
   virtual void do_op(OpRequestRef op) = 0;
   virtual void do_sub_op(OpRequestRef op) = 0;
@@ -2007,9 +2042,6 @@ public:
     ThreadPool::TPHandle &handle
   ) = 0;
   virtual void do_backfill(OpRequestRef op) = 0;
-  virtual void do_push(OpRequestRef op) = 0;
-  virtual void do_pull(OpRequestRef op) = 0;
-  virtual void do_push_reply(OpRequestRef op) = 0;
   virtual void snap_trimmer() = 0;
 
   virtual int do_command(cmdmap_t cmdmap, ostream& ss,
@@ -2020,6 +2052,7 @@ public:
   virtual bool same_for_rep_modify_since(epoch_t e) = 0;
 
   virtual void on_role_change() = 0;
+  virtual void on_pool_change() = 0;
   virtual void on_change(ObjectStore::Transaction *t) = 0;
   virtual void on_activate() = 0;
   virtual void on_flushed() = 0;

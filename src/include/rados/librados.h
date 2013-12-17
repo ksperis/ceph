@@ -1,8 +1,6 @@
 #ifndef CEPH_LIBRADOS_H
 #define CEPH_LIBRADOS_H
 
-#include "include/int_types.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -224,6 +222,23 @@ int rados_create2(rados_t *pcluster, const char *const clustername,
  * @returns 0 on success, negative error code on failure
  */
 int rados_create_with_context(rados_t *cluster, rados_config_t cct);
+
+/**
+ * Ping the monitor with ID @p mon_id, storing the resulting reply in
+ * @p buf (if specified) with a maximum size of @p len.
+ *
+ * The result buffer is allocated on the heap; the caller is
+ * expected to release that memory with rados_buffer_free().  The
+ * buffer and length pointers can be NULL, in which case they are
+ * not filled in.
+ *
+ * @param      cluster    cluster handle
+ * @param[in]  mon_id     ID of the monitor to ping
+ * @param[out] outstr     double pointer with the resulting reply
+ * @param[out] outstrlen  pointer with the size of the reply in @p outstr
+ */
+int rados_ping_monitor(rados_t cluster, const char *mon_id,
+                       char **outstr, size_t *outstrlen);
 
 /**
  * Connect to the cluster.
@@ -566,7 +581,7 @@ int rados_pool_create_with_auid(rados_t cluster, const char *pool_name, uint64_t
  * @returns 0 on success, negative error code on failure
  */
 int rados_pool_create_with_crush_rule(rados_t cluster, const char *pool_name,
-				      __u8 crush_rule_num);
+				      uint8_t crush_rule_num);
 
 /**
  * Create a pool with a specific CRUSH rule and auid
@@ -581,7 +596,7 @@ int rados_pool_create_with_crush_rule(rados_t cluster, const char *pool_name,
  * @returns 0 on success, negative error code on failure
  */
 int rados_pool_create_with_all(rados_t cluster, const char *pool_name, uint64_t auid,
-			       __u8 crush_rule_num);
+			       uint8_t crush_rule_num);
 
 /**
  * Delete a pool and all data inside it
@@ -685,6 +700,14 @@ void rados_ioctx_set_namespace(rados_ioctx_t io, const char *nspace);
  * @returns 0 on success, negative error code on failure
  */
 int rados_objects_list_open(rados_ioctx_t io, rados_list_ctx_t *ctx);
+
+/**
+ * Return hash position of iterator, rounded to the current PG
+ *
+ * @param ctx iterator marking where you are in the listing
+ * @returns current hash position, rounded to the current pg
+ */
+uint32_t rados_objects_list_get_pg_hash_position(rados_list_ctx_t ctx);
 
 /**
  * Get the next object name and locator in the pool
@@ -912,6 +935,7 @@ uint64_t rados_get_last_version(rados_ioctx_t io);
 /**
  * Write data to an object
  *
+ * @note This will never return a positive value not equal to len.
  * @param io the io context in which the write will occur
  * @param oid name of the object
  * @param buf data to write

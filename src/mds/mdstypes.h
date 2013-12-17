@@ -329,6 +329,7 @@ struct inode_t {
   ceph_file_layout layout;
   vector <int64_t> old_pools;
   uint64_t   size;        // on directory, # dentries
+  uint64_t   max_size_ever; // max size the file has ever been
   uint32_t   truncate_seq;
   uint64_t   truncate_size, truncate_from;
   uint32_t   truncate_pending;
@@ -353,7 +354,8 @@ struct inode_t {
   inode_t() : ino(0), rdev(0),
 	      mode(0), uid(0), gid(0),
 	      nlink(0), anchored(false),
-	      size(0), truncate_seq(0), truncate_size(0), truncate_from(0),
+	      size(0), max_size_ever(0),
+	      truncate_seq(0), truncate_size(0), truncate_from(0),
 	      truncate_pending(0),
 	      time_warp_seq(0),
 	      version(0), file_data_version(0), xattr_version(0), backtrace_version(0) {
@@ -369,6 +371,8 @@ struct inode_t {
   bool is_truncating() const { return (truncate_pending > 0); }
   void truncate(uint64_t old_size, uint64_t new_size) {
     assert(new_size < old_size);
+    if (old_size > max_size_ever)
+      max_size_ever = old_size;
     truncate_from = old_size;
     size = new_size;
     rstat.rbytes = new_size;
@@ -1134,8 +1138,9 @@ class MDSCacheObject {
   // -- state --
   const static int STATE_AUTH      = (1<<30);
   const static int STATE_DIRTY     = (1<<29);
-  const static int STATE_REJOINING = (1<<28);  // replica has not joined w/ primary copy
-  const static int STATE_REJOINUNDEF = (1<<27);  // contents undefined.
+  const static int STATE_NOTIFYREF = (1<<28); // notify dropping ref drop through _put()
+  const static int STATE_REJOINING = (1<<27);  // replica has not joined w/ primary copy
+  const static int STATE_REJOINUNDEF = (1<<26);  // contents undefined.
 
 
   // -- wait --
@@ -1221,6 +1226,7 @@ protected:
 #endif
     assert(ref > 0);
   }
+  virtual void _put() {}
   void put(int by) {
 #ifdef MDS_REF_SET
     if (ref == 0 || ref_map[by] == 0) {
@@ -1236,6 +1242,8 @@ protected:
 #endif
       if (ref == 0)
 	last_put();
+      if (state_test(STATE_NOTIFYREF))
+	_put();
     }
   }
 
@@ -1286,26 +1294,26 @@ protected:
   // --------------------------------------------
   // replication (across mds cluster)
  protected:
-  __s16        replica_nonce; // [replica] defined on replica
-  map<int,int> replica_map;   // [auth] mds -> nonce
+  unsigned		replica_nonce; // [replica] defined on replica
+  map<int,unsigned>	replica_map;   // [auth] mds -> nonce
 
  public:
   bool is_replicated() { return !replica_map.empty(); }
   bool is_replica(int mds) { return replica_map.count(mds); }
   int num_replicas() { return replica_map.size(); }
-  int add_replica(int mds) {
+  unsigned add_replica(int mds) {
     if (replica_map.count(mds)) 
       return ++replica_map[mds];  // inc nonce
     if (replica_map.empty()) 
       get(PIN_REPLICATED);
     return replica_map[mds] = 1;
   }
-  void add_replica(int mds, int nonce) {
+  void add_replica(int mds, unsigned nonce) {
     if (replica_map.empty()) 
       get(PIN_REPLICATED);
     replica_map[mds] = nonce;
   }
-  int get_replica_nonce(int mds) {
+  unsigned get_replica_nonce(int mds) {
     assert(replica_map.count(mds));
     return replica_map[mds];
   }
@@ -1320,18 +1328,18 @@ protected:
       put(PIN_REPLICATED);
     replica_map.clear();
   }
-  map<int,int>::iterator replicas_begin() { return replica_map.begin(); }
-  map<int,int>::iterator replicas_end() { return replica_map.end(); }
-  const map<int,int>& get_replicas() { return replica_map; }
+  map<int,unsigned>::iterator replicas_begin() { return replica_map.begin(); }
+  map<int,unsigned>::iterator replicas_end() { return replica_map.end(); }
+  const map<int,unsigned>& get_replicas() { return replica_map; }
   void list_replicas(set<int>& ls) {
-    for (map<int,int>::const_iterator p = replica_map.begin();
+    for (map<int,unsigned>::const_iterator p = replica_map.begin();
 	 p != replica_map.end();
 	 ++p) 
       ls.insert(p->first);
   }
 
-  int get_replica_nonce() { return replica_nonce;}
-  void set_replica_nonce(int n) { replica_nonce = n; }
+  unsigned get_replica_nonce() { return replica_nonce; }
+  void set_replica_nonce(unsigned n) { replica_nonce = n; }
 
 
   // ---------------------------------------------

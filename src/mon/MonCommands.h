@@ -59,7 +59,7 @@
  * CephString: optional badchars
  * CephSocketpath: validation involves "is it S_ISSOCK"
  * CephIPAddr: v4 or v6 addr with optional port, syntax validated
- * CephEntityAddr: CephIPAddr + '/nonce'
+ * CephEntityAddr: CephIPAddr + optional '/nonce'
  * CephPoolname: Plainold string
  * CephObjectname: Another plainold string
  * CephPgid: n.xxx where n is an int > 0, xxx is a hex number > 0
@@ -112,7 +112,7 @@ COMMAND("pg send_pg_creates", "trigger pg creates to be issued",\
 	"pg", "rw", "cli,rest")
 COMMAND("pg dump " \
 	"name=dumpcontents,type=CephChoices,strings=all|summary|sum|delta|pools|osds|pgs|pgs_brief,n=N,req=false", \
-	"show human-readable versions of pg map", "pg", "r", "cli,rest")
+	"show human-readable versions of pg map (only 'all' valid with plain)", "pg", "r", "cli,rest")
 COMMAND("pg dump_json " \
 	"name=dumpcontents,type=CephChoices,strings=all|summary|sum|pools|osds|pgs,n=N,req=false", \
 	"show human-readable version of pg map in json only",\
@@ -210,8 +210,8 @@ COMMAND("quorum_status", "report status of monitor quorum", \
 	"mon", "r", "cli,rest")
 COMMAND("mon_status", "report status of monitors", "mon", "r", "cli,rest")
 COMMAND("sync force " \
-	"name=validate1,type=CephChoices,strings=--yes-i-really-mean-it " \
-	"name=validate2,type=CephChoices,strings=--i-know-what-i-am-doing", \
+	"name=validate1,type=CephChoices,strings=--yes-i-really-mean-it,req=false " \
+	"name=validate2,type=CephChoices,strings=--i-know-what-i-am-doing,req=false", \
 	"force sync of and clear monitor store", "mon", "rw", "cli,rest")
 COMMAND("heap " \
 	"name=heapcmd,type=CephChoices,strings=dump|start_profiler|stop_profiler|release|stats", \
@@ -274,23 +274,32 @@ COMMAND("mds compat rm_compat " \
 COMMAND("mds compat rm_incompat " \
 	"name=feature,type=CephInt,range=0", \
 	"remove incompatible feature", "mds", "rw", "cli,rest")
+COMMAND("mds set " \
+        "name=key,type=CephChoices,strings=allow_new_snaps " \
+        "name=sure,type=CephString,req=false", \
+        "set <key>", \
+        "mds", "w", "cli,rest")
+COMMAND("mds unset " \
+        "name=key,type=CephChoices,strings=allow_new_snaps " \
+        "name=sure,type=CephString,req=false", \
+        "unset <key>", "mds", "w", "cli,rest")
 COMMAND("mds add_data_pool " \
-	"name=poolid,type=CephInt,range=0", \
-	"add data pool <poolid>", "mds", "rw", "cli,rest")
+	"name=pool,type=CephString", \
+	"add data pool <pool>", "mds", "rw", "cli,rest")
 COMMAND("mds remove_data_pool " \
-	"name=poolid,type=CephInt,range=0", \
-	"remove data pool <poolid>", "mds", "rw", "cli,rest")
+	"name=pool,type=CephString", \
+	"remove data pool <pool>", "mds", "rw", "cli,rest")
 COMMAND("mds newfs " \
 	"name=metadata,type=CephInt,range=0 " \
 	"name=data,type=CephInt,range=0 " \
-	"name=sure,type=CephChoices,strings=--yes-i-really-mean-it", \
+	"name=sure,type=CephChoices,strings=--yes-i-really-mean-it,req=false", \
 	"make new filesystom using pools <metadata> and <data>", \
 	"mds", "rw", "cli,rest")
 /*
  * Monmap commands
  */
 COMMAND("mon dump " \
-	"name=epoch,type=CephInt,req=false", \
+	"name=epoch,type=CephInt,range=0,req=false", \
 	"dump formatted monmap (optionally from epoch)", \
 	"mon", "r", "cli,rest")
 COMMAND("mon stat", "summarize monitor status", "mon", "r", "cli,rest")
@@ -334,6 +343,10 @@ COMMAND("osd getmaxosd", "show largest OSD id", "osd", "r", "cli,rest")
 COMMAND("osd find " \
 	"name=id,type=CephInt,range=0", \
 	"find osd <id> in the CRUSH map and show its location", \
+	"osd", "r", "cli,rest")
+COMMAND("osd metadata " \
+	"name=id,type=CephInt,range=0", \
+	"fetch metadata for osd <id>", \
 	"osd", "r", "cli,rest")
 COMMAND("osd map " \
 	"name=pool,type=CephPoolname " \
@@ -384,7 +397,7 @@ COMMAND("osd crush create-or-move " \
 	"create entry or move existing entry for <name> <weight> at/to location <args>", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush move " \
-	"name=id,type=CephOsdName " \
+	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=args,type=CephString,n=N,goodchars=[A-Za-z0-9-_.=]", \
 	"move existing entry for <name> to location <args>", \
 	"osd", "rw", "cli,rest")
@@ -396,17 +409,17 @@ COMMAND("osd crush link " \
 COMMAND("osd crush rm " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=ancestor,type=CephString,req=false,goodchars=[A-Za-z0-9-_.]", \
-	"remove <name> from crush map (everywhere, or just at <ancestor>",\
+	"remove <name> from crush map (everywhere, or just at <ancestor>)",\
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush remove " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=ancestor,type=CephString,req=false,goodchars=[A-Za-z0-9-_.]", \
-	"remove <name> from crush map (everywhere, or just at <ancestor>", \
+	"remove <name> from crush map (everywhere, or just at <ancestor>)", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush unlink " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=ancestor,type=CephString,req=false,goodchars=[A-Za-z0-9-_.]", \
-	"unlink <name> from crush map (everywhere, or just at <ancestor>", \
+	"unlink <name> from crush map (everywhere, or just at <ancestor>)", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush reweight " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
@@ -419,8 +432,9 @@ COMMAND("osd crush tunables " \
 COMMAND("osd crush rule create-simple " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=root,type=CephString,goodchars=[A-Za-z0-9-_.] " \
-	"name=type,type=CephString,goodchars=[A-Za-z0-9-_.]",
-	"create crush rule <name> in <root> of type <type>", \
+	"name=type,type=CephString,goodchars=[A-Za-z0-9-_.] " \
+	"name=mode,type=CephChoices,strings=firstn|indep,req=false",
+	"create crush rule <name> to start from <root>, replicate across buckets of type <type>, using a choose mode of <firstn|indep> (default firstn; indep best for erasure pools)", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush rule rm " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] ",	\
@@ -456,7 +470,7 @@ COMMAND("osd reweight " \
 	"reweight osd to 0.0 < <weight> < 1.0", "osd", "rw", "cli,rest")
 COMMAND("osd lost " \
 	"name=id,type=CephInt,range=0 " \
-	"name=sure,type=CephChoices,strings=--yes-i-really-mean-it", \
+	"name=sure,type=CephChoices,strings=--yes-i-really-mean-it,req=false", \
 	"mark osd as permanently lost. THIS DESTROYS DATA IF NO MORE REPLICAS EXIST, BE CAREFUL", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd create " \
@@ -484,9 +498,9 @@ COMMAND("osd pool create " \
 	"create pool", "osd", "rw", "cli,rest")
 COMMAND("osd pool delete " \
 	"name=pool,type=CephPoolname " \
-	"name=pool2,type=CephPoolname " \
-	"name=sure,type=CephChoices,strings=--yes-i-really-really-mean-it", \
-	"delete pool (say pool twice, add --yes-i-really-really-mean-it)", \
+	"name=pool2,type=CephPoolname,req=false " \
+	"name=sure,type=CephChoices,strings=--yes-i-really-really-mean-it,req=false", \
+	"delete pool", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd pool rename " \
 	"name=srcpool,type=CephPoolname " \
@@ -498,8 +512,8 @@ COMMAND("osd pool get " \
 	"get pool parameter <var>", "osd", "r", "cli,rest")
 COMMAND("osd pool set " \
 	"name=pool,type=CephPoolname " \
-	"name=var,type=CephChoices,strings=size|min_size|crash_replay_interval|pg_num|pgp_num|crush_ruleset " \
-	"name=val,type=CephInt", \
+	"name=var,type=CephChoices,strings=size|min_size|crash_replay_interval|pg_num|pgp_num|crush_ruleset|hashpspool|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp " \
+	"name=val,type=CephString", \
 	"set pool parameter <var> to <val>", "osd", "rw", "cli,rest")
 // 'val' is a CephString because it can include a unit.  Perhaps
 // there should be a Python type for validation/conversion of strings
@@ -509,6 +523,10 @@ COMMAND("osd pool set-quota " \
 	"name=field,type=CephChoices,strings=max_objects|max_bytes " \
 	"name=val,type=CephString",
 	"set object or byte limit on pool", "osd", "rw", "cli,rest")
+COMMAND("osd pool stats " \
+        "name=name,type=CephString,req=false",
+        "obtain stats from all pools, or from specified pool",
+        "osd", "r", "cli,rest")
 COMMAND("osd reweight-by-utilization " \
 	"name=oload,type=CephInt,range=100,req=false", \
 	"reweight OSDs by utilization [overload-percentage-for-consideration, default 120]", \

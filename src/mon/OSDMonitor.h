@@ -37,6 +37,8 @@ class Monitor;
 #include "messages/MOSDFailure.h"
 #include "messages/MPoolOp.h"
 
+#define OSD_METADATA_PREFIX "osd_metadata"
+
 /// information about a particular peer's failure reports for one osd
 struct failure_reporter_t {
   int num_reports;          ///< reports from this reporter
@@ -120,6 +122,8 @@ public:
 private:
   // [leader]
   OSDMap::Incremental pending_inc;
+  map<int, bufferlist> pending_metadata;
+  set<int>             pending_metadata_rm;
   map<int, failure_info_t> failure_info;
   map<int,utime_t>    down_pending_out;  // osd down -> out
 
@@ -227,7 +231,7 @@ private:
   bool prepare_pgtemp(class MOSDPGTemp *m);
 
   int _prepare_remove_pool(uint64_t pool);
-  int _prepare_rename_pool(uint64_t pool, string newname);
+  int _prepare_rename_pool(int64_t pool, string newname);
 
   bool preprocess_pool_op ( class MPoolOp *m);
   bool preprocess_pool_op_create ( class MPoolOp *m);
@@ -324,6 +328,9 @@ private:
   bool preprocess_command(MMonCommand *m);
   bool prepare_command(MMonCommand *m);
 
+  int prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
+                               stringstream& ss);
+
   void handle_osd_timeouts(const utime_t &now,
 			   std::map<int,utime_t> &last_osd_report);
   void mark_all_down();
@@ -336,6 +343,7 @@ private:
   epoch_t blacklist(const entity_addr_t& a, utime_t until);
 
   void dump_info(Formatter *f);
+  int dump_osd_metadata(int osd, Formatter *f, ostream *err);
 
   void check_subs();
   void check_sub(Subscription *sub);

@@ -42,7 +42,7 @@ with a command like::
 When creating a new monitor cluster, the keyring should also contain a ``client.admin`` key that can be used
 to administer the system::
 
-        ceph-authtool /path/to/keyring --gen-key -n client.admin
+        ceph-authtool /path/to/keyring --gen-key -n client.admin --set-uid=0 --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow'
 
 The resulting keyring is fed to ``ceph-mon --mkfs`` with the ``--keyring <keyring>`` command-line argument.
 
@@ -63,7 +63,7 @@ The monitor address can be provided in several ways.
 #. via the ``--public-addr <ip[:port]>`` command-line option (or config file option)
 #. via the ``--public-network <cidr>`` command-line option (or config file option)
 #. via the monmap provided via ``--monmap <path>``, if it includes a monitor with our name
-#. via the bootstrap monmap (provided via ``--monmap <path>`` or generated from ``--mon-host <list>``) if it includes a monitor with no name (``noname-<something>``) and an address configured on the local host.
+#. via the bootstrap monmap (provided via ``--inject-monmap <path>`` or generated from ``--mon-host <list>``) if it includes a monitor with no name (``noname-<something>``) and an address configured on the local host.
 
 Peers
 =====

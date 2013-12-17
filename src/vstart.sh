@@ -2,6 +2,7 @@
 
 export PYTHONPATH=./pybind
 export LD_LIBRARY_PATH=.libs
+export DYLD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
 
 # abort on failure
@@ -34,8 +35,10 @@ start_rgw=0
 ip=""
 nodaemon=0
 smallmds=0
+hitset=""
 overwrite_conf=1
 cephx=1 #turn cephx on by default
+memstore=0
 
 MON_ADDR=""
 
@@ -60,6 +63,7 @@ usage=$usage"\t-m ip:port\t\tspecify monitor address\n"
 usage=$usage"\t-k keep old configuration files\n"
 usage=$usage"\t-x enable cephx (on by default)\n"
 usage=$usage"\t-X disable cephx\n"
+usage=$usage"\t--hitset <pool> <hit_set_type>: enable hitset tracking\n"
 usage=$usage"\t-o config\t\t add extra config parameters to mds section\n"
 
 usage_exit() {
@@ -141,6 +145,14 @@ case $1 in
     -k )
 	    overwrite_conf=0
 	    ;;
+    --memstore )
+	    memstore=1
+	    ;;
+    --hitset )
+	    hitset="$hitset $2 $3"
+	    shift
+	    shift
+	    ;;
     -o )
 	    extra_conf="$extra_conf	$2
 "
@@ -220,6 +232,10 @@ if [ -n "$MON_ADDR" ]; then
 	CMDS_ARGS=" -m "$MON_ADDR
 fi
 
+if [ "$memstore" -eq 1 ]; then
+    COSDMEMSTORE='
+	osd objectstore = memstore'
+fi
 
 # lockdep everywhere?
 # export CEPH_ARGS="--lockdep 1"
@@ -237,6 +253,7 @@ fi
 $SUDO rm -f core*
 
 test -d out || mkdir out
+test -d dev || mkdir dev
 $SUDO rm -rf out/*
 test -d gmon && $SUDO rm -rf gmon/*
 
@@ -249,11 +266,11 @@ if [ -n "$ip" ]; then
     IP="$ip"
 else
     echo hostname $HOSTNAME
-    RAW_IP=`hostname --ip-address`
+    RAW_IP=`hostname -I`
     # filter out IPv6 and localhost addresses
     IP="$(echo "$RAW_IP"|tr ' ' '\012'|grep -v :|grep -v '^127\.'|head -n1)"
     # if that left nothing, then try to use the raw thing, it might work
-    if [ -z "IP" ]; then IP="$RAW_IP"; fi
+    if [ -z "$IP" ]; then IP="$RAW_IP"; fi
     echo ip $IP
 fi
 echo "ip $IP"
@@ -337,8 +354,10 @@ $DAEMONOPTS
         osd scrub load threshold = 5.0
         osd debug op order = true
 $COSDDEBUG
+$COSDMEMSTORE
 $extra_conf
 [mon]
+        mon pg warn min per osd = 10
 $DAEMONOPTS
 $CMONDEBUG
 $extra_conf
@@ -389,7 +408,7 @@ EOF
 		    cmd="rm -rf $CEPH_DEV_DIR/mon.$f"
 		    echo $cmd
 		    $cmd
-                    cmd="mkdir $CEPH_DEV_DIR/mon.$f"
+                    cmd="mkdir -p $CEPH_DEV_DIR/mon.$f"
                     echo $cmd
                     $cmd
 		    cmd="$CEPH_BIN/ceph-mon --mkfs -c $conf -i $f --monmap=$monmap_fn"
@@ -568,6 +587,20 @@ EOF
 	run 'apache2' $SUDO apache2 -f $CEPH_OUT_DIR/apache.conf
     done
 fi
+
+do_hitsets() {
+    while [ -n "$*" ]; do
+	pool="$1"
+	type="$2"
+	shift
+	shift
+	echo "setting hit_set on pool $pool type $type ..."
+	$CEPH_ADM osd pool set $pool hit_set_type $type
+	$CEPH_ADM osd pool set $pool hit_set_count 8
+	$CEPH_ADM osd pool set $pool hit_set_period 30
+    done
+}
+do_hitsets $hitset
 
 echo "started.  stop.sh to stop.  see out/* (e.g. 'tail -f out/????') for debug output."
 

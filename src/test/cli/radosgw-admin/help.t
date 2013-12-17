@@ -23,6 +23,9 @@
     bucket check               check bucket index
     object rm                  remove object
     object unlink              unlink object from bucket index
+    quota set                  set quota params
+    quota enable               enable quota
+    quota disable              disable quota
     region get                 show region info
     regions list               list all regions set on this cluster
     region set                 set region info (requires infile)
@@ -116,9 +119,16 @@
   
   <date> := "YYYY-MM-DD[ hh:mm:ss]"
   
-    --conf/-c        Read configuration from the given configuration file
-    --id/-i          set ID portion of my name
-    --name/-n        set name (TYPE.ID)
-    --version        show version and quit
+  Quota options:
+     --bucket                  specified bucket for quota command
+     --max-objects             specify max objects (negative value to disable)
+     --max-size                specify max size (in bytes, negative value to disable)
+     --quota-scope             scope of quota (bucket, user)
+  
+    --conf/-c FILE    read configuration from the given configuration file
+    --id/-i ID        set ID portion of my name
+    --name/-n TYPE.ID set name
+    --cluster NAME    set cluster name (default: ceph)
+    --version         show version and quit
   
   [1]

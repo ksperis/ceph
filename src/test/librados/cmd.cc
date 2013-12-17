@@ -57,6 +57,21 @@ TEST(LibRadosCmd, MonDescribe) {
   ASSERT_EQ(0, destroy_one_pool(pool_name, &cluster));
 }
 
+TEST(LibRadosCmd, MonDescribePP) {
+  Rados cluster;
+  std::string pool_name = get_temp_pool_name();
+  ASSERT_EQ("", create_one_pool_pp(pool_name, cluster));
+
+  bufferlist inbl, outbl;
+  string outs;
+  ASSERT_EQ(0, cluster.mon_command("{\"prefix\": \"get_command_descriptions\"}",
+				   inbl, &outbl, &outs));
+  ASSERT_LT(0u, outbl.length());
+  ASSERT_LE(0u, outs.length());
+
+  ASSERT_EQ(0, destroy_one_pool_pp(pool_name, cluster));
+}
+
 TEST(LibRadosCmd, OSDCmd) {
   rados_t cluster;
   std::string pool_name = get_temp_pool_name();
@@ -100,8 +115,9 @@ TEST(LibRadosCmd, PGCmd) {
   string pgid = stringify(poolid) + ".0";
 
   cmd[0] = (char *)"asdfasdf";
-  ASSERT_EQ(-22, rados_pg_command(cluster, pgid.c_str(), (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen));
-
+  // note: tolerate NXIO here in case the cluster is thrashing out underneath us.
+  int r = rados_pg_command(cluster, pgid.c_str(), (const char **)cmd, 1, "", 0, &buf, &buflen, &st, &stlen);
+  ASSERT_TRUE(r == -22 || r == -ENXIO);
 
   // make sure the pg exists on the osd before we query it
   rados_ioctx_t io;
@@ -114,7 +130,9 @@ TEST(LibRadosCmd, PGCmd) {
 
   string qstr = "{\"prefix\":\"pg\", \"cmd\":\"query\", \"pgid\":\"" +  pgid + "\"}";
   cmd[0] = (char *)qstr.c_str();
-  ASSERT_EQ(0, rados_pg_command(cluster, pgid.c_str(), (const char **)cmd, 1, "", 0,  &buf, &buflen, &st, &stlen));
+  // note: tolerate ENOENT/ENXIO here if hte osd is thrashing out underneath us
+  r = rados_pg_command(cluster, pgid.c_str(), (const char **)cmd, 1, "", 0,  &buf, &buflen, &st, &stlen);
+  ASSERT_TRUE(r == 0 || r == -ENOENT || r == -ENXIO);
 
   ASSERT_LT(0u, buflen);
   rados_buffer_free(buf);

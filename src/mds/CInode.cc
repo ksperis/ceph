@@ -458,13 +458,6 @@ frag_t CInode::pick_dirfrag(const string& dn)
 bool CInode::get_dirfrags_under(frag_t fg, list<CDir*>& ls)
 {
   bool all = true;
-  for (map<frag_t,CDir*>::iterator p = dirfrags.begin(); p != dirfrags.end(); ++p) {
-    if (fg.contains(p->first))
-      ls.push_back(p->second);
-    else
-      all = false;
-  }
-  /*
   list<frag_t> fglist;
   dirfragtree.get_leaves_under(fg, fglist);
   for (list<frag_t>::iterator p = fglist.begin();
@@ -474,7 +467,6 @@ bool CInode::get_dirfrags_under(frag_t fg, list<CDir*>& ls)
       ls.push_back(dirfrags[*p]);
     else 
       all = false;
-  */
   return all;
 }
 
@@ -682,6 +674,12 @@ void CInode::last_put()
     parent->put(CDentry::PIN_INODEPIN);
 }
 
+void CInode::_put()
+{
+  if (get_num_ref() == (int)is_dirty() + (int)is_dirty_parent())
+    mdcache->maybe_eval_stray(this, true);
+}
+
 void CInode::add_remote_parent(CDentry *p) 
 {
   if (remote_parents.empty())
@@ -875,6 +873,7 @@ struct C_Inode_Stored : public Context {
   Context *fin;
   C_Inode_Stored(CInode *i, version_t v, Context *f) : in(i), version(v), fin(f) {}
   void finish(int r) {
+    assert(r == 0);
     in->_stored(version, fin);
   }
 };
@@ -1004,6 +1003,7 @@ struct C_Inode_StoredBacktrace : public Context {
   Context *fin;
   C_Inode_StoredBacktrace(CInode *i, version_t v, Context *f) : in(i), version(v), fin(f) {}
   void finish(int r) {
+    assert(r == 0);
     in->_stored_backtrace(version, fin);
   }
 };
@@ -1073,7 +1073,6 @@ void CInode::_stored_backtrace(version_t v, Context *fin)
     clear_dirty_parent();
   if (fin)
     fin->complete(0);
-  mdcache->maybe_eval_stray(this);
 }
 
 void CInode::_mark_dirty_parent(LogSegment *ls, bool dirty_pool)
@@ -1156,6 +1155,7 @@ void CInode::encode_lock_state(int type, bufferlist& bl)
 
   switch (type) {
   case CEPH_LOCK_IAUTH:
+    ::encode(inode.version, bl);
     ::encode(inode.ctime, bl);
     ::encode(inode.mode, bl);
     ::encode(inode.uid, bl);
@@ -1163,13 +1163,16 @@ void CInode::encode_lock_state(int type, bufferlist& bl)
     break;
     
   case CEPH_LOCK_ILINK:
+    ::encode(inode.version, bl);
     ::encode(inode.ctime, bl);
     ::encode(inode.nlink, bl);
     ::encode(inode.anchored, bl);
     break;
     
   case CEPH_LOCK_IDFT:
-    if (!is_auth()) {
+    if (is_auth()) {
+      ::encode(inode.version, bl);
+    } else {
       bool dirty = dirfragtreelock.is_dirty();
       ::encode(dirty, bl);
     }
@@ -1192,6 +1195,7 @@ void CInode::encode_lock_state(int type, bufferlist& bl)
     
   case CEPH_LOCK_IFILE:
     if (is_auth()) {
+      ::encode(inode.version, bl);
       ::encode(inode.mtime, bl);
       ::encode(inode.atime, bl);
       ::encode(inode.time_warp_seq, bl);
@@ -1234,7 +1238,9 @@ void CInode::encode_lock_state(int type, bufferlist& bl)
     break;
 
   case CEPH_LOCK_INEST:
-    if (!is_auth()) {
+    if (is_auth()) {
+      ::encode(inode.version, bl);
+    } else {
       bool dirty = nestlock.is_dirty();
       ::encode(dirty, bl);
     }
@@ -1269,20 +1275,24 @@ void CInode::encode_lock_state(int type, bufferlist& bl)
     break;
     
   case CEPH_LOCK_IXATTR:
+    ::encode(inode.version, bl);
     ::encode(xattrs, bl);
     break;
 
   case CEPH_LOCK_ISNAP:
+    ::encode(inode.version, bl);
     encode_snap(bl);
     break;
 
   case CEPH_LOCK_IFLOCK:
+    ::encode(inode.version, bl);
     ::encode(fcntl_locks, bl);
     ::encode(flock_locks, bl);
     break;
 
   case CEPH_LOCK_IPOLICY:
     if (inode.is_dir()) {
+      ::encode(inode.version, bl);
       ::encode(inode.layout, bl);
     }
     break;
@@ -1315,6 +1325,7 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
 
   switch (type) {
   case CEPH_LOCK_IAUTH:
+    ::decode(inode.version, p);
     ::decode(tm, p);
     if (inode.ctime < tm) inode.ctime = tm;
     ::decode(inode.mode, p);
@@ -1323,6 +1334,7 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
     break;
 
   case CEPH_LOCK_ILINK:
+    ::decode(inode.version, p);
     ::decode(tm, p);
     if (inode.ctime < tm) inode.ctime = tm;
     ::decode(inode.nlink, p);
@@ -1342,6 +1354,8 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
 	dout(10) << "decode_lock_state setting dftlock dirty flag" << dendl;
 	dirfragtreelock.mark_dirty();  // ok bc we're auth and caller will handle
       }
+    } else {
+      ::decode(inode.version, p);
     }
     {
       fragtree_t temp;
@@ -1377,6 +1391,7 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
 
   case CEPH_LOCK_IFILE:
     if (!is_auth()) {
+      ::decode(inode.version, p);
       ::decode(inode.mtime, p);
       ::decode(inode.atime, p);
       ::decode(inode.time_warp_seq, p);
@@ -1459,6 +1474,8 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
 	dout(10) << "decode_lock_state setting nestlock dirty flag" << dendl;
 	nestlock.mark_dirty();  // ok bc we're auth and caller will handle
       }
+    } else {
+      ::decode(inode.version, p);
     }
     {
       nest_info_t rstat;
@@ -1521,11 +1538,13 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
     break;
 
   case CEPH_LOCK_IXATTR:
+    ::decode(inode.version, p);
     ::decode(xattrs, p);
     break;
 
   case CEPH_LOCK_ISNAP:
     {
+      ::decode(inode.version, p);
       snapid_t seq = 0;
       if (snaprealm)
 	seq = snaprealm->srnode.seq;
@@ -1536,12 +1555,14 @@ void CInode::decode_lock_state(int type, bufferlist& bl)
     break;
 
   case CEPH_LOCK_IFLOCK:
+    ::decode(inode.version, p);
     ::decode(fcntl_locks, p);
     ::decode(flock_locks, p);
     break;
 
   case CEPH_LOCK_IPOLICY:
     if (inode.is_dir()) {
+      ::decode(inode.version, p);
       ::decode(inode.layout, p);
     }
     break;
@@ -1771,7 +1792,7 @@ void CInode::finish_scatter_gather_update(int type)
 	CDir *dir = p->second;
 	dout(20) << fg << " " << *dir << dendl;
 
-	bool update = dir->is_auth() && !dir->is_frozen();
+	bool update = dir->is_auth() && dir->get_version() != 0 &&  !dir->is_frozen();
 
 	fnode_t *pf = dir->get_projected_fnode();
 	if (update)
@@ -1852,7 +1873,7 @@ void CInode::finish_scatter_gather_update(int type)
 	CDir *dir = p->second;
 	dout(20) << fg << " " << *dir << dendl;
 
-	bool update = dir->is_auth() && !dir->is_frozen();
+	bool update = dir->is_auth() && dir->get_version() != 0 && !dir->is_frozen();
 
 	fnode_t *pf = dir->get_projected_fnode();
 	if (update)
@@ -1939,7 +1960,7 @@ void CInode::finish_scatter_gather_update_accounted(int type, Mutation *mut, EMe
        p != dirfrags.end();
        ++p) {
     CDir *dir = p->second;
-    if (!dir->is_auth() || dir->is_frozen())
+    if (!dir->is_auth() || dir->get_version() == 0 || dir->is_frozen())
       continue;
     
     if (type == CEPH_LOCK_IDFT)
@@ -2075,7 +2096,7 @@ void CInode::clear_ambiguous_auth()
 
 // auth_pins
 bool CInode::can_auth_pin() {
-  if (is_freezing_inode() || is_frozen_inode() || is_frozen_auth_pin())
+  if (!is_auth() || is_freezing_inode() || is_frozen_inode() || is_frozen_auth_pin())
     return false;
   if (parent)
     return parent->can_auth_pin();
@@ -2465,8 +2486,10 @@ Capability *CInode::add_client_cap(client_t client, Session *session, SnapRealm 
   Capability *cap = new Capability(this, ++mdcache->last_cap_id, client);
   assert(client_caps.count(client) == 0);
   client_caps[client] = cap;
-  if (session)
-    session->add_cap(cap);
+
+  session->add_cap(cap);
+  if (session->is_stale())
+    cap->mark_stale();
   
   cap->client_follows = first-1;
   
@@ -2534,8 +2557,8 @@ Capability *CInode::reconnect_cap(client_t client, ceph_mds_cap_reconnect& icr, 
     cap->set_wanted(icr.wanted);
     cap->issue_norevoke(icr.issued);
     cap->reset_seq();
+    cap->set_cap_id(icr.cap_id);
   }
-  cap->set_cap_id(icr.cap_id);
   cap->set_last_issue_stamp(ceph_clock_now(g_ceph_context));
   return cap;
 }

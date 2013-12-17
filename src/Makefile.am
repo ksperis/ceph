@@ -58,9 +58,9 @@ bin_PROGRAMS += ceph-mds
 mount_ceph_SOURCES = mount/mount.ceph.c
 mount_ceph_LDADD = $(LIBCOMMON)
 if LINUX
-sbin_PROGRAMS += mount.ceph
+su_sbin_PROGRAMS += mount.ceph
 endif # LINUX
-sbin_SCRIPTS += mount.fuse.ceph
+su_sbin_SCRIPTS += mount.fuse.ceph
 
 cephfs_SOURCES = cephfs.cc
 cephfs_LDADD = $(LIBCOMMON)
@@ -75,8 +75,8 @@ ceph_syn_SOURCES += client/SyntheticClient.cc # uses g_conf.. needs cleanup
 ceph_syn_LDADD = $(LIBCLIENT) $(CEPH_GLOBAL)
 bin_PROGRAMS += ceph-syn
 
-rbd_SOURCES = rbd.cc 
-rbd_LDADD = $(LIBRBD) $(LIBRADOS) $(CEPH_GLOBAL)
+rbd_SOURCES = rbd.cc
+rbd_LDADD = $(LIBRBD) $(LIBRADOS) $(CEPH_GLOBAL) -lblkid
 if LINUX
 bin_PROGRAMS += rbd
 endif #LINUX
@@ -112,7 +112,7 @@ libcephfs_jni_la_SOURCES = \
 	java/native/JniConstants.cpp \
 	java/native/JniConstants.h
 libcephfs_jni_la_LIBADD = $(LIBCEPHFS) $(EXTRALIBS)
-libcephfs_jni_la_CPPFLAGS = $(JDK_CPPFLAGS)
+libcephfs_jni_la_CPPFLAGS = $(JDK_CPPFLAGS) $(AM_CPPFLAGS)
 libcephfs_jni_la_LDFLAGS = ${AM_LDFLAGS} -version-info 1:0:0
 lib_LTLIBRARIES += libcephfs_jni.la
 endif
@@ -128,7 +128,7 @@ editpaths = sed \
 	-e 's|@datadir[@]|$(pkgdatadir)|g' \
 	-e 's|@prefix[@]|$(prefix)|g' \
 	-e 's|@@GCOV_PREFIX_STRIP[@][@]|$(GCOV_PREFIX_STRIP)|g'
-shell_scripts = ceph-debugpack ceph-post-file
+shell_scripts = ceph-debugpack ceph-post-file ceph-crush-location
 $(shell_scripts): Makefile
 $(shell_scripts): %: %.in
 	rm -f $@ $@.tmp
@@ -224,6 +224,7 @@ EXTRA_DIST += \
 	ceph-disk-udev \
 	ceph-create-keys \
 	ceph-rest-api \
+	ceph-crush-location \
 	mount.fuse.ceph \
 	rbdmap \
 	unittest_bufferlist.sh \
@@ -280,10 +281,11 @@ bin_SCRIPTS += \
 	ceph-clsinfo \
 	ceph-debugpack \
 	ceph-rbdnamer \
-	ceph-post-file
+	ceph-post-file \
+	ceph-crush-location
 
 BUILT_SOURCES += init-ceph
-sbin_SCRIPTS += mkcephfs
+su_sbin_SCRIPTS += mkcephfs
 
 shell_scripts += init-ceph mkcephfs
 
@@ -295,10 +297,11 @@ shell_scripts += init-ceph mkcephfs
 # executables built, you need to replace this with manual assignments
 # target by target
 
-TESTS = $(check_PROGRAMS) unittest_bufferlist.sh
+TESTS = \
+	$(check_PROGRAMS) \
+	$(check_SCRIPTS)
 
 check-local:
-	$(srcdir)/test/encoding/check-generated.sh
 	$(srcdir)/test/encoding/readable.sh ../ceph-object-corpus
 
 
@@ -338,12 +341,12 @@ CLEANFILES += ceph_ver.h sample.fetch_config
 
 ceph: ceph.in ./ceph_ver.h Makefile
 	rm -f $@ $@.tmp
-	echo "#!/usr/bin/python" >$@.tmp
+	echo "#!/usr/bin/env python" >$@.tmp
 	grep "#define CEPH_GIT_NICE_VER" ./ceph_ver.h | \
 		sed -e 's/#define \(.*VER\) /\1=/' >>$@.tmp
 	grep "#define CEPH_GIT_VER" ./ceph_ver.h | \
 	  sed -e 's/#define \(.*VER\) /\1=/' -e 's/=\(.*\)$$/="\1"/' >>$@.tmp
-	cat $@.in >>$@.tmp
+	cat $(srcdir)/$@.in >>$@.tmp
 	chmod a+x $@.tmp
 	chmod a-w $@.tmp
 	mv $@.tmp $@
@@ -351,7 +354,8 @@ ceph: ceph.in ./ceph_ver.h Makefile
 # cleaning
 
 clean-local:
-	-rm *.so *.gcno *.gcda
+	rm -f *.so *.gcno *.gcda
+	rm -f ceph java/java/com/ceph/crush/Bucket.class
 
 
 # pybind

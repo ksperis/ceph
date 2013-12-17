@@ -18,10 +18,10 @@ rados_include_DATA = \
 	$(srcdir)/include/crc32c.h
 
 noinst_HEADERS += \
-	include/bloom_filter.hpp \
 	include/Context.h \
 	include/CompatSet.h \
 	include/Distribution.h \
+	include/Spinlock.h \
 	include/addr_parsing.h \
 	include/assert.h \
 	include/atomic.h \
@@ -44,6 +44,7 @@ noinst_HEADERS += \
 	include/filepath.h \
 	include/frag.h \
 	include/hash.h \
+	include/histogram.h \
 	include/intarith.h \
 	include/interval_set.h \
 	include/int_types.h \
@@ -77,4 +78,5 @@ noinst_HEADERS += \
 	include/rbd/features.h \
 	include/rbd/librbd.h \
 	include/rbd/librbd.hpp\
-	include/util.h
+	include/util.h\
+	include/stat.h

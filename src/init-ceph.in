@@ -80,7 +80,7 @@ stop_daemon() {
     action=$5
     [ -z "$action" ] && action="Stopping"
     echo -n "$action Ceph $name on $host..."
-    do_cmd "while [ 1 ]; do 
+    do_cmd "while [ 1 ]; do
 	[ -e $pidfile ] || break
 	pid=\`cat $pidfile\`
 	while [ -e /proc/\$pid ] && grep -q $daemon /proc/\$pid/cmdline ; do
@@ -172,6 +172,14 @@ command=$1
 get_local_name_list
 get_name_list "$@"
 
+# Reverse the order if we are stopping
+if [ "$command" = "stop" ]; then
+    for f in $what; do
+       new_order="$f $new_order"
+    done
+    what="$new_order"
+fi
+
 for name in $what; do
     type=`echo $name | cut -c 1-3`   # e.g. 'mon', if $item is 'mon1'
     id=`echo $name | cut -c 4- | sed 's/^\\.//'`
@@ -251,18 +259,18 @@ for name in $what; do
 	    wrap=""
 	    runmode=""
 	    runarg=""
-	    
+
 	    [ -z "$docrun" ] && get_conf_bool docrun "0" "restart on core dump"
 	    [ "$docrun" -eq 1 ] && wrap="$BINDIR/ceph-run"
-	    
+
 	    [ -z "$dovalgrind" ] && get_conf_bool valgrind "" "valgrind"
 	    [ -n "$valgrind" ] && wrap="$wrap valgrind $valgrind"
-	    
+
 	    [ -n "$wrap" ] && runmode="-f &" && runarg="-f"
 	    [ -n "$max_open_files" ] && files="ulimit -n $max_open_files;"
 
 	    cmd="$files $wrap $cmd $runmode"
-	    
+
 	    if [ $dofsmount -eq 1 ] && [ -n "$fs_devs" ]; then
 		get_conf pre_mount "true" "pre mount command"
 		get_conf fs_type "" "osd mkfs type"
@@ -309,28 +317,29 @@ for name in $what; do
 
 	    if [ "$type" = "osd" ]; then
 		get_conf update_crush "" "osd crush update on start"
-		if [ "${update_crush:-1}" = "1" -o "{$update_crush:-1}" = "true" ]; then
-		    # update location in crush; put in some suitable defaults on the
-                    # command line, ceph.conf can override what it wants
-		    get_conf osd_location "" "osd crush location"
+		if [ "${update_crush:-1}" = "1" -o "${update_crush:-1}" = "true" ]; then
+		    # update location in crush
+		    get_conf osd_location_hook "$BINDIR/ceph-crush-location" "osd crush location hook"
+		    osd_location=`$osd_location_hook --cluster ceph --id $id --type osd`
 		    get_conf osd_weight "" "osd crush initial weight"
+<<<<<<< HEAD
 		    defaultweight="$(do_cmd "df $osd_data/. | tail -1 | awk '{ d= \$2/1073741824 ; r = sprintf(\"%.2f\", d); print r }'")"
 <<<<<<< HEAD
 
 =======
 >>>>>>> 59147be9aeea47576884e5587dd7da8bb58c6c53
+=======
+		    defaultweight="$(do_cmd "df -P -k $osd_data/. | tail -1 | awk '{ d= \$2/1073741824 ; r = sprintf(\"%.2f\", d); print r }'")"
+>>>>>>> 6f431200e393434475200b921f98c76dccde56e2
 		    get_conf osd_keyring "$osd_data/keyring" "keyring"
-		    do_cmd "$BINDIR/ceph \
+		    do_cmd "timeout 10 $BINDIR/ceph \
 			--name=osd.$id \
 			--keyring=$osd_keyring \
 			osd crush create-or-move \
 			-- \
 			$id \
 			${osd_weight:-${defaultweight:-1}} \
-			root=default \
-			host=$host \
-			$osd_location \
-			|| :"
+			$osd_location"
 		fi
 	    fi
 
@@ -365,7 +374,7 @@ for name in $what; do
 	    [ -n "$post_start" ] && do_cmd "$post_start"
 	    [ -n "$lockfile" ] && [ "$?" -eq 0 ] && touch $lockfile
 	    ;;
-	
+
 	stop)
 	    get_conf pre_stop "" "pre stop command"
 	    get_conf post_stop "" "post stop command"
@@ -406,13 +415,13 @@ for name in $what; do
 	    [ -n "$post_forcestop" ] && do_cmd "$post_forcestop"
 	    [ -n "$lockfile" ] && [ "$?" -eq 0 ] && rm -f $lockfile
 	    ;;
-	    
+
 	killall)
 	    echo "killall ceph-$type on $host"
 	    do_cmd "pkill ^ceph-$type || true"
 	    [ -n "$lockfile" ] && [ "$?" -eq 0 ] && rm -f $lockfile
 	    ;;
-	
+
 	force-reload | reload)
 	    signal_daemon $name ceph-$type $pid_file -1 "Reloading"
 	    ;;

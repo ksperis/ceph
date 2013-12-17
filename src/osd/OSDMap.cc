@@ -673,18 +673,18 @@ void OSDMap::get_all_osds(set<int32_t>& ls) const
       ls.insert(i);
 }
 
-int OSDMap::get_num_up_osds() const
+unsigned OSDMap::get_num_up_osds() const
 {
-  int n = 0;
+  unsigned n = 0;
   for (int i=0; i<max_osd; i++)
     if ((osd_state[i] & CEPH_OSD_EXISTS) &&
 	(osd_state[i] & CEPH_OSD_UP)) n++;
   return n;
 }
 
-int OSDMap::get_num_in_osds() const
+unsigned OSDMap::get_num_in_osds() const
 {
-  int n = 0;
+  unsigned n = 0;
   for (int i=0; i<max_osd; i++)
     if ((osd_state[i] & CEPH_OSD_EXISTS) &&
 	get_weight(i) != CEPH_OSD_OUT) n++;
@@ -744,13 +744,15 @@ bool OSDMap::find_osd_on_ip(const entity_addr_t& ip) const
 
 uint64_t OSDMap::get_features(uint64_t *pmask) const
 {
-  uint64_t features = 0;
-  uint64_t mask = 0;
+  uint64_t features = 0;  // things we actually have
+  uint64_t mask = 0;      // things we could have
 
   if (crush->has_nondefault_tunables())
     features |= CEPH_FEATURE_CRUSH_TUNABLES;
   if (crush->has_nondefault_tunables2())
     features |= CEPH_FEATURE_CRUSH_TUNABLES2;
+  if (crush->has_v2_rules())
+    features |= CEPH_FEATURE_CRUSH_V2;
   mask |= CEPH_FEATURES_CRUSH;
 
   for (map<int64_t,pg_pool_t>::const_iterator p = pools.begin(); p != pools.end(); ++p) {
@@ -762,7 +764,7 @@ uint64_t OSDMap::get_features(uint64_t *pmask) const
       features |= CEPH_FEATURE_OSD_CACHEPOOL;
     }
   }
-  mask |= CEPH_FEATURE_OSDHASHPSPOOL;
+  mask |= CEPH_FEATURE_OSDHASHPSPOOL | CEPH_FEATURE_OSD_CACHEPOOL;
 
   if (pmask)
     *pmask = mask;
@@ -988,13 +990,6 @@ int OSDMap::apply_incremental(const Incremental &inc)
   return 0;
 }
 
-static string make_hash_str(const string &inkey, const string &nspace)
-{
-  if (nspace.empty())
-    return inkey;
-  return nspace + '\037' + inkey;
-}
-
 // mapping
 int OSDMap::object_locator_to_pg(
 	const object_t& oid,
@@ -1006,13 +1001,14 @@ int OSDMap::object_locator_to_pg(
   if (!pool)
     return -ENOENT;
   ps_t ps;
-  string key;
-  if (!loc.key.empty())
-    key = make_hash_str(loc.key, loc.nspace);
-  else
-    key = make_hash_str(oid.name, loc.nspace);
-
-  ps = ceph_str_hash(pool->object_hash, key.c_str(), key.length());
+  if (loc.hash >= 0) {
+    ps = loc.hash;
+  } else {
+    if (!loc.key.empty())
+      ps = pool->hash_key(loc.key, loc.nspace);
+    else
+      ps = pool->hash_key(oid.name, loc.nspace);
+  }
   pg = pg_t(ps, loc.get_pool(), -1);
   return 0;
 }
@@ -1029,20 +1025,28 @@ ceph_object_layout OSDMap::make_object_layout(
   return ol;
 }
 
-void OSDMap::_remove_nonexistent_osds(vector<int>& osds) const
+void OSDMap::_remove_nonexistent_osds(const pg_pool_t& pool,
+				      vector<int>& osds) const
 {
-  unsigned removed = 0;
-  for (unsigned i = 0; i < osds.size(); i++) {
-    if (!exists(osds[i])) {
-      removed++;
-      continue;
+  if (pool.can_shift_osds()) {
+    unsigned removed = 0;
+    for (unsigned i = 0; i < osds.size(); i++) {
+      if (!exists(osds[i])) {
+	removed++;
+	continue;
+      }
+      if (removed) {
+	osds[i - removed] = osds[i];
+      }
     }
-    if (removed) {
-      osds[i - removed] = osds[i];
+    if (removed)
+      osds.resize(osds.size() - removed);
+  } else {
+    for (vector<int>::iterator p = osds.begin(); p != osds.end(); ++p) {
+      if (!exists(*p))
+	*p = CRUSH_ITEM_NONE;
     }
   }
-  if (removed)
-    osds.resize(osds.size() - removed);
 }
 
 int OSDMap::_pg_to_osds(const pg_pool_t& pool, pg_t pg, vector<int>& osds) const
@@ -1056,7 +1060,7 @@ int OSDMap::_pg_to_osds(const pg_pool_t& pool, pg_t pg, vector<int>& osds) const
   if (ruleno >= 0)
     crush->do_rule(ruleno, pps, osds, size, osd_weight);
 
-  _remove_nonexistent_osds(osds);
+  _remove_nonexistent_osds(pool, osds);
 
   return osds.size();
 }
@@ -1828,6 +1832,21 @@ void OSDMap::build_simple(CephContext *cct, epoch_t e, uuid_d &fsid,
   }
 }
 
+int OSDMap::_build_crush_types(CrushWrapper& crush)
+{
+  crush.set_type_name(0, "osd");
+  crush.set_type_name(1, "host");
+  crush.set_type_name(2, "chassis");
+  crush.set_type_name(3, "rack");
+  crush.set_type_name(4, "row");
+  crush.set_type_name(5, "pdu");
+  crush.set_type_name(6, "pod");
+  crush.set_type_name(7, "room");
+  crush.set_type_name(8, "datacenter");
+  crush.set_type_name(9, "region");
+  crush.set_type_name(10, "root");
+  return 10;
+}
 
 void OSDMap::build_simple_crush_map(CephContext *cct, CrushWrapper& crush,
 				    map<int, const char*>& rulesets, int nosd)
@@ -1836,17 +1855,11 @@ void OSDMap::build_simple_crush_map(CephContext *cct, CrushWrapper& crush,
 
   crush.create();
 
-  crush.set_type_name(0, "osd");
-  crush.set_type_name(1, "host");
-  crush.set_type_name(2, "rack");
-  crush.set_type_name(3, "row");
-  crush.set_type_name(4, "room");
-  crush.set_type_name(5, "datacenter");
-  crush.set_type_name(6, "root");
-
   // root
+  int root_type = _build_crush_types(crush);
   int rootid;
-  int r = crush.add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT, 6 /* pool */, 0, NULL, NULL, &rootid);
+  int r = crush.add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT,
+			   root_type, 0, NULL, NULL, &rootid);
   assert(r == 0);
   crush.set_item_name(rootid, "default");
 
@@ -1871,7 +1884,7 @@ void OSDMap::build_simple_crush_map(CephContext *cct, CrushWrapper& crush,
     assert(rule);
     crush_rule_set_step(rule, 0, CRUSH_RULE_TAKE, rootid, 0);
     crush_rule_set_step(rule, 1,
-			cct->_conf->osd_crush_chooseleaf_type ? CRUSH_RULE_CHOOSE_LEAF_FIRSTN : CRUSH_RULE_CHOOSE_FIRSTN,
+			cct->_conf->osd_crush_chooseleaf_type ? CRUSH_RULE_CHOOSELEAF_FIRSTN : CRUSH_RULE_CHOOSE_FIRSTN,
 			CRUSH_CHOOSE_N,
 			cct->_conf->osd_crush_chooseleaf_type);
     crush_rule_set_step(rule, 2, CRUSH_RULE_EMIT, 0, 0);
@@ -1966,19 +1979,13 @@ void OSDMap::build_simple_crush_map_from_conf(CephContext *cct, CrushWrapper& cr
 
   crush.create();
 
-  crush.set_type_name(0, "osd");
-  crush.set_type_name(1, "host");
-  crush.set_type_name(2, "rack");
-  crush.set_type_name(3, "row");
-  crush.set_type_name(4, "room");
-  crush.set_type_name(5, "datacenter");
-  crush.set_type_name(6, "root");
-
   set<string> hosts, racks;
 
   // root
+  int root_type = _build_crush_types(crush);
   int rootid;
-  int r = crush.add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT, 6 /* pool */, 0, NULL, NULL, &rootid);
+  int r = crush.add_bucket(0, CRUSH_BUCKET_STRAW, CRUSH_HASH_DEFAULT,
+			   root_type, 0, NULL, NULL, &rootid);
   assert(r == 0);
   crush.set_item_name(rootid, "default");
 
@@ -2040,10 +2047,10 @@ void OSDMap::build_simple_crush_map_from_conf(CephContext *cct, CrushWrapper& cr
 
     if (racks.size() > 3) {
       // spread replicas across hosts
-      crush_rule_set_step(rule, 1, CRUSH_RULE_CHOOSE_LEAF_FIRSTN, CRUSH_CHOOSE_N, 2);
+      crush_rule_set_step(rule, 1, CRUSH_RULE_CHOOSELEAF_FIRSTN, CRUSH_CHOOSE_N, 2);
     } else if (hosts.size() > 1) {
       // spread replicas across hosts
-      crush_rule_set_step(rule, 1, CRUSH_RULE_CHOOSE_LEAF_FIRSTN, CRUSH_CHOOSE_N, 1);
+      crush_rule_set_step(rule, 1, CRUSH_RULE_CHOOSELEAF_FIRSTN, CRUSH_CHOOSE_N, 1);
     } else {
       // just spread across osds
       crush_rule_set_step(rule, 1, CRUSH_RULE_CHOOSE_FIRSTN, CRUSH_CHOOSE_N, 0);

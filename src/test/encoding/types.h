@@ -4,6 +4,10 @@ TYPE(CompatSet)
 #include "include/filepath.h"
 TYPE(filepath)
 
+#include "common/bloom_filter.hpp"
+TYPE(bloom_filter)
+TYPE(compressible_bloom_filter)
+
 #include "common/snap_types.h"
 TYPE(SnapContext)
 TYPE(SnapRealmInfo)
@@ -16,6 +20,9 @@ TYPE(LogEntryKey)
 TYPE(LogEntry)
 TYPE(LogSummary)
 
+#include "common/SloppyCRCMap.h"
+TYPE(SloppyCRCMap)
+
 #include "msg/msg_types.h"
 TYPE(entity_name_t)
 TYPE(entity_addr_t)
@@ -27,7 +34,10 @@ TYPEWITHSTRAYDATA(OSDMap)
 TYPEWITHSTRAYDATA(OSDMap::Incremental)
 
 #include "crush/CrushWrapper.h"
-TYPE(CrushWrapper)
+TYPE_NOCOPY(CrushWrapper)
+
+#include "include/histogram.h"
+TYPE(pow2_hist_t)
 
 #include "osd/osd_types.h"
 TYPE(osd_reqid_t)
@@ -35,7 +45,6 @@ TYPE(object_locator_t)
 TYPE(request_redirect_t)
 TYPE(pg_t)
 TYPE(coll_t)
-TYPE(pow2_hist_t)
 TYPE(filestore_perf_stat_t)
 TYPE(osd_stat_t)
 TYPE(OSDSuperblock)
@@ -55,6 +64,7 @@ TYPE(pg_missing_t::item)
 TYPE(pg_missing_t)
 TYPE(pg_ls_response_t)
 TYPE(object_copy_cursor_t)
+TYPE(object_copy_data_t)
 TYPE(pg_create_t)
 TYPE(watch_info_t)
 TYPE(object_info_t)
@@ -63,12 +73,21 @@ TYPE(ObjectRecoveryInfo)
 TYPE(ObjectRecoveryProgress)
 TYPE(ScrubMap::object)
 TYPE(ScrubMap)
+TYPE(pg_hit_set_info_t)
+TYPE(pg_hit_set_history_t)
 TYPE(osd_peer_stat_t)
 TYPE(clone_info)
 TYPE(obj_list_snap_response_t)
 TYPE(PullOp)
 TYPE(PushOp)
 TYPE(PushReplyOp)
+
+#include "osd/HitSet.h"
+TYPE(ExplicitHashHitSet)
+TYPE(ExplicitObjectHitSet)
+TYPE(BloomHitSet)
+TYPE(HitSet)
+TYPE(HitSet::Params)
 
 #include "os/ObjectStore.h"
 TYPE(ObjectStore::Transaction)
@@ -78,6 +97,7 @@ TYPE(SequencerPosition)
 
 #include "common/hobject.h"
 TYPE(hobject_t)
+TYPE(ghobject_t)
 
 #include "mon/AuthMonitor.h"
 TYPE(AuthMonitor::Incremental)
@@ -132,7 +152,7 @@ TYPE_FEATUREFUL(MDSMap)
 TYPE_FEATUREFUL(MDSMap::mds_info_t)
 
 #include "mds/Capability.h"
-TYPE(Capability)
+TYPE_NOCOPY(Capability)
 
 #include "mds/AnchorServer.h"
 TYPE(AnchorServer)
@@ -151,7 +171,7 @@ TYPE(EImportFinish)
 #include "mds/events/EImportStart.h"
 TYPE(EImportStart)
 #include "mds/events/EMetaBlob.h"
-TYPE(EMetaBlob::fullbit)
+TYPE_NOCOPY(EMetaBlob::fullbit)
 TYPE(EMetaBlob::remotebit)
 TYPE(EMetaBlob::nullbit)
 TYPE(EMetaBlob::dirlump)

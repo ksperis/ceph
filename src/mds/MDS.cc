@@ -588,6 +588,7 @@ void MDS::tick()
   
   if (is_active()) {
     balancer->tick();
+    mdcache->migrator->find_stale_export_freeze();
     if (snapserver)
       snapserver->check_osd_map(false);
   }
@@ -800,7 +801,9 @@ void MDS::handle_command(MMonCommand *m)
      clog.info() << "tcmalloc not enabled, can't use heap profiler commands\n";
    else {
      ostringstream ss;
-     ceph_heap_profiler_handle_command(m->cmd, ss);
+     vector<std::string> cmdargs;
+     cmdargs.insert(cmdargs.begin(), m->cmd.begin()+1, m->cmd.end());
+     ceph_heap_profiler_handle_command(cmdargs, ss);
      clog.info() << ss.str();
    }
  } else dout(0) << "unrecognized command! " << m->cmd << dendl;
@@ -993,7 +996,8 @@ void MDS::handle_mds_map(MMDSMap *m)
   
   // RESOLVE
   // is someone else newly resolving?
-  if (is_resolve() || is_rejoin() || is_clientreplay() || is_active() || is_stopping()) {
+  if (is_resolve() || is_reconnect() || is_rejoin() ||
+      is_clientreplay() || is_active() || is_stopping()) {
     if (!oldmap->is_resolving() && mdsmap->is_resolving()) {
       set<int> resolve;
       mdsmap->get_mds_set(resolve, MDSMap::STATE_RESOLVE);
@@ -1523,7 +1527,6 @@ void MDS::active_start()
     mdcache->open_root();
 
   mdcache->clean_open_file_lists();
-  mdcache->scan_stray_dir();
   mdcache->export_remaining_imported_caps();
   finish_contexts(g_ceph_context, waiting_for_replay);  // kick waiters
   finish_contexts(g_ceph_context, waiting_for_active);  // kick waiters

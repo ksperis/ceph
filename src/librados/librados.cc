@@ -269,6 +269,12 @@ void librados::ObjectReadOperation::list_snaps(
   o->list_snaps(out_snaps, prval);
 }
 
+void librados::ObjectReadOperation::is_dirty(bool *is_dirty, int *prval)
+{
+  ::ObjectOperation *o = (::ObjectOperation *)impl;
+  o->is_dirty(is_dirty, prval);
+}
+
 int librados::IoCtx::omap_get_vals(const std::string& oid,
                                    const std::string& start_after,
                                    const std::string& filter_prefix,
@@ -390,6 +396,12 @@ void librados::ObjectWriteOperation::copy_from(const std::string& src,
   o->copy_from(object_t(src), src_ioctx.io_ctx_impl->snap_seq, src_ioctx.io_ctx_impl->oloc, src_version);
 }
 
+void librados::ObjectWriteOperation::undirty()
+{
+  ::ObjectOperation *o = (::ObjectOperation *)impl;
+  o->undirty();
+}
+
 void librados::ObjectWriteOperation::tmap_put(const bufferlist &bl)
 {
   ::ObjectOperation *o = (::ObjectOperation *)impl;
@@ -490,6 +502,11 @@ void librados::ObjectIterator::get_next()
   }
 
   cur_obj = make_pair(entry, key ? key : string());
+}
+
+uint32_t librados::ObjectIterator::get_pg_hash_position() const
+{
+  return ctx->lc->get_pg_hash_position();
 }
 
 const librados::ObjectIterator librados::ObjectIterator::__EndObjectIterator(NULL);
@@ -958,6 +975,8 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
     op_flags |= CEPH_OSD_FLAG_BALANCE_READS;
   if (flags & OPERATION_LOCALIZE_READS)
     op_flags |= CEPH_OSD_FLAG_LOCALIZE_READS;
+  if (flags & OPERATION_ORDER_READS_WRITES)
+    op_flags |= CEPH_OSD_FLAG_RWORDERED;
 
   return io_ctx_impl->aio_operate_read(obj, (::ObjectOperation*)o->impl, c->pc,
 				       op_flags, pbl);
@@ -1119,6 +1138,20 @@ const librados::ObjectIterator& librados::IoCtx::objects_end() const
 {
   return ObjectIterator::__EndObjectIterator;
 }
+
+int librados::IoCtx::hit_set_list(uint32_t hash, AioCompletion *c,
+				  std::list< std::pair<time_t, time_t> > *pls)
+{
+  return io_ctx_impl->hit_set_list(hash, c->pc, pls);
+}
+
+int librados::IoCtx::hit_set_get(uint32_t hash,  AioCompletion *c, time_t stamp,
+				 bufferlist *pbl)
+{
+  return io_ctx_impl->hit_set_get(hash, c->pc, stamp, pbl);
+}
+
+
 
 uint64_t librados::IoCtx::get_last_version()
 {
@@ -1293,6 +1326,16 @@ void librados::IoCtx::set_namespace(const string& nspace)
 int64_t librados::IoCtx::get_id()
 {
   return io_ctx_impl->get_id();
+}
+
+uint32_t librados::IoCtx::get_object_hash_position(const std::string& oid)
+{
+  return io_ctx_impl->get_object_hash_position(oid);
+}
+
+uint32_t librados::IoCtx::get_object_pg_hash_position(const std::string& oid)
+{
+  return io_ctx_impl->get_object_pg_hash_position(oid);
 }
 
 librados::config_t librados::IoCtx::cct()
@@ -1471,6 +1514,14 @@ int librados::Rados::pool_reverse_lookup(int64_t id, std::string *name)
   return client->pool_get_name(id, name);
 }
 
+int librados::Rados::mon_command(string cmd, const bufferlist& inbl,
+				 bufferlist *outbl, string *outs)
+{
+  vector<string> cmdvec;
+  cmdvec.push_back(cmd);
+  return client->mon_command(cmdvec, inbl, outbl, outs);
+}
+
 int librados::Rados::ioctx_create(const char *name, IoCtx &io)
 {
   rados_ioctx_t p;
@@ -1561,6 +1612,11 @@ int librados::Rados::cluster_stat(cluster_stat_t& result)
 int librados::Rados::cluster_fsid(string *fsid)
 {
   return client->get_fsid(fsid);
+}
+
+int librados::Rados::wait_for_latest_osdmap()
+{
+  return client->wait_for_latest_osdmap();
 }
 
 librados::PoolAsyncCompletion *librados::Rados::pool_async_create_completion()
@@ -1882,6 +1938,22 @@ static void do_out_buffer(string& outbl, char **outbuf, size_t *outbuflen)
   }
   if (outbuflen)
     *outbuflen = outbl.length();
+}
+
+extern "C" int rados_ping_monitor(rados_t cluster, const char *mon_id,
+                                  char **outstr, size_t *outstrlen)
+{
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+  string str;
+
+  if (!mon_id)
+    return -EINVAL;
+
+  int ret = client->ping_monitor(mon_id, &str);
+  if (ret == 0 && !str.empty() && outstr && outstrlen) {
+    do_out_buffer(str, outstr, outstrlen);
+  }
+  return ret;
 }
 
 extern "C" int rados_mon_command(rados_t cluster, const char **cmd,
@@ -2511,6 +2583,13 @@ extern "C" void rados_objects_list_close(rados_list_ctx_t h)
 {
   librados::ObjListCtx *lh = (librados::ObjListCtx *)h;
   delete lh;
+}
+
+extern "C" uint32_t rados_objects_list_get_pg_hash_position(
+  rados_list_ctx_t listctx)
+{
+  librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
+  return lh->lc->get_pg_hash_position();
 }
 
 extern "C" int rados_objects_list_next(rados_list_ctx_t listctx, const char **entry, const char **key)

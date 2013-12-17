@@ -18,9 +18,11 @@
 #include "common/errno.h"
 #include "common/safe_io.h"
 #include "common/simple_spin.h"
+#include "common/strtol.h"
 #include "include/atomic.h"
 #include "include/types.h"
 #include "include/compat.h"
+#include "include/Spinlock.h"
 
 #include <errno.h>
 #include <fstream>
@@ -39,8 +41,8 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
 # define bendl std::endl; }
 #endif
 
-atomic_t buffer_total_alloc;
-bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
+  atomic_t buffer_total_alloc;
+  bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
 
   void buffer::inc_total_alloc(unsigned len) {
     if (buffer_track_alloc)
@@ -54,11 +56,75 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     return buffer_total_alloc.read();
   }
 
+  atomic_t buffer_cached_crc;
+  atomic_t buffer_cached_crc_adjusted;
+  bool buffer_track_crc = get_env_bool("CEPH_BUFFER_TRACK");
+
+  void buffer::track_cached_crc(bool b) {
+    buffer_track_crc = b;
+  }
+  int buffer::get_cached_crc() {
+    return buffer_cached_crc.read();
+  }
+  int buffer::get_cached_crc_adjusted() {
+    return buffer_cached_crc_adjusted.read();
+  }
+
+  atomic_t buffer_c_str_accesses;
+  bool buffer_track_c_str = get_env_bool("CEPH_BUFFER_TRACK");
+
+  void buffer::track_c_str(bool b) {
+    buffer_track_c_str = b;
+  }
+  int buffer::get_c_str_accesses() {
+    return buffer_c_str_accesses.read();
+  }
+
+  atomic_t buffer_max_pipe_size;
+  int update_max_pipe_size() {
+#ifdef CEPH_HAVE_SETPIPE_SZ
+    char buf[32];
+    int r;
+    std::string err;
+    struct stat stat_result;
+    if (::stat("/proc/sys/fs/pipe-max-size", &stat_result) == -1)
+      return -errno;
+    r = safe_read_file("/proc/sys/fs/", "pipe-max-size",
+		       buf, sizeof(buf) - 1);
+    if (r < 0)
+      return r;
+    buf[r] = '\0';
+    size = strict_strtol(buf, 10, &err);
+    if (!err.empty())
+      return -EIO;
+    buffer_max_pipe_size.set(size);
+#endif
+    return 0;
+  }
+
+  size_t get_max_pipe_size() {
+#ifdef CEPH_HAVE_SETPIPE_SZ
+    size_t size = buffer_max_pipe_size.read();
+    if (size)
+      return size;
+    if (update_max_pipe_size() == 0)
+      return buffer_max_pipe_size.read()
+#endif
+    // this is the max size hardcoded in linux before 2.6.35
+    return 65536;
+  }
+
+  buffer::error_code::error_code(int error) :
+    buffer::malformed_input(cpp_strerror(error).c_str()), code(error) {}
+
   class buffer::raw {
   public:
     char *data;
     unsigned len;
     atomic_t nref;
+
+    Spinlock crc_lock;
+    map<pair<size_t, size_t>, pair<uint32_t, uint32_t> > crc_map;
 
     raw(unsigned l) : data(NULL), len(l), nref(0)
     { }
@@ -70,18 +136,45 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     raw(const raw &other);
     const raw& operator=(const raw &other);
 
+    virtual char *get_data() {
+      return data;
+    }
     virtual raw* clone_empty() = 0;
     raw *clone() {
       raw *c = clone_empty();
       memcpy(c->data, data, len);
       return c;
     }
-
-    bool is_page_aligned() {
+    virtual bool can_zero_copy() const {
+      return false;
+    }
+    virtual int zero_copy_to_fd(int fd, loff_t *offset) {
+      return -ENOTSUP;
+    }
+    virtual bool is_page_aligned() {
       return ((long)data & ~CEPH_PAGE_MASK) == 0;
     }
     bool is_n_page_sized() {
       return (len & ~CEPH_PAGE_MASK) == 0;
+    }
+    bool get_crc(const pair<size_t, size_t> &fromto,
+		 pair<uint32_t, uint32_t> *crc) const {
+      Spinlock::Locker l(crc_lock);
+      map<pair<size_t, size_t>, pair<uint32_t, uint32_t> >::const_iterator i =
+	crc_map.find(fromto);
+      if (i == crc_map.end())
+	return false;
+      *crc = i->second;
+      return true;
+    }
+    void set_crc(const pair<size_t, size_t> &fromto,
+		 const pair<uint32_t, uint32_t> &crc) {
+      Spinlock::Locker l(crc_lock);
+      crc_map[fromto] = crc;
+    }
+    void invalidate_crc() {
+      Spinlock::Locker l(crc_lock);
+      crc_map.clear();
     }
   };
 
@@ -186,6 +279,187 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
   };
 #endif
 
+#ifdef CEPH_HAVE_SPLICE
+  class buffer::raw_pipe : public buffer::raw {
+  public:
+    raw_pipe(unsigned len) : raw(len), source_consumed(false) {
+      size_t max = get_max_pipe_size();
+      if (len > max) {
+	bdout << "raw_pipe: requested length " << len
+	      << " > max length " << max << bendl;
+	throw malformed_input("length larger than max pipe size");
+      }
+      pipefds[0] = -1;
+      pipefds[1] = -1;
+
+      int r;
+      if (::pipe(pipefds) == -1) {
+	r = -errno;
+	bdout << "raw_pipe: error creating pipe: " << cpp_strerror(r) << bendl;
+	throw error_code(r);
+      }
+
+      r = set_nonblocking(pipefds);
+      if (r < 0) {
+	bdout << "raw_pipe: error setting nonblocking flag on temp pipe: "
+	      << cpp_strerror(r) << bendl;
+	throw error_code(r);
+      }
+
+      r = set_pipe_size(pipefds, len);
+      if (r < 0) {
+	bdout << "raw_pipe: could not set pipe size" << bendl;
+	// continue, since the pipe should become large enough as needed
+      }
+
+      inc_total_alloc(len);
+      bdout << "raw_pipe " << this << " alloc " << len << " "
+	    << buffer::get_total_alloc() << bendl;
+    }
+
+    ~raw_pipe() {
+      if (data)
+	delete data;
+      close_pipe(pipefds);
+      dec_total_alloc(len);
+      bdout << "raw_pipe " << this << " free " << (void *)data << " "
+	    << buffer::get_total_alloc() << bendl;
+    }
+
+    bool can_zero_copy() const {
+      return true;
+    }
+
+    bool is_page_aligned() {
+      return false;
+    }
+
+    int set_source(int fd, loff_t *off) {
+      int flags = SPLICE_F_NONBLOCK;
+      ssize_t r = safe_splice(fd, off, pipefds[1], NULL, len, flags);
+      if (r < 0) {
+	bdout << "raw_pipe: error splicing into pipe: " << cpp_strerror(r)
+	      << bendl;
+	return r;
+      }
+      // update length with actual amount read
+      len = r;
+      return 0;
+    }
+
+    int zero_copy_to_fd(int fd, loff_t *offset) {
+      assert(!source_consumed);
+      int flags = SPLICE_F_NONBLOCK;
+      ssize_t r = safe_splice_exact(pipefds[0], NULL, fd, offset, len, flags);
+      if (r < 0) {
+	bdout << "raw_pipe: error splicing from pipe to fd: "
+	      << cpp_strerror(r) << bendl;
+	return r;
+      }
+      source_consumed = true;
+      return 0;
+    }
+
+    buffer::raw* clone_empty() {
+      // cloning doesn't make sense for pipe-based buffers,
+      // and is only used by unit tests for other types of buffers
+      return NULL;
+    }
+
+    char *get_data() {
+      if (data)
+	return data;
+      return copy_pipe(pipefds);
+    }
+
+  private:
+    int set_pipe_size(int *fds, long length) {
+#ifdef CEPH_HAVE_SETPIPE_SZ
+      if (::fcntl(fds[1], F_SETPIPE_SZ, length) == -1) {
+	int r = -errno;
+	if (r == -EPERM) {
+	  // pipe limit must have changed - EPERM means we requested
+	  // more than the maximum size as an unprivileged user
+	  update_max_pipe_size();
+	  throw malformed_input("length larger than new max pipe size");
+	}
+	return r;
+      }
+#endif
+      return 0;
+    }
+
+    int set_nonblocking(int *fds) {
+      if (::fcntl(fds[0], F_SETFL, O_NONBLOCK) == -1)
+	return -errno;
+      if (::fcntl(fds[1], F_SETFL, O_NONBLOCK) == -1)
+	return -errno;
+      return 0;
+    }
+
+    void close_pipe(int *fds) {
+      if (fds[0] >= 0)
+	TEMP_FAILURE_RETRY(::close(fds[0]));
+      if (fds[1] >= 0)
+	TEMP_FAILURE_RETRY(::close(fds[1]));
+    }
+    char *copy_pipe(int *fds) {
+      /* preserve original pipe contents by copying into a temporary
+       * pipe before reading.
+       */
+      int tmpfd[2];
+      int r;
+
+      assert(!source_consumed);
+      assert(fds[0] >= 0);
+
+      if (::pipe(tmpfd) == -1) {
+	r = -errno;
+	bdout << "raw_pipe: error creating temp pipe: " << cpp_strerror(r)
+	      << bendl;
+	throw error_code(r);
+      }
+      r = set_nonblocking(tmpfd);
+      if (r < 0) {
+	bdout << "raw_pipe: error setting nonblocking flag on temp pipe: "
+	      << cpp_strerror(r) << bendl;
+	throw error_code(r);
+      }
+      r = set_pipe_size(tmpfd, len);
+      if (r < 0) {
+	bdout << "raw_pipe: error setting pipe size on temp pipe: "
+	      << cpp_strerror(r) << bendl;
+      }
+      int flags = SPLICE_F_NONBLOCK;
+      if (::tee(fds[0], tmpfd[1], len, flags) == -1) {
+	r = errno;
+	bdout << "raw_pipe: error tee'ing into temp pipe: " << cpp_strerror(r)
+	      << bendl;
+	close_pipe(tmpfd);
+	throw error_code(r);
+      }
+      data = (char *)malloc(len);
+      if (!data) {
+	close_pipe(tmpfd);
+	throw bad_alloc();
+      }
+      r = safe_read(tmpfd[0], data, len);
+      if (r < (ssize_t)len) {
+	bdout << "raw_pipe: error reading from temp pipe:" << cpp_strerror(r)
+	      << bendl;
+	delete data;
+	data = NULL;
+	close_pipe(tmpfd);
+	throw error_code(r);
+      }
+      close_pipe(tmpfd);
+      return data;
+    }
+    bool source_consumed;
+    int pipefds[2];
+  };
+#endif // CEPH_HAVE_SPLICE
+
   /*
    * primitive buffer types
    */
@@ -248,6 +522,20 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     return new raw_posix_aligned(len);
 #else
     return new raw_hack_aligned(len);
+#endif
+  }
+
+  buffer::raw* buffer::create_zero_copy(unsigned len, int fd, loff_t *offset) {
+#ifdef CEPH_HAVE_SPLICE
+    buffer::raw_pipe* buf = new raw_pipe(len);
+    int r = buf->set_source(fd, offset);
+    if (r < 0) {
+      delete buf;
+      throw error_code(r);
+    }
+    return buf;
+#else
+    throw error_code(-ENOTSUP);
 #endif
   }
 
@@ -333,8 +621,18 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
 
   bool buffer::ptr::at_buffer_tail() const { return _off + _len == _raw->len; }
 
-  const char *buffer::ptr::c_str() const { assert(_raw); return _raw->data + _off; }
-  char *buffer::ptr::c_str() { assert(_raw); return _raw->data + _off; }
+  const char *buffer::ptr::c_str() const {
+    assert(_raw);
+    if (buffer_track_c_str)
+      buffer_c_str_accesses.inc();
+    return _raw->get_data() + _off;
+  }
+  char *buffer::ptr::c_str() {
+    assert(_raw);
+    if (buffer_track_c_str)
+      buffer_c_str_accesses.inc();
+    return _raw->get_data() + _off;
+  }
 
   unsigned buffer::ptr::unused_tail_length() const
   {
@@ -347,13 +645,13 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
   {
     assert(_raw);
     assert(n < _len);
-    return _raw->data[_off + n];
+    return _raw->get_data()[_off + n];
   }
   char& buffer::ptr::operator[](unsigned n)
   {
     assert(_raw);
     assert(n < _len);
-    return _raw->data[_off + n];
+    return _raw->get_data()[_off + n];
   }
 
   const char *buffer::ptr::raw_c_str() const { assert(_raw); return _raw->data; }
@@ -413,20 +711,32 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     assert(_raw);
     assert(o <= _len);
     assert(o+l <= _len);
+    _raw->invalidate_crc();
     memcpy(c_str()+o, src, l);
   }
 
   void buffer::ptr::zero()
   {
+    _raw->invalidate_crc();
     memset(c_str(), 0, _len);
   }
 
   void buffer::ptr::zero(unsigned o, unsigned l)
   {
     assert(o+l <= _len);
+    _raw->invalidate_crc();
     memset(c_str()+o, 0, l);
   }
 
+  bool buffer::ptr::can_zero_copy() const
+  {
+    return _raw->can_zero_copy();
+  }
+
+  int buffer::ptr::zero_copy_to_fd(int fd, loff_t *offset) const
+  {
+    return _raw->zero_copy_to_fd(fd, offset);
+  }
 
   // -- buffer::list::iterator --
   /*
@@ -689,6 +999,16 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
     }
   }
 
+  bool buffer::list::can_zero_copy() const
+  {
+    for (std::list<ptr>::const_iterator it = _buffers.begin();
+	 it != _buffers.end();
+	 ++it)
+      if (!it->can_zero_copy())
+	return false;
+    return true;
+  }
+
   bool buffer::list::is_page_aligned() const
   {
     for (std::list<ptr>::const_iterator it = _buffers.begin();
@@ -761,6 +1081,11 @@ bool buffer_track_alloc = get_env_bool("CEPH_BUFFER_TRACK");
       nb = buffer::create_page_aligned(_len);
     else
       nb = buffer::create(_len);
+    rebuild(nb);
+  }
+
+  void buffer::list::rebuild(ptr& nb)
+  {
     unsigned pos = 0;
     for (std::list<ptr>::iterator it = _buffers.begin();
 	 it != _buffers.end();
@@ -804,7 +1129,8 @@ void buffer::list::rebuild_page_aligned()
 	     (!p->is_page_aligned() ||
 	      !p->is_n_page_sized() ||
 	      (offset & ~CEPH_PAGE_MASK)));
-    unaligned.rebuild();
+    ptr nb(buffer::create_page_aligned(unaligned._len));
+    unaligned.rebuild(nb);
     _buffers.insert(p, unaligned._buffers.front());
   }
 }
@@ -990,11 +1316,14 @@ void buffer::list::rebuild_page_aligned()
    */
   char *buffer::list::c_str()
   {
-    if (_buffers.size() == 0) 
+    if (_buffers.empty())
       return 0;                         // no buffers
-    if (_buffers.size() > 1) 
+
+    std::list<ptr>::const_iterator iter = _buffers.begin();
+    ++iter;
+
+    if (iter != _buffers.end())
       rebuild();
-    assert(_buffers.size() == 1);
     return _buffers.front().c_str();  // good, we're already contiguous.
   }
 
@@ -1178,8 +1507,14 @@ int buffer::list::read_file(const char *fn, std::string *error)
   return 0;
 }
 
-ssize_t buffer::list::read_fd(int fd, size_t len) 
+ssize_t buffer::list::read_fd(int fd, size_t len)
 {
+  // try zero copy first
+  if (false && read_fd_zero_copy(fd, len) == 0) {
+    // TODO fix callers to not require correct read size, which is not
+    // available for raw_pipe until we actually inspect the data
+    return 0;
+  }
   int s = ROUND_UP_TO(len, CEPH_PAGE_SIZE);
   bufferptr bp = buffer::create_page_aligned(s);
   ssize_t ret = safe_read(fd, (void*)bp.c_str(), len);
@@ -1188,6 +1523,23 @@ ssize_t buffer::list::read_fd(int fd, size_t len)
     append(bp);
   }
   return ret;
+}
+
+int buffer::list::read_fd_zero_copy(int fd, size_t len)
+{
+#ifdef CEPH_HAVE_SPLICE
+  try {
+    bufferptr bp = buffer::create_zero_copy(len, fd, NULL);
+    append(bp);
+  } catch (buffer::error_code e) {
+    return e.code;
+  } catch (buffer::malformed_input) {
+    return -EIO;
+  }
+  return 0;
+#else
+  return -ENOTSUP;
+#endif
 }
 
 int buffer::list::write_file(const char *fn, int mode)
@@ -1217,12 +1569,15 @@ int buffer::list::write_file(const char *fn, int mode)
 
 int buffer::list::write_fd(int fd) const
 {
+  if (can_zero_copy())
+    return write_fd_zero_copy(fd);
+
   // use writev!
   iovec iov[IOV_MAX];
   int iovlen = 0;
   ssize_t bytes = 0;
 
-  std::list<ptr>::const_iterator p = _buffers.begin(); 
+  std::list<ptr>::const_iterator p = _buffers.begin();
   while (p != _buffers.end()) {
     if (p->length() > 0) {
       iov[iovlen].iov_base = (void *)p->c_str();
@@ -1267,6 +1622,67 @@ int buffer::list::write_fd(int fd) const
   return 0;
 }
 
+int buffer::list::write_fd_zero_copy(int fd) const
+{
+  if (!can_zero_copy())
+    return -ENOTSUP;
+  /* pass offset to each call to avoid races updating the fd seek
+   * position, since the I/O may be non-blocking
+   */
+  loff_t offset = ::lseek(fd, 0, SEEK_CUR);
+  loff_t *off_p = &offset;
+  if (offset < 0 && offset != ESPIPE)
+    return (int) offset;
+  if (offset == ESPIPE)
+    off_p = NULL;
+  for (std::list<ptr>::const_iterator it = _buffers.begin();
+       it != _buffers.end(); ++it) {
+    int r = it->zero_copy_to_fd(fd, off_p);
+    if (r < 0)
+      return r;
+    if (off_p)
+      offset += it->length();
+  }
+  return 0;
+}
+
+__u32 buffer::list::crc32c(__u32 crc) const
+{
+  for (std::list<ptr>::const_iterator it = _buffers.begin();
+       it != _buffers.end();
+       ++it) {
+    if (it->length()) {
+      raw *r = it->get_raw();
+      pair<size_t, size_t> ofs(it->offset(), it->offset() + it->length());
+      pair<uint32_t, uint32_t> ccrc;
+      if (r->get_crc(ofs, &ccrc)) {
+	if (ccrc.first == crc) {
+	  // got it already
+	  crc = ccrc.second;
+	  if (buffer_track_crc)
+	    buffer_cached_crc.inc();
+	} else {
+	  /* If we have cached crc32c(buf, v) for initial value v,
+	   * we can convert this to a different initial value v' by:
+	   * crc32c(buf, v') = crc32c(buf, v) ^ adjustment
+	   * where adjustment = crc32c(0*len(buf), v ^ v')
+	   *
+	   * http://crcutil.googlecode.com/files/crc-doc.1.0.pdf
+	   * note, u for our crc32c implementation is 0
+	   */
+	  crc = ccrc.second ^ ceph_crc32c(ccrc.first ^ crc, NULL, it->length());
+	  if (buffer_track_crc)
+	    buffer_cached_crc_adjusted.inc();
+	}
+      } else {
+	uint32_t base = crc;
+	crc = ceph_crc32c(crc, (unsigned char*)it->c_str(), it->length());
+	r->set_crc(ofs, make_pair(base, crc));
+      }
+    }
+  }
+  return crc;
+}
 
 void buffer::list::hexdump(std::ostream &out) const
 {

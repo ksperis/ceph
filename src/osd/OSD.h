@@ -179,8 +179,6 @@ class HistoricOpsSocketHook;
 class TestOpsSocketHook;
 struct C_CompleteSplits;
 
-extern const coll_t meta_coll;
-
 typedef std::tr1::shared_ptr<ObjectStore::Sequencer> SequencerRef;
 
 class DeletingState {
@@ -309,6 +307,7 @@ public:
   ThreadPool::WorkQueue<PG> &scrub_wq;
   ThreadPool::WorkQueue<PG> &scrub_finalize_wq;
   ThreadPool::WorkQueue<MOSDRepScrub> &rep_scrub_wq;
+  GenContextWQ push_wq;
   ClassHandler  *&class_handler;
 
   void dequeue_pg(PG *pg, list<OpRequestRef> *dequeued);
@@ -441,7 +440,7 @@ public:
 			   bool force_new);
     ObjecterDispatcher(OSDService *o) : Dispatcher(cct), osd(o) {}
   } objecter_dispatcher;
-  friend class ObjecterDispatcher;
+  friend struct ObjecterDispatcher;
 
 
   // -- Watch --
@@ -637,6 +636,20 @@ public:
   OSDService(OSD *osd);
   ~OSDService();
 };
+
+struct C_OSD_SendMessageOnConn: public Context {
+  OSDService *osd;
+  Message *reply;
+  ConnectionRef conn;
+  C_OSD_SendMessageOnConn(
+    OSDService *osd,
+    Message *reply,
+    ConnectionRef conn) : osd(osd), reply(reply), conn(conn) {}
+  void finish(int) {
+    osd->send_message_osd_cluster(reply, conn.get());
+  }
+};
+
 class OSD : public Dispatcher,
 	    public md_config_obs_t {
   /** OSD **/
@@ -733,6 +746,25 @@ public:
     return oid;
   }
   static void recursive_remove_collection(ObjectStore *store, coll_t tmp);
+
+  /**
+   * get_osd_initial_compat_set()
+   *
+   * Get the initial feature set for this OSD.  Features
+   * here are automatically upgraded.
+   *
+   * Return value: Initial osd CompatSet
+   */
+  static CompatSet get_osd_initial_compat_set();
+
+  /**
+   * get_osd_compat_set()
+   *
+   * Get all features supported by this OSD
+   *
+   * Return value: CompatSet of all supported features
+   */
+  static CompatSet get_osd_compat_set();
   
 
 private:
@@ -1159,8 +1191,12 @@ protected:
   void build_past_intervals_parallel();
 
   void calc_priors_during(pg_t pgid, epoch_t start, epoch_t end, set<int>& pset);
-  void project_pg_history(pg_t pgid, pg_history_t& h, epoch_t from,
-			  const vector<int>& lastup, const vector<int>& lastacting);
+
+  /// project pg history from from to now
+  bool project_pg_history(
+    pg_t pgid, pg_history_t& h, epoch_t from,
+    const vector<int>& lastup, const vector<int>& lastacting
+    ); ///< @return false if there was a map gap between from and now
 
   void wake_pg_waiters(pg_t pgid) {
     if (waiting_for_pg.count(pgid)) {
@@ -1218,6 +1254,7 @@ protected:
   void start_boot();
   void _maybe_boot(epoch_t oldest, epoch_t newest);
   void _send_boot();
+  void _collect_metadata(map<string,string> *pmeta);
 
   void start_waiting_for_healthy();
   bool _is_healthy();
@@ -1282,8 +1319,10 @@ protected:
   // -- generic pg peering --
   PG::RecoveryCtx create_context();
   bool compat_must_dispatch_immediately(PG *pg);
-  void dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap);
-  void dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg);
+  void dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap,
+                        ThreadPool::TPHandle *handle = NULL);
+  void dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg,
+                                    ThreadPool::TPHandle *handle = NULL);
   void do_notifies(map< int,vector<pair<pg_notify_t, pg_interval_map_t> > >& notify_list,
 		   OSDMapRef map);
   void do_queries(map< int, map<pg_t,pg_query_t> >& query_map,
@@ -1523,12 +1562,11 @@ protected:
 
   struct ScrubFinalizeWQ : public ThreadPool::WorkQueue<PG> {
   private:
-    OSD *osd;
     xlist<PG*> scrub_finalize_queue;
 
   public:
-    ScrubFinalizeWQ(OSD *o, time_t ti, ThreadPool *tp)
-      : ThreadPool::WorkQueue<PG>("OSD::ScrubFinalizeWQ", ti, ti*10, tp), osd(o) {}
+    ScrubFinalizeWQ(time_t ti, ThreadPool *tp)
+      : ThreadPool::WorkQueue<PG>("OSD::ScrubFinalizeWQ", ti, ti*10, tp) {}
 
     bool _empty() {
       return scrub_finalize_queue.empty();
@@ -1649,7 +1687,7 @@ protected:
       remove_queue.pop_front();
       return item;
     }
-    void _process(pair<PGRef, DeletingStateRef>);
+    void _process(pair<PGRef, DeletingStateRef>, ThreadPool::TPHandle &);
     void _clear() {
       remove_queue.clear();
     }
@@ -1673,6 +1711,7 @@ protected:
   /* internal and external can point to the same messenger, they will still
    * be cleaned up properly*/
   OSD(CephContext *cct_,
+      ObjectStore *store_,
       int id,
       Messenger *internal,
       Messenger *external,
@@ -1685,15 +1724,11 @@ protected:
 
   // static bits
   static int find_osd_dev(char *result, int whoami);
-  static ObjectStore *create_object_store(CephContext *cct, const std::string &dev, const std::string &jdev);
-  static int convertfs(const std::string &dev, const std::string &jdev);
   static int do_convertfs(ObjectStore *store);
   static int convert_collection(ObjectStore *store, coll_t cid);
-  static int mkfs(CephContext *cct, const std::string &dev, const std::string &jdev,
+  static int mkfs(CephContext *cct, ObjectStore *store,
+		  const string& dev,
 		  uuid_d fsid, int whoami);
-  static int mkjournal(CephContext *cct, const std::string &dev, const std::string &jdev);
-  static int flushjournal(CephContext *cct, const std::string &dev, const std::string &jdev);
-  static int dump_journal(CephContext *cct, const std::string &dev, const std::string &jdev, ostream& out);
   /* remove any non-user xattrs from a map of them */
   void filter_xattrs(map<string, bufferptr>& attrs) {
     for (map<string, bufferptr>::iterator iter = attrs.begin();
@@ -1706,16 +1741,11 @@ protected:
   }
 
 private:
-  static int write_meta(const std::string &base, const std::string &file,
-			const char *val, size_t vallen);
-  static int read_meta(const std::string &base, const std::string &file,
-		       char *val, size_t vallen);
-  static int write_meta(const std::string &base,
+  static int write_meta(ObjectStore *store,
 			uuid_d& cluster_fsid, uuid_d& osd_fsid, int whoami);
 public:
-  static int peek_meta(const std::string &dev, string& magic,
+  static int peek_meta(ObjectStore *store, string& magic,
 		       uuid_d& cluster_fsid, uuid_d& osd_fsid, int& whoami);
-  static int peek_journal_fsid(std::string jpath, uuid_d& fsid);
   
 
   // startup/shutdown

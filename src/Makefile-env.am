@@ -8,9 +8,12 @@ CLEANFILES =
 
 noinst_HEADERS =
 bin_PROGRAMS =
+noinst_PROGRAMS =
 bin_SCRIPTS =
 sbin_PROGRAMS =
 sbin_SCRIPTS =
+su_sbin_PROGRAMS =
+su_sbin_SCRIPTS =
 dist_bin_SCRIPTS =
 lib_LTLIBRARIES = 
 noinst_LTLIBRARIES = 
@@ -21,10 +24,19 @@ radoslib_LTLIBRARIES =
 bin_DEBUGPROGRAMS =
 
 # like sbin_SCRIPTS but can be used to install to e.g. /usr/sbin
-ceph_sbindir = $(exec_prefix)$(sbindir)
+ceph_sbindir = $(sbindir)
+
+# certain things go straight into /sbin, though!
+su_sbindir = /sbin
 
 # C/C++ tests to build will be appended to this
 check_PROGRAMS =
+
+# tests scripts will be appended to this
+check_SCRIPTS =
+
+# python unit tests need to know where the scripts are located
+export PYTHONPATH=$(top_srcdir)/src/pybind
 
 # when doing a debug build, make sure to make the targets
 if WITH_DEBUG
@@ -35,14 +47,16 @@ endif
 ##################################
 ## automake environment
 
-AM_COMMON_FLAGS = \
+AM_COMMON_CPPFLAGS = \
 	-D__CEPH__ \
 	-D_FILE_OFFSET_BITS=64 \
 	-D_REENTRANT \
 	-D_THREAD_SAFE \
 	-D__STDC_FORMAT_MACROS \
 	-D_GNU_SOURCE \
-	-rdynamic \
+	-DCEPH_LIBDIR=\"${libdir}\"
+
+AM_COMMON_CFLAGS = \
 	-Wall \
 	${WARN_TYPE_LIMITS} \
 	${WARN_IGNORED_QUALIFIERS} \
@@ -51,18 +65,21 @@ AM_COMMON_FLAGS = \
 	-Werror=format-security \
 	-fno-strict-aliasing \
 	-fsigned-char
+if !CLANG
+	AM_COMMON_CFLAGS += -rdynamic
+endif
 
-AM_CFLAGS = $(AM_COMMON_FLAGS)
-AM_CPPFLAGS = \
-	$(AM_COMMON_FLAGS) \
-	-DCEPH_LIBDIR=\"${libdir}\"
+AM_CFLAGS = $(AM_COMMON_CFLAGS)
+AM_CPPFLAGS = $(AM_COMMON_CPPFLAGS)
 AM_CXXFLAGS = \
 	@AM_CXXFLAGS@ \
-	$(AM_COMMON_FLAGS) \
-	-DCEPH_LIBDIR=\"${libdir}\" \
+	$(AM_COMMON_CFLAGS) \
+	-ftemplate-depth-1024 \
 	-Wnon-virtual-dtor \
-	-Wno-invalid-offsetof \
-	-Wstrict-null-sentinel
+	-Wno-invalid-offsetof
+if !CLANG
+	AM_CXXFLAGS += -Wstrict-null-sentinel
+endif
 
 # note: this is position dependant, it affects the -l options that
 # come after it on the command line. when you use ${AM_LDFLAGS} in

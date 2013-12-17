@@ -48,8 +48,11 @@ const char *ceph_osd_op_name(int op)
 	case CEPH_OSD_OP_TMAPPUT: return "tmapput";
 	case CEPH_OSD_OP_WATCH: return "watch";
 
+	case CEPH_OSD_OP_COPY_GET_CLASSIC: return "copy-get-classic";
 	case CEPH_OSD_OP_COPY_GET: return "copy-get";
 	case CEPH_OSD_OP_COPY_FROM: return "copy-from";
+	case CEPH_OSD_OP_UNDIRTY: return "undirty";
+	case CEPH_OSD_OP_ISDIRTY: return "isdirty";
 
 	case CEPH_OSD_OP_CLONERANGE: return "clonerange";
 	case CEPH_OSD_OP_ASSERT_SRC_VERSION: return "assert-src-version";
@@ -84,6 +87,8 @@ const char *ceph_osd_op_name(int op)
 
 	case CEPH_OSD_OP_PGLS: return "pgls";
 	case CEPH_OSD_OP_PGLS_FILTER: return "pgls-filter";
+	case CEPH_OSD_OP_PG_HITSET_LS: return "pg-hitset-ls";
+	case CEPH_OSD_OP_PG_HITSET_GET: return "pg-hitset-get";
 	case CEPH_OSD_OP_OMAPGETKEYS: return "omap-get-keys";
 	case CEPH_OSD_OP_OMAPGETVALS: return "omap-get-vals";
 	case CEPH_OSD_OP_OMAPGETHEADER: return "omap-get-header";
@@ -148,6 +153,8 @@ const char *ceph_session_op_name(int op)
 	case CEPH_SESSION_RENEWCAPS: return "renewcaps";
 	case CEPH_SESSION_STALE: return "stale";
 	case CEPH_SESSION_RECALL_STATE: return "recall_state";
+	case CEPH_SESSION_FLUSHMSG: return "flushmsg";
+	case CEPH_SESSION_FLUSHMSG_ACK: return "flushmsg_ack";
 	}
 	return "???";
 }
@@ -181,6 +188,7 @@ const char *ceph_mds_op_name(int op)
 	case CEPH_MDS_OP_RMSNAP: return "rmsnap";
 	case CEPH_MDS_OP_SETFILELOCK: return "setfilelock";
 	case CEPH_MDS_OP_GETFILELOCK: return "getfilelock";
+	case CEPH_MDS_OP_FRAGMENTDIR: return "fragmentdir";
 	}
 	return "???";
 }

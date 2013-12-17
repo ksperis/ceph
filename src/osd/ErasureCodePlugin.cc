@@ -36,7 +36,8 @@ static ostream& _prefix(std::ostream* _dout)
 ErasureCodePluginRegistry ErasureCodePluginRegistry::singleton;
 
 ErasureCodePluginRegistry::ErasureCodePluginRegistry() :
-  lock("ErasureCodePluginRegistry::lock")
+  lock("ErasureCodePluginRegistry::lock"),
+  loading(false)
 {
 }
 
@@ -44,7 +45,7 @@ ErasureCodePluginRegistry::~ErasureCodePluginRegistry()
 {
   for (std::map<std::string,ErasureCodePlugin*>::iterator i = plugins.begin();
        i != plugins.end();
-       i++) {
+       ++i) {
     void *library = i->second->library;
     delete i->second;
     dlclose(library);
@@ -76,7 +77,9 @@ int ErasureCodePluginRegistry::factory(const std::string &plugin_name,
   int r = 0;
   ErasureCodePlugin *plugin = get(plugin_name);
   if (plugin == 0) {
+    loading = true;
     r = load(plugin_name, parameters, &plugin);
+    loading = false;
     if (r != 0)
       return r;
   }
@@ -109,6 +112,7 @@ int ErasureCodePluginRegistry::load(const std::string &plugin_name,
     if (r != 0) {
       derr << "erasure_code_init(" << plugin_name
            << "): " << strerror(-r) << dendl;
+      dlclose(library);
       return r;
     }
   } else {

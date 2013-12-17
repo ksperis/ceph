@@ -54,7 +54,7 @@ static ostream& _prefix(std::ostream *_dout, Monitor *mon, MDSMap& mdsmap) {
 
 void MDSMonitor::print_map(MDSMap &m, int dbl)
 {
-  dout(7) << "print_map\n";
+  dout(dbl) << "print_map\n";
   m.print(*_dout);
   *_dout << dendl;
 }
@@ -124,7 +124,8 @@ void MDSMonitor::encode_pending(MonitorDBStore::Transaction *t)
 
   pending_mdsmap.modified = ceph_clock_now(g_ceph_context);
 
-  //print_map(pending_mdsmap);
+  // print map iff 'debug mon = 30' or higher
+  print_map(pending_mdsmap, 30);
 
   // apply to paxos
   assert(get_last_committed() + 1 == pending_mdsmap.epoch);
@@ -134,6 +135,24 @@ void MDSMonitor::encode_pending(MonitorDBStore::Transaction *t)
   /* put everything in the transaction */
   put_version(t, pending_mdsmap.epoch, mdsmap_bl);
   put_last_committed(t, pending_mdsmap.epoch);
+}
+
+version_t MDSMonitor::get_trim_to()
+{
+  version_t floor = 0;
+  if (g_conf->mon_mds_force_trim_to > 0 &&
+      g_conf->mon_mds_force_trim_to < (int)get_last_committed()) {
+    floor = g_conf->mon_mds_force_trim_to;
+    dout(10) << __func__ << " explicit mon_mds_force_trim_to = "
+             << floor << dendl;
+  }
+
+  unsigned max = g_conf->mon_max_mdsmap_epochs;
+  version_t last = get_last_committed();
+
+  if (last - get_first_committed() > max && floor < last - max)
+    return last - max;
+  return floor;
 }
 
 void MDSMonitor::update_logger()
@@ -491,8 +510,8 @@ bool MDSMonitor::prepare_offload_targets(MMDSLoadTargets *m)
 
 bool MDSMonitor::should_propose(double& delay)
 {
-  delay = 0.0;
-  return true;
+  // delegate to PaxosService to assess whether we should propose
+  return PaxosService::should_propose(delay);
 }
 
 void MDSMonitor::_updated(MMDSBeacon *m)
@@ -531,6 +550,7 @@ void MDSMonitor::dump_info(Formatter *f)
   f->close_section();
 
   f->dump_unsigned("mdsmap_first_committed", get_first_committed());
+  f->dump_unsigned("mdsmap_last_committed", get_last_committed());
 }
 
 int MDSMonitor::parse_mds_id(const char *s, stringstream *pss)
@@ -591,10 +611,8 @@ bool MDSMonitor::preprocess_command(MMonCommand *m)
     }
     r = 0;
   } else if (prefix == "mds dump") {
-    string val;
     int64_t epocharg;
     epoch_t epoch;
-    epoch = epocharg;
 
     MDSMap *p = &mdsmap;
     if (cmd_getval(g_ceph_context, cmdmap, "epoch", epocharg)) {
@@ -675,7 +693,6 @@ bool MDSMonitor::preprocess_command(MMonCommand *m)
   } else if (prefix == "mds tell") {
     string whostr;
     cmd_getval(g_ceph_context, cmdmap, "who", whostr);
-    string args;
     vector<string>args_vec;
     cmd_getval(g_ceph_context, cmdmap, "args", args_vec);
 
@@ -961,22 +978,75 @@ bool MDSMonitor::prepare_command(MMonCommand *m)
       r = 0;
     }
 
+  } else if (prefix == "mds set") {
+    string key;
+    cmd_getval(g_ceph_context, cmdmap, "key", key);
+    string sure;
+    cmd_getval(g_ceph_context, cmdmap, "sure", sure);
+    if (key == "allow_new_snaps") {
+      if (sure != "--yes-i-really-mean-it") {
+	ss << "Snapshots are unstable and will probably break your FS! Add --yes-i-really-mean-it if you are sure";
+	r = -EPERM;
+      } else {
+	pending_mdsmap.set_snaps_allowed();
+	ss << "turned on snaps";
+	r = 0;
+      }
+    }
+  } else if (prefix == "mds unset") {
+    string key;
+    cmd_getval(g_ceph_context, cmdmap, "key", key);
+    string sure;
+    cmd_getval(g_ceph_context, cmdmap, "sure", sure);
+    if (key == "allow_new_snaps") {
+      if (sure != "--yes-i-really-mean-it") {
+	ss << "this won't get rid of snapshots or restore the cluster if it's broken. Add --yes-i-really-mean-it if you are sure";
+	r = -EPERM;
+      } else {
+	pending_mdsmap.clear_snaps_allowed();
+	ss << "disabled new snapshots";
+	r = 0;
+      }
+    }
   } else if (prefix == "mds add_data_pool") {
-    int64_t poolid;
-    cmd_getval(g_ceph_context, cmdmap, "poolid", poolid);
-    pending_mdsmap.add_data_pool(poolid);
-    ss << "added data pool " << poolid << " to mdsmap";
-    r = 0;
-
-  } else if (prefix == "mds remove_data_pool") {
-    int64_t poolid;
-    cmd_getval(g_ceph_context, cmdmap, "poolid", poolid);
-    r = pending_mdsmap.remove_data_pool(poolid);
-    if (r == -ENOENT)
+    string poolname;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolname);
+    int64_t poolid = mon->osdmon()->osdmap.lookup_pg_pool_name(poolname);
+    if (poolid < 0) {
+      string err;
+      poolid = strict_strtol(poolname.c_str(), 10, &err);
+      if (err.length()) {
+	r = -ENOENT;
+	poolid = -1;
+	ss << "pool '" << poolname << "' does not exist";
+      }
+    }
+    if (poolid >= 0) {
+      pending_mdsmap.add_data_pool(poolid);
+      ss << "added data pool " << poolid << " to mdsmap";
       r = 0;
-    if (r == 0)
-      ss << "removed data pool " << poolid << " from mdsmap";
-
+    }
+  } else if (prefix == "mds remove_data_pool") {
+    string poolname;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolname);
+    int64_t poolid = mon->osdmon()->osdmap.lookup_pg_pool_name(poolname);
+    if (poolid < 0) {
+      string err;
+      poolid = strict_strtol(poolname.c_str(), 10, &err);
+      if (err.length()) {
+	r = -ENOENT;
+	poolid = -1;
+	ss << "pool '" << poolname << "' does not exist";
+      }
+    }
+    if (poolid >= 0) {
+      cmd_getval(g_ceph_context, cmdmap, "poolid", poolid);
+      r = pending_mdsmap.remove_data_pool(poolid);
+      if (r == -ENOENT)
+	r = 0;
+      if (r == 0)
+	ss << "removed data pool " << poolid << " from mdsmap";
+    }
   } else if (prefix == "mds newfs") {
     MDSMap newmap;
     int64_t metadata, data;

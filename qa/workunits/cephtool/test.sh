@@ -1,6 +1,8 @@
 #!/bin/bash -x
 
 set -e
+set -o functrace
+PS4=' ${FUNCNAME[0]}: $LINENO: '
 
 get_pg()
 {
@@ -26,7 +28,7 @@ expect_false()
 }
 
 TMPFILE=/tmp/test_invalid.$$
-trap "rm $TMPFILE" 0
+trap "rm -f $TMPFILE" 0
 
 function check_response()
 {
@@ -147,7 +149,9 @@ ceph mds newfs 0 1 --yes-i-really-mean-it
 ceph osd pool create data2 10
 poolnum=$(ceph osd dump | grep 'pool.*data2' | awk '{print $2;}')
 ceph mds add_data_pool $poolnum
+ceph mds add_data_pool rbd
 ceph mds remove_data_pool $poolnum
+ceph mds remove_data_pool rbd
 ceph osd pool delete data2 data2 --yes-i-really-really-mean-it
 ceph mds set_max_mds 4
 ceph mds set_max_mds 3
@@ -169,7 +173,16 @@ bl=192.168.0.1:0/1000
 ceph osd blacklist add $bl
 ceph osd blacklist ls | grep $bl
 ceph osd blacklist rm $bl
-expect_false "(ceph osd blacklist ls | grep $bl)"
+expect_false "ceph osd blacklist ls | grep $bl"
+
+bl=192.168.0.1
+# test without nonce, invalid nonce
+ceph osd blacklist add $bl
+ceph osd blacklist ls | grep $bl
+ceph osd blacklist rm $bl
+expect_false "ceph osd blacklist ls | grep $bl"
+expect_false "ceph osd blacklist $bl/-1"
+expect_false "ceph osd blacklist $bl/foo"
 
 ceph osd crush tunables legacy
 ceph osd crush tunables bobtail
@@ -201,6 +214,7 @@ for ((i=0; i < 100; i++)); do
 done
 ceph osd dump | grep 'osd.0 up'
 ceph osd find 1
+ceph osd metadata 1 | grep 'distro'
 ceph osd out 0
 ceph osd dump | grep 'osd.0.*out'
 ceph osd in 0
@@ -223,6 +237,8 @@ ceph osd getmaxosd | grep "max_osd = $save"
 for id in `ceph osd ls` ; do
 	ceph tell osd.$id version
 done
+
+ceph osd rm 0 2>&1 | grep 'EBUSY'
 
 id=`ceph osd create`
 ceph osd lost $id --yes-i-really-mean-it
@@ -311,10 +327,26 @@ for s in pg_num pgp_num size min_size crash_replay_interval crush_ruleset; do
 	ceph osd pool get data $s
 done
 
-ceph osd pool get data size | grep 'size: 2'
-ceph osd pool set data size 3
-ceph osd pool get data size | grep 'size: 3'
-ceph osd pool set data size 2
+old_size=$(ceph osd pool get data size | sed -e 's/size: //')
+(( new_size = old_size + 1 ))
+ceph osd pool set data size $new_size
+ceph osd pool get data size | grep "size: $new_size"
+ceph osd pool set data size $old_size
+
+ceph osd pool set data hashpspool true
+ceph osd pool set data hashpspool false
+ceph osd pool set data hashpspool 0
+ceph osd pool set data hashpspool 1
+expect_false ceph osd pool set data hashpspool asdf
+expect_false ceph osd pool set data hashpspool 2
+
+ceph osd pool set rbd hit_set_type explicit_hash
+ceph osd pool set rbd hit_set_type explicit_object
+ceph osd pool set rbd hit_set_type bloom
+expect_false ceph osd pool set rbd hit_set_type i_dont_exist
+ceph osd pool set rbd hit_set_period 123
+ceph osd pool set rbd hit_set_count 12
+ceph osd pool set rbd hit_set_fpp .01
 
 ceph osd pool get rbd crush_ruleset | grep 'crush_ruleset: 2'
 
@@ -333,5 +365,12 @@ ceph pg set_full_ratio 95 2>$TMPFILE; check_response $? 22 'not in range'
 
 # expect "not in range" for invalid overload percentage
 ceph osd reweight-by-utilization 80 2>$TMPFILE; check_response $? 22 'not in range'
+
+# expect 'heap' commands to be correctly parsed
+ceph heap stats
+ceph heap start_profiler
+ceph heap dump
+ceph heap stop_profiler
+ceph heap release
 
 echo OK

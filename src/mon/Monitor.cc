@@ -52,6 +52,7 @@
 
 #include "messages/MTimeCheck.h"
 #include "messages/MMonHealth.h"
+#include "messages/MPing.h"
 
 #include "common/strtol.h"
 #include "common/ceph_argparse.h"
@@ -92,6 +93,18 @@ static ostream& _prefix(std::ostream *_dout, const Monitor *mon) {
 
 const string Monitor::MONITOR_NAME = "monitor";
 const string Monitor::MONITOR_STORE_PREFIX = "monitor_store";
+
+
+#undef COMMAND
+MonCommand mon_commands[] = {
+#define COMMAND(parsesig, helptext, modulename, req_perms, avail) \
+  {parsesig, helptext, modulename, req_perms, avail},
+#include <mon/MonCommands.h>
+};
+MonCommand classic_mon_commands[] = {
+#include <mon/DumplingMonCommands.h>
+};
+
 
 long parse_pos_long(const char *s, ostream *pss)
 {
@@ -136,6 +149,8 @@ Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
   auth_service_required(cct,
 			cct->_conf->auth_supported.length() ?
 			cct->_conf->auth_supported : cct->_conf->auth_service_required),
+  leader_supported_mon_commands(NULL),
+  leader_supported_mon_commands_size(0),
   store(s),
   
   state(STATE_PROBING),
@@ -212,6 +227,9 @@ Monitor::~Monitor()
   delete paxos;
   assert(session_map.sessions.empty());
   delete mon_caps;
+  if (leader_supported_mon_commands != mon_commands &&
+      leader_supported_mon_commands != classic_mon_commands)
+    delete[] leader_supported_mon_commands;
 }
 
 
@@ -241,9 +259,11 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
 
   boost::scoped_ptr<Formatter> f(new_formatter(format));
 
-  if (command == "mon_status")
+  if (command == "mon_status") {
     _mon_status(f.get(), ss);
-  else if (command == "quorum_status")
+    if (f)
+      f->flush(ss);
+  } else if (command == "quorum_status")
     _quorum_status(f.get(), ss);
   else if (command == "sync_force") {
     string validate;
@@ -255,9 +275,17 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
       return;
     }
     sync_force(f.get(), ss);
-  } else if (command.find("add_bootstrap_peer_hint") == 0)
+  } else if (command.find("add_bootstrap_peer_hint") == 0) {
     _add_bootstrap_peer_hint(command, cmdmap, ss);
-  else
+  } else if (command == "quorum enter") {
+    elector.start_participating();
+    start_election();
+    ss << "started responding to quorum, initiated new election";
+  } else if (command == "quorum exit") {
+    start_election();
+    elector.stop_participating();
+    ss << "stopped responding to quorum, initiated new election";
+  } else
     assert(0 == "bad AdminSocket command binding");
 }
 
@@ -501,6 +529,14 @@ int Monitor::preinit()
 				     "add peer address as potential bootstrap"
 				     " peer for cluster bringup");
   assert(r == 0);
+  r = admin_socket->register_command("quorum enter", "quorum enter",
+                                     admin_hook,
+                                     "force monitor back into quorum");
+  assert(r == 0);
+  r = admin_socket->register_command("quorum exit", "quorum exit",
+                                     admin_hook,
+                                     "force monitor out of the quorum");
+  assert(r == 0);
   lock.Lock();
 
   lock.Unlock();
@@ -520,6 +556,14 @@ int Monitor::init()
   messenger->add_dispatcher_tail(this);
 
   bootstrap();
+
+  // encode command sets
+  const MonCommand *cmds;
+  int cmdsize;
+  get_locally_supported_monitor_commands(&cmds, &cmdsize);
+  MonCommand::encode_array(cmds, cmdsize, supported_commands_bl);
+  get_classic_monitor_commands(&cmds, &cmdsize);
+  MonCommand::encode_array(cmds, cmdsize, classic_commands_bl);
 
   lock.Unlock();
   return 0;
@@ -1486,7 +1530,11 @@ void Monitor::win_standalone_election()
   assert(rank == 0);
   set<int> q;
   q.insert(rank);
-  win_election(1, q, CEPH_FEATURES_ALL);
+
+  const MonCommand *my_cmds;
+  int cmdsize;
+  get_locally_supported_monitor_commands(&my_cmds, &cmdsize);
+  win_election(1, q, CEPH_FEATURES_ALL, my_cmds, cmdsize, NULL);
 }
 
 const utime_t& Monitor::get_leader_since() const
@@ -1500,7 +1548,9 @@ epoch_t Monitor::get_epoch()
   return elector.get_epoch();
 }
 
-void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features) 
+void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features,
+                           const MonCommand *cmdset, int cmdsize,
+                           const set<int> *classic_monitors)
 {
   dout(10) << __func__ << " epoch " << epoch << " quorum " << active
 	   << " features " << features << dendl;
@@ -1514,6 +1564,10 @@ void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features)
 
   clog.info() << "mon." << name << "@" << rank
 		<< " won leader election with quorum " << quorum << "\n";
+
+  set_leader_supported_commands(cmdset, cmdsize);
+  if (classic_monitors)
+    classic_mons = *classic_monitors;
 
   paxos->leader_init();
   for (vector<PaxosService*>::iterator p = paxos_service.begin(); p != paxos_service.end(); ++p)
@@ -1689,9 +1743,11 @@ void Monitor::_mon_status(Formatter *f, ostream& ss)
 
   f->close_section(); // mon_status
 
-  f->flush(ss);
-  if (free_formatter)
+  if (free_formatter) {
+    // flush formatter to ss and delete it iff we created the formatter
+    f->flush(ss);
     delete f;
+  }
 }
 
 void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
@@ -1869,23 +1925,9 @@ void Monitor::get_status(stringstream &ss, Formatter *f)
   }
 }
 
-#undef COMMAND
-struct MonCommand {
-  string cmdstring;
-  string helpstring;
-  string module;
-  string req_perms;
-  string availability;
-} mon_commands[] = {
-#define COMMAND(parsesig, helptext, modulename, req_perms, avail) \
-  {parsesig, helptext, modulename, req_perms, avail},
-#include <mon/MonCommands.h>
-};
-
-bool Monitor::_allowed_command(MonSession *s, string &module, string &prefix,
-                               map<string,cmd_vartype>& cmdmap) {
-
-  map<string,string> strmap;
+void Monitor::_generate_command_map(map<string,cmd_vartype>& cmdmap,
+                                    map<string,string> &param_str_map)
+{
   for (map<string,cmd_vartype>::const_iterator p = cmdmap.begin();
        p != cmdmap.end(); ++p) {
     if (p->first == "prefix")
@@ -1896,35 +1938,92 @@ bool Monitor::_allowed_command(MonSession *s, string &module, string &prefix,
 	  cv.size() % 2 == 0) {
 	for (unsigned i = 0; i < cv.size(); i += 2) {
 	  string k = string("caps_") + cv[i];
-	  strmap[k] = cv[i + 1];
+	  param_str_map[k] = cv[i + 1];
 	}
 	continue;
       }
     }
-    strmap[p->first] = cmd_vartype_stringify(p->second);
+    param_str_map[p->first] = cmd_vartype_stringify(p->second);
   }
+}
 
+const MonCommand *Monitor::_get_moncommand(const string &cmd_prefix,
+                                           MonCommand *cmds, int cmds_size)
+{
   MonCommand *this_cmd = NULL;
-  for (MonCommand *cp = mon_commands;
-       cp < &mon_commands[ARRAY_SIZE(mon_commands)]; cp++) {
-    if (cp->cmdstring.find(prefix) != string::npos) {
+  for (MonCommand *cp = cmds;
+       cp < &cmds[cmds_size]; cp++) {
+    if (cp->cmdstring.find(cmd_prefix) != string::npos) {
       this_cmd = cp;
       break;
     }
   }
-  assert(this_cmd != NULL);
+  return this_cmd;
+}
+
+bool Monitor::_allowed_command(MonSession *s, string &module, string &prefix,
+                               const map<string,cmd_vartype>& cmdmap,
+                               const map<string,string> param_str_map,
+                               const MonCommand *this_cmd) {
+
   bool cmd_r = (this_cmd->req_perms.find('r') != string::npos);
   bool cmd_w = (this_cmd->req_perms.find('w') != string::npos);
   bool cmd_x = (this_cmd->req_perms.find('x') != string::npos);
 
   bool capable = s->caps.is_capable(g_ceph_context, s->inst.name,
-                                    module, prefix, strmap,
+                                    module, prefix, param_str_map,
                                     cmd_r, cmd_w, cmd_x);
 
   dout(10) << __func__ << " " << (capable ? "" : "not ") << "capable" << dendl;
   return capable;
 }
 
+void Monitor::format_command_descriptions(const MonCommand *commands,
+					  unsigned commands_size,
+					  Formatter *f,
+					  bufferlist *rdata)
+{
+  int cmdnum = 0;
+  f->open_object_section("command_descriptions");
+  for (const MonCommand *cp = commands;
+       cp < &commands[commands_size]; cp++) {
+
+    ostringstream secname;
+    secname << "cmd" << setfill('0') << std::setw(3) << cmdnum;
+    dump_cmddesc_to_json(f, secname.str(),
+			 cp->cmdstring, cp->helpstring, cp->module,
+			 cp->req_perms, cp->availability);
+    cmdnum++;
+  }
+  f->close_section();	// command_descriptions
+
+  f->flush(*rdata);
+}
+
+void Monitor::get_locally_supported_monitor_commands(const MonCommand **cmds,
+						     int *count)
+{
+  *cmds = mon_commands;
+  *count = ARRAY_SIZE(mon_commands);
+}
+void Monitor::get_leader_supported_commands(const MonCommand **cmds, int *count)
+{
+  *cmds = leader_supported_mon_commands;
+  *count = leader_supported_mon_commands_size;
+}
+void Monitor::get_classic_monitor_commands(const MonCommand **cmds, int *count)
+{
+  *cmds = classic_mon_commands;
+  *count = ARRAY_SIZE(classic_mon_commands);
+}
+void Monitor::set_leader_supported_commands(const MonCommand *cmds, int size)
+{
+  if (leader_supported_mon_commands != mon_commands &&
+      leader_supported_mon_commands != classic_mon_commands)
+    delete[] leader_supported_mon_commands;
+  leader_supported_mon_commands = cmds;
+  leader_supported_mon_commands_size = size;
+}
 
 void Monitor::handle_command(MMonCommand *m)
 {
@@ -1969,23 +2068,10 @@ void Monitor::handle_command(MMonCommand *m)
 
   cmd_getval(g_ceph_context, cmdmap, "prefix", prefix);
   if (prefix == "get_command_descriptions") {
-    int cmdnum = 0;
-    Formatter *f = new_formatter("json");
-    f->open_object_section("command_descriptions");
-    for (MonCommand *cp = mon_commands;
-	 cp < &mon_commands[ARRAY_SIZE(mon_commands)]; cp++) {
-
-      ostringstream secname;
-      secname << "cmd" << setfill('0') << std::setw(3) << cmdnum;
-      dump_cmddesc_to_json(f, secname.str(),
-			   cp->cmdstring, cp->helpstring, cp->module,
-			   cp->req_perms, cp->availability);
-      cmdnum++;
-    }
-    f->close_section();	// command_descriptions
-
     bufferlist rdata;
-    f->flush(rdata);
+    Formatter *f = new_formatter("json");
+    format_command_descriptions(leader_supported_mon_commands,
+				leader_supported_mon_commands_size, f, &rdata);
     delete f;
     reply_command(m, 0, "", rdata, 0);
     return;
@@ -2003,7 +2089,31 @@ void Monitor::handle_command(MMonCommand *m)
   get_str_vec(prefix, fullcmd);
   module = fullcmd[0];
 
-  if (!_allowed_command(session, module, prefix, cmdmap)) {
+  // validate command is in leader map
+
+  const MonCommand *leader_cmd;
+  leader_cmd = _get_moncommand(prefix,
+                               // the boost underlying this isn't const for some reason
+                               const_cast<MonCommand*>(leader_supported_mon_commands),
+                               leader_supported_mon_commands_size);
+  if (!leader_cmd) {
+    reply_command(m, -EINVAL, "command not known", 0);
+    return;
+  }
+  // validate command is in our map & matches, or forward
+  const MonCommand *mon_cmd = _get_moncommand(prefix, mon_commands,
+                                              ARRAY_SIZE(mon_commands));
+  if (!is_leader() && (!mon_cmd ||
+      (*leader_cmd != *mon_cmd))) {
+    dout(10) << "We don't match leader, forwarding request " << m << dendl;
+    forward_request_leader(m);
+    return;
+  }
+  // validate user's permissions for requested command
+  map<string,string> param_str_map;
+  _generate_command_map(cmdmap, param_str_map);
+  if (!_allowed_command(session, module, prefix, cmdmap,
+                        param_str_map, mon_cmd)) {
     dout(1) << __func__ << " access denied" << dendl;
     reply_command(m, -EACCES, "access denied", 0);
     return;
@@ -2192,6 +2302,8 @@ void Monitor::handle_command(MMonCommand *m)
     r = 0;
   } else if (prefix == "mon_status") {
     _mon_status(f.get(), ds);
+    if (f)
+      f->flush(ds);
     rdata.append(ds);
     rs = "";
     r = 0;
@@ -2577,67 +2689,102 @@ bool Monitor::_ms_dispatch(Message *m)
   EntityName entity_name;
   bool src_is_mon;
 
-  src_is_mon = !connection || (connection->get_peer_type() & CEPH_ENTITY_TYPE_MON);
+  // regardless of who we are or who the sender is, the message must
+  // have a connection associated.  If it doesn't then something fishy
+  // is going on.
+  assert(connection);
 
-  if (connection) {
-    bool reuse_caps = false;
-    dout(20) << "have connection" << dendl;
-    s = static_cast<MonSession *>(connection->get_priv());
-    if (s && s->closed) {
-      caps = s->caps;
-      reuse_caps = true;
-      s->put();
-      s = NULL;
+  src_is_mon = (connection->get_peer_type() & CEPH_ENTITY_TYPE_MON);
+
+  bool reuse_caps = false;
+  dout(20) << "have connection" << dendl;
+  s = static_cast<MonSession *>(connection->get_priv());
+  if (s && s->closed) {
+    caps = s->caps;
+    reuse_caps = true;
+    s->put();
+    s = NULL;
+  }
+  if (!s) {
+    // if the sender is not a monitor, make sure their first message for a
+    // session is an MAuth.  If it is not, assume it's a stray message,
+    // and considering that we are creating a new session it is safe to
+    // assume that the sender hasn't authenticated yet, so we have no way
+    // of assessing whether we should handle it or not.
+    if (!src_is_mon && (m->get_type() != CEPH_MSG_AUTH &&
+			m->get_type() != CEPH_MSG_MON_GET_MAP)) {
+      if (m->get_type() == CEPH_MSG_PING) {
+        // let it go through and be dispatched immediately!
+        return dispatch(s, m, false);
+      }
+      dout(1) << __func__ << " dropping stray message " << *m
+        << " from " << m->get_source_inst() << dendl;
+      return false;
     }
-    if (!s) {
-      if (!exited_quorum.is_zero() && !src_is_mon) {
-	waitlist_or_zap_client(m);
-	return true;
-      }
-      dout(10) << "do not have session, making new one" << dendl;
-      s = session_map.new_session(m->get_source_inst(), m->get_connection().get());
-      m->get_connection()->set_priv(s->get());
-      dout(10) << "ms_dispatch new session " << s << " for " << s->inst << dendl;
 
-      if (m->get_connection()->get_peer_type() != CEPH_ENTITY_TYPE_MON) {
-	dout(10) << "setting timeout on session" << dendl;
-	// set an initial timeout here, so we will trim this session even if they don't
-	// do anything.
-	s->until = ceph_clock_now(g_ceph_context);
-	s->until += g_conf->mon_subscribe_interval;
-      } else {
-	//give it monitor caps; the peer type has been authenticated
-	reuse_caps = false;
-	dout(5) << "setting monitor caps on this connection" << dendl;
-	if (!s->caps.is_allow_all()) //but no need to repeatedly copy
-	  s->caps = *mon_caps;
-      }
-      if (reuse_caps)
-        s->caps = caps;
+    if (!exited_quorum.is_zero() && !src_is_mon) {
+      waitlist_or_zap_client(m);
+      return true;
+    }
+
+    dout(10) << "do not have session, making new one" << dendl;
+    s = session_map.new_session(m->get_source_inst(), m->get_connection().get());
+    m->get_connection()->set_priv(s->get());
+    dout(10) << "ms_dispatch new session " << s << " for " << s->inst << dendl;
+
+    if (!src_is_mon) {
+      dout(10) << "setting timeout on session" << dendl;
+      // set an initial timeout here, so we will trim this session even if they don't
+      // do anything.
+      s->until = ceph_clock_now(g_ceph_context);
+      s->until += g_conf->mon_subscribe_interval;
     } else {
-      dout(20) << "ms_dispatch existing session " << s << " for " << s->inst << dendl;
+      //give it monitor caps; the peer type has been authenticated
+      reuse_caps = false;
+      dout(5) << "setting monitor caps on this connection" << dendl;
+      if (!s->caps.is_allow_all()) //but no need to repeatedly copy
+        s->caps = *mon_caps;
     }
+    if (reuse_caps)
+      s->caps = caps;
+  } else {
+    dout(20) << "ms_dispatch existing session " << s << " for " << s->inst << dendl;
+  }
+
+  if (s) {
     if (s->auth_handler) {
       entity_name = s->auth_handler->get_entity_name();
     }
-  }
-
-  if (s)
     dout(20) << " caps " << s->caps.get_str() << dendl;
+  }
 
   if (is_synchronizing() && !src_is_mon) {
     waitlist_or_zap_client(m);
     return true;
   }
 
-  {
-    switch (m->get_type()) {
-      
+  ret = dispatch(s, m, src_is_mon);
+
+  if (s) {
+    s->put();
+  }
+
+  return ret;
+}
+
+bool Monitor::dispatch(MonSession *s, Message *m, const bool src_is_mon)
+{
+  bool ret = true;
+
+  assert(m != NULL);
+
+  switch (m->get_type()) {
+
     case MSG_ROUTE:
       handle_route(static_cast<MRoute*>(m));
       break;
 
-      // misc
+    // misc
     case CEPH_MSG_MON_GET_MAP:
       handle_mon_get_map(static_cast<MMonGetMap*>(m));
       break;
@@ -2663,12 +2810,11 @@ bool Monitor::_ms_dispatch(Message *m)
     case MSG_MON_SYNC:
       handle_sync(static_cast<MMonSync*>(m));
       break;
-
     case MSG_MON_SCRUB:
       handle_scrub(static_cast<MMonScrub*>(m));
       break;
 
-      // OSDs
+    // OSDs
     case MSG_OSD_MARK_ME_DOWN:
     case MSG_OSD_FAILURE:
     case MSG_OSD_BOOT:
@@ -2681,20 +2827,20 @@ bool Monitor::_ms_dispatch(Message *m)
       paxos_service[PAXOS_OSDMAP]->dispatch((PaxosServiceMessage*)m);
       break;
 
-      // MDSs
+    // MDSs
     case MSG_MDS_BEACON:
     case MSG_MDS_OFFLOAD_TARGETS:
       paxos_service[PAXOS_MDSMAP]->dispatch((PaxosServiceMessage*)m);
       break;
 
-      // auth
+    // auth
     case MSG_MON_GLOBAL_ID:
     case CEPH_MSG_AUTH:
       /* no need to check caps here */
       paxos_service[PAXOS_AUTH]->dispatch((PaxosServiceMessage*)m);
       break;
 
-      // pg
+    // pg
     case CEPH_MSG_STATFS:
     case MSG_PGSTATS:
     case MSG_GETPOOLSTATS:
@@ -2705,7 +2851,7 @@ bool Monitor::_ms_dispatch(Message *m)
       paxos_service[PAXOS_OSDMAP]->dispatch((PaxosServiceMessage*)m);
       break;
 
-      // log
+    // log
     case MSG_LOG:
       paxos_service[PAXOS_LOG]->dispatch((PaxosServiceMessage*)m);
       break;
@@ -2714,60 +2860,60 @@ bool Monitor::_ms_dispatch(Message *m)
       clog.handle_log_ack((MLogAck*)m);
       break;
 
-      // monmap
+    // monmap
     case MSG_MON_JOIN:
       paxos_service[PAXOS_MONMAP]->dispatch((PaxosServiceMessage*)m);
       break;
 
-      // paxos
+    // paxos
     case MSG_MON_PAXOS:
       {
-	MMonPaxos *pm = static_cast<MMonPaxos*>(m);
-	if (!src_is_mon && 
-	    !s->is_capable("mon", MON_CAP_X)) {
-	  //can't send these!
-	  pm->put();
-	  break;
-	}
+        MMonPaxos *pm = static_cast<MMonPaxos*>(m);
+        if (!src_is_mon ||
+            !s->is_capable("mon", MON_CAP_X)) {
+          //can't send these!
+          pm->put();
+          break;
+        }
 
-	if (state == STATE_SYNCHRONIZING) {
-	  // we are synchronizing. These messages would do us no
-	  // good, thus just drop them and ignore them.
-	  dout(10) << __func__ << " ignore paxos msg from "
-		   << pm->get_source_inst() << dendl;
-	  pm->put();
-	  break;
-	}
+        if (state == STATE_SYNCHRONIZING) {
+          // we are synchronizing. These messages would do us no
+          // good, thus just drop them and ignore them.
+          dout(10) << __func__ << " ignore paxos msg from "
+            << pm->get_source_inst() << dendl;
+          pm->put();
+          break;
+        }
 
-	// sanitize
-	if (pm->epoch > get_epoch()) {
-	  bootstrap();
-	  pm->put();
-	  break;
-	}
-	if (pm->epoch != get_epoch()) {
-	  pm->put();
-	  break;
-	}
+        // sanitize
+        if (pm->epoch > get_epoch()) {
+          bootstrap();
+          pm->put();
+          break;
+        }
+        if (pm->epoch != get_epoch()) {
+          pm->put();
+          break;
+        }
 
-	paxos->dispatch((PaxosServiceMessage*)m);
+        paxos->dispatch((PaxosServiceMessage*)m);
       }
       break;
 
-      // elector messages
+    // elector messages
     case MSG_MON_ELECTION:
       //check privileges here for simplicity
       if (s &&
-	  !s->is_capable("mon", MON_CAP_X)) {
-	dout(0) << "MMonElection received from entity without enough caps!"
-		<< s->caps << dendl;
-	m->put();
-	break;
+          !s->is_capable("mon", MON_CAP_X)) {
+        dout(0) << "MMonElection received from entity without enough caps!"
+          << s->caps << dendl;
+        m->put();
+        break;
       }
       if (!is_probing() && !is_synchronizing()) {
-	elector.dispatch(m);
+        elector.dispatch(m);
       } else {
-	m->put();
+        m->put();
       }
       break;
 
@@ -2783,15 +2929,41 @@ bool Monitor::_ms_dispatch(Message *m)
       health_monitor->dispatch(static_cast<MMonHealth *>(m));
       break;
 
+    case CEPH_MSG_PING:
+      handle_ping(static_cast<MPing*>(m));
+      break;
+
     default:
       ret = false;
-    }
-  }
-  if (s) {
-    s->put();
   }
 
   return ret;
+}
+
+void Monitor::handle_ping(MPing *m)
+{
+  dout(10) << __func__ << " " << *m << dendl;
+  MPing *reply = new MPing;
+  entity_inst_t inst = m->get_source_inst();
+  bufferlist payload;
+  Formatter *f = new JSONFormatter(true);
+  f->open_object_section("pong");
+
+  string health_str;
+  get_health(health_str, NULL, f);
+  {
+    stringstream ss;
+    _mon_status(f, ss);
+  }
+
+  f->close_section();
+  stringstream ss;
+  f->flush(ss);
+  ::encode(ss.str(), payload);
+  reply->set_payload(payload);
+  dout(10) << __func__ << " reply payload len " << reply->get_payload().length() << dendl;
+  messenger->send_message(reply, inst);
+  m->put();
 }
 
 void Monitor::timecheck_start()

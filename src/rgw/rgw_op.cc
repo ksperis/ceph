@@ -269,7 +269,7 @@ static int read_policy(RGWRados *store, struct req_state *s,
   string oid = object;
   rgw_obj obj;
 
-  if (bucket_info.flags & BUCKET_SUSPENDED) {
+  if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
     ldout(s->cct, 0) << "NOTICE: bucket " << bucket_info.bucket.name << " is suspended" << dendl;
     return -ERR_USER_SUSPENDED;
   }
@@ -292,7 +292,7 @@ static int read_policy(RGWRados *store, struct req_state *s,
     if (ret < 0)
       return ret;
     string& owner = bucket_policy.get_owner().get_id();
-    if (owner.compare(s->user.user_id) != 0 &&
+    if (!s->system_request && owner.compare(s->user.user_id) != 0 &&
         !bucket_policy.verify_permission(s->user.user_id, s->perm_mask, RGW_PERM_READ))
       ret = -EACCES;
     else
@@ -339,7 +339,7 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
       s->local_source = store->region.equals(region);
     }
   }
-    
+
   if (s->bucket_name_str.size()) {
     s->bucket_exists = true;
     if (s->bucket_instance_id.empty()) {
@@ -418,6 +418,52 @@ int RGWOp::verify_op_mask()
     return -EPERM;
   }
 
+  if (!s->system_request && (required_mask & RGW_OP_TYPE_MODIFY) && !store->zone.is_master)  {
+    ldout(s->cct, 5) << "NOTICE: modify request to a non-master zone by a non-system user, permission denied"  << dendl;
+    return -EPERM;
+  }
+
+  return 0;
+}
+
+int RGWOp::init_quota()
+{
+  /* no quota enforcement for system requests */
+  if (s->system_request)
+    return 0;
+
+  /* init quota related stuff */
+  if (!(s->user.op_mask & RGW_OP_TYPE_MODIFY)) {
+    return 0;
+  }
+
+  /* only interested in object related ops */
+  if (s->object_str.empty()) {
+    return 0;
+  }
+
+  if (s->bucket_info.quota.enabled) {
+    bucket_quota = s->bucket_info.quota;
+    return 0;
+  }
+  if (s->user.user_id == s->bucket_owner.get_id()) {
+    if (s->user.bucket_quota.enabled) {
+      bucket_quota = s->user.bucket_quota;
+      return 0;
+    }
+  } else {
+    RGWUserInfo owner_info;
+    int r = rgw_get_user_info_by_uid(store, s->bucket_info.owner, owner_info);
+    if (r < 0)
+      return r;
+
+    if (owner_info.bucket_quota.enabled) {
+      bucket_quota = owner_info.bucket_quota;
+      return 0;
+    }
+  }
+
+  bucket_quota = store->region_map.bucket_quota;
   return 0;
 }
 
@@ -1152,8 +1198,12 @@ void RGWCreateBucket::execute()
   }
 
   ret = rgw_link_bucket(store, s->user.user_id, s->bucket, info.creation_time, false);
-  if (ret && !existed && ret != -EEXIST)   /* if it exists (or previously existed), don't remove it! */
-    rgw_unlink_bucket(store, s->user.user_id, s->bucket.name);
+  if (ret && !existed && ret != -EEXIST) {  /* if it exists (or previously existed), don't remove it! */
+    ret = rgw_unlink_bucket(store, s->user.user_id, s->bucket.name);
+    if (ret < 0) {
+      ldout(s->cct, 0) << "WARNING: failed to unlink bucket: ret=" << ret << dendl;
+    }
+  }
 
   if (ret == -EEXIST)
     ret = -ERR_BUCKET_EXISTS;
@@ -1171,7 +1221,7 @@ void RGWDeleteBucket::execute()
 {
   ret = -EINVAL;
 
-  if (!s->bucket_name)
+  if (s->bucket_name_str.empty())
     return;
 
   RGWObjVersionTracker ot;
@@ -1363,6 +1413,14 @@ void RGWPutObj::execute()
     ldout(s->cct, 15) << "supplied_md5=" << supplied_md5 << dendl;
   }
 
+  if (!chunked_upload) { /* with chunked upload we don't know how big is the upload.
+                            we also check sizes at the end anyway */
+    ret = store->check_quota(s->bucket, bucket_quota, s->content_length);
+    if (ret < 0) {
+      goto done;
+    }
+  }
+
   if (supplied_etag) {
     strncpy(supplied_md5, supplied_etag, sizeof(supplied_md5) - 1);
     supplied_md5[sizeof(supplied_md5) - 1] = '\0';
@@ -1406,6 +1464,11 @@ void RGWPutObj::execute()
   }
   s->obj_size = ofs;
   perfcounter->inc(l_rgw_put_b, s->obj_size);
+
+  ret = store->check_quota(s->bucket, bucket_quota, s->obj_size);
+  if (ret < 0) {
+    goto done;
+  }
 
   hash.Final(m);
 
@@ -1604,6 +1667,13 @@ void RGWPutMetadata::execute()
     }
   }
 
+  map<string, string>::iterator giter;
+  for (giter = s->generic_attrs.begin(); giter != s->generic_attrs.end(); ++giter) {
+    bufferlist& attrbl = attrs[giter->first];
+    const string& val = giter->second;
+    attrbl.append(val.c_str(), val.size() + 1);
+  }
+
   if (has_policy) {
     policy.encode(bl);
     attrs[RGW_ATTR_ACL] = bl;
@@ -1644,8 +1714,6 @@ bool RGWCopyObj::parse_copy_location(const char *src, string& bucket_name, strin
 
   url_decode(url_src, dec_src);
   src = dec_src.c_str();
-
-  ldout(s->cct, 15) << "decoded obj=" << src << dendl;
 
   if (*src == '/') ++src;
 

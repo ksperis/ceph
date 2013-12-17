@@ -1,8 +1,7 @@
 #ifndef CEPH_CRC32C_H
 #define CEPH_CRC32C_H
 
-#include "include/int_types.h"
-
+#include <inttypes.h>
 #include <string.h>
 
 typedef uint32_t (*ceph_crc32c_func_t)(uint32_t crc, unsigned char const *data, unsigned length);
@@ -15,8 +14,15 @@ extern ceph_crc32c_func_t ceph_crc32c_func;
 
 extern ceph_crc32c_func_t ceph_choose_crc32(void);
 
-/*
- * common entry point; use this!
+/**
+ * calculate crc32c
+ *
+ * Note: if the data pointer is NULL, we calculate a crc value as if
+ * it were zero-filled.
+ *
+ * @param crc initial value
+ * @param data pointer to data buffer
+ * @param length length of buffer
  */
 static inline uint32_t ceph_crc32c(uint32_t crc, unsigned char const *data, unsigned length)
 {

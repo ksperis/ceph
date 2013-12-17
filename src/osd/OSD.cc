@@ -16,6 +16,7 @@
 #include <iostream>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <signal.h>
 #include <ctype.h>
 #include <boost/scoped_ptr.hpp>
@@ -37,8 +38,8 @@
 
 #include "common/ceph_argparse.h"
 #include "common/version.h"
-#include "os/FileStore.h"
-#include "os/FileJournal.h"
+
+#include "os/ObjectStore.h"
 
 #include "ReplicatedPG.h"
 
@@ -98,7 +99,6 @@
 #include "common/perf_counters.h"
 #include "common/Timer.h"
 #include "common/LogClient.h"
-#include "common/safe_io.h"
 #include "common/HeartbeatMap.h"
 #include "common/admin_socket.h"
 
@@ -134,9 +134,9 @@ static ostream& _prefix(std::ostream* _dout, int whoami, OSDMapRef osdmap) {
 		<< " ";
 }
 
-const coll_t coll_t::META_COLL("meta");
-
-static CompatSet get_osd_compat_set() {
+//Initial features in new superblock.
+//Features here are also automatically upgraded
+CompatSet OSD::get_osd_initial_compat_set() {
   CompatSet::FeatureSet ceph_osd_feature_compat;
   CompatSet::FeatureSet ceph_osd_feature_ro_compat;
   CompatSet::FeatureSet ceph_osd_feature_incompat;
@@ -152,6 +152,14 @@ static CompatSet get_osd_compat_set() {
   ceph_osd_feature_incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SNAPMAPPER);
   return CompatSet(ceph_osd_feature_compat, ceph_osd_feature_ro_compat,
 		   ceph_osd_feature_incompat);
+}
+
+//Features are added here that this OSD supports.
+CompatSet OSD::get_osd_compat_set() {
+  CompatSet compat =  get_osd_initial_compat_set();
+  //Any features here can be set in code, but not in initial superblock
+  compat.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SHARDS);
+  return compat;
 }
 
 OSDService::OSDService(OSD *osd) :
@@ -172,6 +180,7 @@ OSDService::OSDService(OSD *osd) :
   scrub_wq(osd->scrub_wq),
   scrub_finalize_wq(osd->scrub_finalize_wq),
   rep_scrub_wq(osd->rep_scrub_wq),
+  push_wq("push_wq", cct->_conf->osd_recovery_thread_timeout, &osd->recovery_tp),
   class_handler(osd->class_handler),
   publish_lock("OSDService::publish_lock"),
   pre_publish_lock("OSDService::pre_publish_lock"),
@@ -425,23 +434,9 @@ void OSDService::init()
     objecter_timer.init();
     objecter->set_client_incarnation(0);
     objecter->init_locked();
+    objecter->unset_honor_cache_redirects();
   }
   watch_timer.init();
-}
-
-ObjectStore *OSD::create_object_store(CephContext *cct, const std::string &dev, const std::string &jdev)
-{
-  struct stat st;
-  if (::stat(dev.c_str(), &st) != 0)
-    return 0;
-
-  if (cct->_conf->filestore)
-    return new FileStore(dev, jdev);
-
-  if (S_ISDIR(st.st_mode))
-    return new FileStore(dev, jdev);
-  else
-    return 0;
 }
 
 #undef dout_prefix
@@ -451,7 +446,7 @@ int OSD::convert_collection(ObjectStore *store, coll_t cid)
 {
   coll_t tmp0("convertfs_temp");
   coll_t tmp1("convertfs_temp1");
-  vector<hobject_t> objects;
+  vector<ghobject_t> objects;
 
   map<string, bufferptr> aset;
   int r = store->collection_getattrs(cid, aset);
@@ -471,10 +466,10 @@ int OSD::convert_collection(ObjectStore *store, coll_t cid)
     store->apply_transaction(t);
   }
 
-  hobject_t next;
+  ghobject_t next;
   while (!next.is_max()) {
     objects.clear();
-    hobject_t start = next;
+    ghobject_t start = next;
     r = store->collection_list_partial(cid, start,
 				       200, 300, 0,
 				       &objects, &next);
@@ -482,7 +477,7 @@ int OSD::convert_collection(ObjectStore *store, coll_t cid)
       return r;
 
     ObjectStore::Transaction t;
-    for (vector<hobject_t>::iterator i = objects.begin();
+    for (vector<ghobject_t>::iterator i = objects.begin();
 	 i != objects.end();
 	 ++i) {
       t.collection_add(tmp0, cid, *i);
@@ -516,7 +511,7 @@ int OSD::do_convertfs(ObjectStore *store)
   if (r == 1)
     return store->umount();
 
-  derr << "FileStore is old at version " << version << ".  Updating..."  << dendl;
+  derr << "ObjectStore is old at version " << version << ".  Updating..."  << dendl;
 
   derr << "Removing tmp pgs" << dendl;
   vector<coll_t> collections;
@@ -573,39 +568,24 @@ int OSD::do_convertfs(ObjectStore *store)
   return store->umount();
 }
 
-int OSD::convertfs(const std::string &dev, const std::string &jdev)
-{
-  boost::scoped_ptr<ObjectStore> store(
-    new FileStore(dev, jdev, "filestore", 
-		  true));
-  int r = do_convertfs(store.get());
-  return r;
-}
-
-int OSD::mkfs(CephContext *cct, const std::string &dev, const std::string &jdev, uuid_d fsid, int whoami)
+int OSD::mkfs(CephContext *cct, ObjectStore *store, const string &dev,
+	      uuid_d fsid, int whoami)
 {
   int ret;
-  ObjectStore *store = NULL;
 
   try {
-    store = create_object_store(cct, dev, jdev);
-    if (!store) {
-      ret = -ENOENT;
-      goto out;
-    }
-
     // if we are fed a uuid for this osd, use it.
     store->set_fsid(cct->_conf->osd_uuid);
 
     ret = store->mkfs();
     if (ret) {
-      derr << "OSD::mkfs: FileStore::mkfs failed with error " << ret << dendl;
+      derr << "OSD::mkfs: ObjectStore::mkfs failed with error " << ret << dendl;
       goto free_store;
     }
 
     ret = store->mount();
     if (ret) {
-      derr << "OSD::mkfs: couldn't mount FileStore: error " << ret << dendl;
+      derr << "OSD::mkfs: couldn't mount ObjectStore: error " << ret << dendl;
       goto free_store;
     }
 
@@ -648,7 +628,7 @@ int OSD::mkfs(CephContext *cct, const std::string &dev, const std::string &jdev,
       sb.cluster_fsid = fsid;
       sb.osd_fsid = store->get_fsid();
       sb.whoami = whoami;
-      sb.compat_features = get_osd_compat_set();
+      sb.compat_features = get_osd_initial_compat_set();
 
       // benchmark?
       if (cct->_conf->osd_auto_weight) {
@@ -697,15 +677,9 @@ int OSD::mkfs(CephContext *cct, const std::string &dev, const std::string &jdev,
 
     store->sync_and_flush();
 
-    ret = write_meta(dev, sb.cluster_fsid, sb.osd_fsid, whoami);
+    ret = write_meta(store, sb.cluster_fsid, sb.osd_fsid, whoami);
     if (ret) {
       derr << "OSD::mkfs: failed to write fsid file: error " << ret << dendl;
-      goto umount_store;
-    }
-
-    ret = write_meta(dev, "ready", "ready\n", 6);
-    if (ret) {
-      derr << "OSD::mkfs: failed to write ready file: error " << ret << dendl;
       goto umount_store;
     }
 
@@ -723,183 +697,68 @@ umount_store:
   store->umount();
 free_store:
   delete store;
-out:
   return ret;
 }
 
-int OSD::mkjournal(CephContext *cct, const std::string &dev, const std::string &jdev)
-{
-  ObjectStore *store = create_object_store(cct, dev, jdev);
-  if (!store)
-    return -ENOENT;
-  return store->mkjournal();
-}
-
-int OSD::flushjournal(CephContext *cct, const std::string &dev, const std::string &jdev)
-{
-  ObjectStore *store = create_object_store(cct, dev, jdev);
-  if (!store)
-    return -ENOENT;
-  int err = store->mount();
-  if (!err) {
-    store->sync_and_flush();
-    store->umount();
-  }
-  delete store;
-  return err;
-}
-
-int OSD::dump_journal(CephContext *cct, const std::string &dev, const std::string &jdev, ostream& out)
-{
-  ObjectStore *store = create_object_store(cct, dev, jdev);
-  if (!store)
-    return -ENOENT;
-  int err = store->dump_journal(out);
-  delete store;
-  return err;
-}
-
-int OSD::write_meta(const std::string &base, const std::string &file,
-		    const char *val, size_t vallen)
-{
-  int ret;
-  char fn[PATH_MAX];
-  char tmp[PATH_MAX];
-  int fd;
-
-  // does the file already have correct content?
-  char oldval[80];
-  ret = read_meta(base, file, oldval, sizeof(oldval));
-  if (ret == (int)vallen && memcmp(oldval, val, vallen) == 0)
-    return 0;  // yes.
-
-  snprintf(fn, sizeof(fn), "%s/%s", base.c_str(), file.c_str());
-  snprintf(tmp, sizeof(tmp), "%s/%s.tmp", base.c_str(), file.c_str());
-  fd = ::open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-  if (fd < 0) {
-    ret = errno;
-    derr << "write_meta: error opening '" << tmp << "': "
-	 << cpp_strerror(ret) << dendl;
-    return -ret;
-  }
-  ret = safe_write(fd, val, vallen);
-  if (ret) {
-    derr << "write_meta: failed to write to '" << tmp << "': "
-	 << cpp_strerror(ret) << dendl;
-    TEMP_FAILURE_RETRY(::close(fd));
-    return ret;
-  }
-
-  ret = ::fsync(fd);
-  TEMP_FAILURE_RETRY(::close(fd));
-  if (ret) {
-    ::unlink(tmp);
-    derr << "write_meta: failed to fsync to '" << tmp << "': "
-	 << cpp_strerror(ret) << dendl;
-    return ret;
-  }
-  ret = ::rename(tmp, fn);
-  if (ret) {
-    ::unlink(tmp);
-    derr << "write_meta: failed to rename '" << tmp << "' to '" << fn << "': "
-	 << cpp_strerror(ret) << dendl;
-    return ret;
-  }
-
-  fd = ::open(base.c_str(), O_RDONLY);
-  if (fd < 0) {
-    ret = errno;
-    derr << "write_meta: failed to open dir '" << base << "': "
-	 << cpp_strerror(ret) << dendl;
-    return -ret;
-  }
-  ::fsync(fd);
-  TEMP_FAILURE_RETRY(::close(fd));
-
-  return 0;
-}
-
-int OSD::read_meta(const  std::string &base, const std::string &file,
-		   char *val, size_t vallen)
-{
-  char fn[PATH_MAX];
-  int fd, len;
-
-  snprintf(fn, sizeof(fn), "%s/%s", base.c_str(), file.c_str());
-  fd = ::open(fn, O_RDONLY);
-  if (fd < 0) {
-    int err = errno;
-    return -err;
-  }
-  len = safe_read(fd, val, vallen);
-  if (len < 0) {
-    TEMP_FAILURE_RETRY(::close(fd));
-    return len;
-  }
-  // close sometimes returns errors, but only after write()
-  TEMP_FAILURE_RETRY(::close(fd));
-
-  val[len] = 0;
-  return len;
-}
-
-int OSD::write_meta(const std::string &base, uuid_d& cluster_fsid, uuid_d& osd_fsid, int whoami)
+int OSD::write_meta(ObjectStore *store, uuid_d& cluster_fsid, uuid_d& osd_fsid, int whoami)
 {
   char val[80];
+  int r;
   
-  snprintf(val, sizeof(val), "%s\n", CEPH_OSD_ONDISK_MAGIC);
-  write_meta(base, "magic", val, strlen(val));
+  snprintf(val, sizeof(val), "%s", CEPH_OSD_ONDISK_MAGIC);
+  r = store->write_meta("magic", val);
+  if (r < 0)
+    return r;
 
-  snprintf(val, sizeof(val), "%d\n", whoami);
-  write_meta(base, "whoami", val, strlen(val));
+  snprintf(val, sizeof(val), "%d", whoami);
+  r = store->write_meta("whoami", val);
+  if (r < 0)
+    return r;
 
   cluster_fsid.print(val);
-  strcat(val, "\n");
-  write_meta(base, "ceph_fsid", val, strlen(val));
+  r = store->write_meta("ceph_fsid", val);
+  if (r < 0)
+    return r;
+
+  r = store->write_meta("ready", "ready");
+  if (r < 0)
+    return r;
 
   return 0;
 }
 
-int OSD::peek_meta(const std::string &dev, std::string& magic,
+int OSD::peek_meta(ObjectStore *store, std::string& magic,
 		   uuid_d& cluster_fsid, uuid_d& osd_fsid, int& whoami)
 {
-  char val[80] = { 0 };
+  string val;
 
-  if (read_meta(dev, "magic", val, sizeof(val)) < 0)
-    return -errno;
-  int l = strlen(val);
-  if (l && val[l-1] == '\n')
-    val[l-1] = 0;
+  int r = store->read_meta("magic", &val);
+  if (r < 0)
+    return r;
   magic = val;
 
-  if (read_meta(dev, "whoami", val, sizeof(val)) < 0)
-    return -errno;
-  whoami = atoi(val);
+  r = store->read_meta("whoami", &val);
+  if (r < 0)
+    return r;
+  whoami = atoi(val.c_str());
 
-  if (read_meta(dev, "ceph_fsid", val, sizeof(val)) < 0)
-    return -errno;
-  if (strlen(val) > 36)
-    val[36] = 0;
-  cluster_fsid.parse(val);
+  r = store->read_meta("ceph_fsid", &val);
+  if (r < 0)
+    return r;
+  r = cluster_fsid.parse(val.c_str());
+  if (r < 0)
+    return r;
 
-  if (read_meta(dev, "fsid", val, sizeof(val)) < 0)
+  r = store->read_meta("fsid", &val);
+  if (r < 0) {
     osd_fsid = uuid_d();
-  else {
-    if (strlen(val) > 36)
-      val[36] = 0;
-    osd_fsid.parse(val);
+  } else {
+    r = osd_fsid.parse(val.c_str());
+    if (r < 0)
+      return r;
   }
 
   return 0;
-}
-
-int OSD::peek_journal_fsid(string path, uuid_d& fsid)
-{
-  // make sure we don't try to use aio or direct_io (and get annoying
-  // error messages from failing to do so); performance implications
-  // should be irrelevant for this use
-  FileJournal j(fsid, 0, 0, path.c_str(), false, false);
-  return j.peek_fsid(fsid);
 }
 
 
@@ -908,7 +767,8 @@ int OSD::peek_journal_fsid(string path, uuid_d& fsid)
 
 // cons/des
 
-OSD::OSD(CephContext *cct_, int id, Messenger *internal_messenger, Messenger *external_messenger,
+OSD::OSD(CephContext *cct_, ObjectStore *store_,
+	 int id, Messenger *internal_messenger, Messenger *external_messenger,
 	 Messenger *hb_clientm,
 	 Messenger *hb_front_serverm,
 	 Messenger *hb_back_serverm,
@@ -932,7 +792,7 @@ OSD::OSD(CephContext *cct_, int id, Messenger *internal_messenger, Messenger *ex
   monc(mc),
   logger(NULL),
   recoverystate_perf(NULL),
-  store(NULL),
+  store(store_),
   clog(cct, client_messenger, &mc->monmap, LogClient::NO_FLAGS),
   whoami(id),
   dev_path(dev), journal_path(jdev),
@@ -974,13 +834,17 @@ OSD::OSD(CephContext *cct_, int id, Messenger *internal_messenger, Messenger *ex
   replay_queue_lock("OSD::replay_queue_lock"),
   snap_trim_wq(this, cct->_conf->osd_snap_trim_thread_timeout, &disk_tp),
   scrub_wq(this, cct->_conf->osd_scrub_thread_timeout, &disk_tp),
-  scrub_finalize_wq(this, cct->_conf->osd_scrub_finalize_thread_timeout, &op_tp),
+  scrub_finalize_wq(cct->_conf->osd_scrub_finalize_thread_timeout, &op_tp),
   rep_scrub_wq(this, cct->_conf->osd_scrub_thread_timeout, &disk_tp),
   remove_wq(store, cct->_conf->osd_remove_thread_timeout, &disk_tp),
   next_removal_seq(0),
   service(this)
 {
   monc->set_messenger(client_messenger);
+  op_tracker.set_complaint_and_threshold(cct->_conf->osd_op_complaint_time,
+                                         cct->_conf->osd_op_log_threshold);
+  op_tracker.set_history_size_and_duration(cct->_conf->osd_op_history_size,
+                                           cct->_conf->osd_op_history_duration);
 }
 
 OSD::~OSD()
@@ -1011,13 +875,6 @@ int OSD::pre_init()
   if (is_stopping())
     return 0;
   
-  assert(!store);
-  store = create_object_store(cct, dev_path, journal_path);
-  if (!store) {
-    derr << "OSD::pre_init: unable to create object store" << dendl;
-    return -ENODEV;
-  }
-
   if (store->test_mount_in_use()) {
     derr << "OSD::pre_init: object store '" << dev_path << "' is "
          << "currently in use. (Is ceph-osd already running?)" << dendl;
@@ -1141,6 +998,7 @@ public:
 
 int OSD::init()
 {
+  CompatSet initial, diff;
   Mutex::Locker lock(osd_lock);
   if (is_stopping())
     return 0;
@@ -1165,9 +1023,48 @@ int OSD::init()
   r = read_superblock();
   if (r < 0) {
     derr << "OSD::init() : unable to read osd superblock" << dendl;
-    store->umount();
-    delete store;
-    return -EINVAL;
+    r = -EINVAL;
+    goto out;
+  }
+
+  if (osd_compat.compare(superblock.compat_features) < 0) {
+    derr << "The disk uses features unsupported by the executable." << dendl;
+    derr << " ondisk features " << superblock.compat_features << dendl;
+    derr << " daemon features " << osd_compat << dendl;
+
+    if (osd_compat.writeable(superblock.compat_features)) {
+      CompatSet diff = osd_compat.unsupported(superblock.compat_features);
+      derr << "it is still writeable, though. Missing features: " << diff << dendl;
+      r = -EOPNOTSUPP;
+      goto out;
+    }
+    else {
+      CompatSet diff = osd_compat.unsupported(superblock.compat_features);
+      derr << "Cannot write to disk! Missing features: " << diff << dendl;
+      r = -EOPNOTSUPP;
+      goto out;
+    }
+  }
+
+  assert_warn(whoami == superblock.whoami);
+  if (whoami != superblock.whoami) {
+    derr << "OSD::init: superblock says osd"
+	 << superblock.whoami << " but i am osd." << whoami << dendl;
+    r = -EINVAL;
+    goto out;
+  }
+
+  initial = get_osd_initial_compat_set();
+  diff = superblock.compat_features.unsupported(initial);
+  if (superblock.compat_features.merge(initial)) {
+    // We need to persist the new compat_set before we
+    // do anything else
+    dout(5) << "Upgrading superblock adding: " << diff << dendl;
+    ObjectStore::Transaction t;
+    write_superblock(t);
+    r = store->apply_transaction(t);
+    if (r < 0)
+      goto out;
   }
 
   // make sure info object exists
@@ -1177,7 +1074,7 @@ int OSD::init()
     t.touch(coll_t::META_COLL, service.infos_oid);
     r = store->apply_transaction(t);
     if (r < 0)
-      return r;
+      goto out;
   }
 
   // make sure snap mapper object exists
@@ -1187,19 +1084,7 @@ int OSD::init()
     t.touch(coll_t::META_COLL, OSD::make_snapmapper_oid());
     r = store->apply_transaction(t);
     if (r < 0)
-      return r;
-  }
-
-  if (osd_compat.compare(superblock.compat_features) != 0) {
-    // We need to persist the new compat_set before we
-    // do anything else
-    dout(5) << "Upgrading superblock compat_set" << dendl;
-    superblock.compat_features = osd_compat;
-    ObjectStore::Transaction t;
-    write_superblock(t);
-    r = store->apply_transaction(t);
-    if (r < 0)
-      return r;
+      goto out;
   }
 
   class_handler = new ClassHandler(cct);
@@ -1215,7 +1100,8 @@ int OSD::init()
   assert_warn(!osdmap);
   if (osdmap) {
     derr << "OSD::init: unable to read current osdmap" << dendl;
-    return -EINVAL;
+    r = -EINVAL;
+    goto out;
   }
   osdmap = get_map(superblock.current_epoch);
   check_osdmap_features();
@@ -1228,12 +1114,6 @@ int OSD::init()
   load_pgs();
 
   dout(2) << "superblock: i am osd." << superblock.whoami << dendl;
-  assert_warn(whoami == superblock.whoami);
-  if (whoami != superblock.whoami) {
-    derr << "OSD::init: logic error: superblock says osd"
-	 << superblock.whoami << " but i am osd." << whoami << dendl;
-    return -EINVAL;
-  }
 
   create_logger();
     
@@ -1250,7 +1130,7 @@ int OSD::init()
   monc->set_want_keys(CEPH_ENTITY_TYPE_MON | CEPH_ENTITY_TYPE_OSD);
   r = monc->init();
   if (r < 0)
-    return r;
+    goto out;
 
   // tell monc about log_client so it will know about mon session resets
   monc->set_log_client(&clog);
@@ -1274,12 +1154,10 @@ int OSD::init()
 
   r = monc->authenticate();
   if (r < 0) {
-    monc->shutdown();
-    store->umount();
     osd_lock.Lock(); // locker is going to unlock this on function exit
     if (is_stopping())
-      return 0;
-    return r;
+      r =  0;
+    goto monout;
   }
 
   while (monc->wait_auth_rotating(30.0) < 0) {
@@ -1299,6 +1177,13 @@ int OSD::init()
   start_boot();
 
   return 0;
+monout:
+  monc->shutdown();
+
+out:
+  store->umount();
+  delete store;
+  return r;
 }
 
 void OSD::final_init()
@@ -1717,28 +1602,6 @@ int OSD::read_superblock()
   ::decode(superblock, p);
 
   dout(10) << "read_superblock " << superblock << dendl;
-  if (osd_compat.compare(superblock.compat_features) < 0) {
-    derr << "The disk uses features unsupported by the executable." << dendl;
-    derr << " ondisk features " << superblock.compat_features << dendl;
-    derr << " daemon features " << osd_compat << dendl;
-
-    if (osd_compat.writeable(superblock.compat_features)) {
-      derr << "it is still writeable, though. Missing features:" << dendl;
-      CompatSet diff = osd_compat.unsupported(superblock.compat_features);
-      return -EOPNOTSUPP;
-    }
-    else {
-      derr << "Cannot write to disk! Missing features:" << dendl;
-      CompatSet diff = osd_compat.unsupported(superblock.compat_features);
-      return -EOPNOTSUPP;
-    }
-  }
-
-  if (whoami != superblock.whoami) {
-    derr << "read_superblock superblock says osd." << superblock.whoami
-         << ", but i (think i) am osd." << whoami << dendl;
-    return -1;
-  }
   
   return 0;
 }
@@ -1753,17 +1616,17 @@ void OSD::recursive_remove_collection(ObjectStore *store, coll_t tmp)
     make_snapmapper_oid());
   SnapMapper mapper(&driver, 0, 0, 0);
 
-  vector<hobject_t> objects;
+  vector<ghobject_t> objects;
   store->collection_list(tmp, objects);
 
   // delete them.
   ObjectStore::Transaction t;
   unsigned removed = 0;
-  for (vector<hobject_t>::iterator p = objects.begin();
+  for (vector<ghobject_t>::iterator p = objects.begin();
        p != objects.end();
        ++p, removed++) {
     OSDriver::OSTransaction _t(driver.get_transaction(&t));
-    int r = mapper.remove_oid(*p, &_t);
+    int r = mapper.remove_oid(p->hobj, &_t);
     if (r != 0 && r != -ENOENT)
       assert(0);
     t.collection_remove(tmp, *p);
@@ -2265,9 +2128,10 @@ void OSD::handle_pg_peering_evt(
     int role = osdmap->calc_pg_role(whoami, acting, acting.size());
 
     pg_history_t history = info.history;
-    project_pg_history(info.pgid, history, epoch, up, acting);
+    bool valid_history = project_pg_history(
+      info.pgid, history, epoch, up, acting);
 
-    if (epoch < history.same_interval_since) {
+    if (!valid_history || epoch < history.same_interval_since) {
       dout(10) << "get_or_create_pg " << info.pgid << " acting changed in "
 	       << history.same_interval_since << " (msg from " << epoch << ")" << dendl;
       return;
@@ -2452,7 +2316,7 @@ void OSD::calc_priors_during(pg_t pgid, epoch_t start, epoch_t end, set<int>& ps
  * Fill in the passed history so you know same_interval_since, same_up_since,
  * and same_primary_since.
  */
-void OSD::project_pg_history(pg_t pgid, pg_history_t& h, epoch_t from,
+bool OSD::project_pg_history(pg_t pgid, pg_history_t& h, epoch_t from,
 			     const vector<int>& currentup,
 			     const vector<int>& currentacting)
 {
@@ -2466,7 +2330,11 @@ void OSD::project_pg_history(pg_t pgid, pg_history_t& h, epoch_t from,
        e > from;
        e--) {
     // verify during intermediate epoch (e-1)
-    OSDMapRef oldmap = get_map(e-1);
+    OSDMapRef oldmap = service.try_get_map(e-1);
+    if (!oldmap) {
+      dout(15) << __func__ << ": found map gap, returning false" << dendl;
+      return false;
+    }
     assert(oldmap->have_pg_pool(pgid.pool()));
 
     vector<int> up, acting;
@@ -2516,6 +2384,7 @@ void OSD::project_pg_history(pg_t pgid, pg_history_t& h, epoch_t from,
   }
 
   dout(15) << "project_pg_history end " << h << dendl;
+  return true;
 }
 
 // -------------------------------------
@@ -3342,13 +3211,15 @@ bool remove_dir(
   ObjectStore *store, SnapMapper *mapper,
   OSDriver *osdriver,
   ObjectStore::Sequencer *osr,
-  coll_t coll, DeletingStateRef dstate)
+  coll_t coll, DeletingStateRef dstate,
+  ThreadPool::TPHandle &handle)
 {
-  vector<hobject_t> olist;
+  vector<ghobject_t> olist;
   int64_t num = 0;
   ObjectStore::Transaction *t = new ObjectStore::Transaction;
-  hobject_t next;
+  ghobject_t next;
   while (!next.is_max()) {
+    handle.reset_tp_timeout();
     store->collection_list_partial(
       coll,
       next,
@@ -3357,11 +3228,11 @@ bool remove_dir(
       0,
       &olist,
       &next);
-    for (vector<hobject_t>::iterator i = olist.begin();
+    for (vector<ghobject_t>::iterator i = olist.begin();
 	 i != olist.end();
 	 ++i, ++num) {
       OSDriver::OSTransaction _t(osdriver->get_transaction(t));
-      int r = mapper->remove_oid(*i, &_t);
+      int r = mapper->remove_oid(i->hobj, &_t);
       if (r != 0 && r != -ENOENT) {
 	assert(0);
       }
@@ -3370,7 +3241,9 @@ bool remove_dir(
 	C_SaferCond waiter;
 	store->queue_transaction(osr, t, &waiter);
 	bool cont = dstate->pause_clearing();
+	handle.suspend_tp_timeout();
 	waiter.wait();
+	handle.reset_tp_timeout();
 	if (cont)
 	  cont = dstate->resume_clearing();
 	delete t;
@@ -3386,14 +3259,18 @@ bool remove_dir(
   C_SaferCond waiter;
   store->queue_transaction(osr, t, &waiter);
   bool cont = dstate->pause_clearing();
+  handle.suspend_tp_timeout();
   waiter.wait();
+  handle.reset_tp_timeout();
   if (cont)
     cont = dstate->resume_clearing();
   delete t;
   return cont;
 }
 
-void OSD::RemoveWQ::_process(pair<PGRef, DeletingStateRef> item)
+void OSD::RemoveWQ::_process(
+  pair<PGRef, DeletingStateRef> item,
+  ThreadPool::TPHandle &handle)
 {
   PGRef pg(item.first);
   SnapMapper &mapper = pg->snap_mapper;
@@ -3404,16 +3281,17 @@ void OSD::RemoveWQ::_process(pair<PGRef, DeletingStateRef> item)
   if (!item.second->start_clearing())
     return;
 
-  if (pg->have_temp_coll()) {
+  list<coll_t> colls_to_remove;
+  pg->get_colls(&colls_to_remove);
+  for (list<coll_t>::iterator i = colls_to_remove.begin();
+       i != colls_to_remove.end();
+       ++i) {
     bool cont = remove_dir(
-      pg->cct, store, &mapper, &driver, pg->osr.get(), pg->get_temp_coll(), item.second);
+      pg->cct, store, &mapper, &driver, pg->osr.get(), *i, item.second,
+      handle);
     if (!cont)
       return;
   }
-  bool cont = remove_dir(
-      pg->cct, store, &mapper, &driver, pg->osr.get(), coll, item.second);
-  if (!cont)
-    return;
 
   if (!item.second->start_deleting())
     return;
@@ -3424,9 +3302,12 @@ void OSD::RemoveWQ::_process(pair<PGRef, DeletingStateRef> item)
     OSD::make_infos_oid(),
     pg->log_oid,
     t);
-  if (pg->have_temp_coll())
-    t->remove_collection(pg->get_temp_coll());
-  t->remove_collection(coll);
+
+  for (list<coll_t>::iterator i = colls_to_remove.begin();
+       i != colls_to_remove.end();
+       ++i) {
+    t->remove_collection(*i);
+  }
 
   // We need the sequencer to stick around until the op is complete
   store->queue_transaction(
@@ -3613,7 +3494,109 @@ void OSD::_send_boot()
 	   << ", hb_back_addr " << hb_back_addr
 	   << ", hb_front_addr " << hb_front_addr
 	   << dendl;
+  _collect_metadata(&mboot->metadata);
   monc->send_mon_message(mboot);
+}
+
+void OSD::_collect_metadata(map<string,string> *pm)
+{
+  (*pm)["ceph_version"] = pretty_version_to_str();
+
+  // config info
+  (*pm)["osd_data"] = dev_path;
+  (*pm)["osd_journal"] = journal_path;
+  (*pm)["front_addr"] = stringify(client_messenger->get_myaddr());
+  (*pm)["back_addr"] = stringify(cluster_messenger->get_myaddr());
+  (*pm)["hb_front_addr"] = stringify(hb_front_server_messenger->get_myaddr());
+  (*pm)["hb_back_addr"] = stringify(hb_back_server_messenger->get_myaddr());
+
+  // kernel info
+  struct utsname u;
+  int r = uname(&u);
+  if (r >= 0) {
+    (*pm)["os"] = u.sysname;
+    (*pm)["kernel_version"] = u.release;
+    (*pm)["kernel_description"] = u.version;
+    (*pm)["hostname"] = u.nodename;
+    (*pm)["arch"] = u.machine;
+  }
+
+  // memory
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (f) {
+    char buf[100];
+    while (!feof(f)) {
+      char *line = fgets(buf, sizeof(buf), f);
+      if (!line)
+	break;
+      char key[40];
+      long long value;
+      int r = sscanf(line, "%s %lld", key, &value);
+      if (r == 2) {
+	if (strcmp(key, "MemTotal:") == 0)
+	  (*pm)["mem_total_kb"] = stringify(value);
+	else if (strcmp(key, "SwapTotal:") == 0)
+	  (*pm)["mem_swap_kb"] = stringify(value);
+      }
+    }
+    fclose(f);
+  }
+
+  // processor
+  f = fopen("/proc/cpuinfo", "r");
+  if (f) {
+    char buf[100];
+    while (!feof(f)) {
+      char *line = fgets(buf, sizeof(buf), f);
+      if (!line)
+	break;
+      if (strncmp(line, "model name", 10) == 0) {
+	char *c = strchr(buf, ':');
+	c++;
+	while (*c == ' ')
+	  ++c;
+	char *nl = c;
+	while (*nl != '\n')
+	  ++nl;
+	*nl = '\0';
+	(*pm)["cpu"] = c;
+	break;
+      }
+    }
+    fclose(f);
+  }
+
+  // distro info
+  f = fopen("/etc/lsb-release", "r");
+  if (f) {
+    char buf[100];
+    while (!feof(f)) {
+      char *line = fgets(buf, sizeof(buf), f);
+      if (!line)
+	break;
+      char *eq = strchr(buf, '=');
+      if (!eq)
+	break;
+      *eq = '\0';
+      ++eq;
+      while (*eq == '\"')
+	++eq;
+      while (*eq && (eq[strlen(eq)-1] == '\n' ||
+		     eq[strlen(eq)-1] == '\"'))
+	eq[strlen(eq)-1] = '\0';
+      if (strcmp(buf, "DISTRIB_ID") == 0)
+	(*pm)["distro"] = eq;
+      else if (strcmp(buf, "DISTRIB_RELEASE") == 0)
+	(*pm)["distro_version"] = eq;
+      else if (strcmp(buf, "DISTRIB_CODENAME") == 0)
+	(*pm)["distro_codename"] = eq;
+      else if (strcmp(buf, "DISTRIB_DESCRIPTION") == 0)
+	(*pm)["distro_description"] = eq;
+    }
+    fclose(f);
+  }
+
+  dout(10) << __func__ << " " << *pm << dendl;
 }
 
 void OSD::queue_want_up_thru(epoch_t want)
@@ -3968,6 +3951,10 @@ COMMAND("bench " \
 	"(default 1G size 4MB). Results in log.",
 	"osd", "rw", "cli,rest")
 COMMAND("flush_pg_stats", "flush pg stats", "osd", "rw", "cli,rest")
+COMMAND("heap " \
+	"name=heapcmd,type=CephChoices,strings=dump|start_profiler|stop_profiler|release|stats", \
+	"show heap usage info (available only if compiled with tcmalloc)", \
+	"osd", "rw", "cli,rest")
 COMMAND("debug_dump_missing " \
 	"name=filename,type=CephFilepath",
 	"dump missing objects to a named file", "osd", "r", "cli,rest")
@@ -4111,7 +4098,7 @@ void OSD::do_command(Connection *con, tid_t tid, vector<string>& cmd, bufferlist
     int64_t bsize;
     // default count 1G, size 4MB
     cmd_getval(cct, cmdmap, "count", count, (int64_t)1 << 30);
-    cmd_getval(cct, cmdmap, "bsize", bsize, (int64_t)4 << 20);
+    cmd_getval(cct, cmdmap, "size", bsize, (int64_t)4 << 20);
 
     bufferlist bl;
     bufferptr bp(bsize);
@@ -4600,7 +4587,7 @@ void OSD::do_waiters()
 
 void OSD::dispatch_op(OpRequestRef op)
 {
-  switch (op->request->get_type()) {
+  switch (op->get_req()->get_type()) {
 
   case MSG_OSD_PG_CREATE:
     handle_pg_create(op);
@@ -4726,7 +4713,7 @@ void OSD::_dispatch(Message *m)
 
   default:
     {
-      OpRequestRef op = op_tracker.create_request(m);
+      OpRequestRef op = op_tracker.create_request<OpRequest>(m);
       op->mark_event("waiting_for_osdmap");
       // no map?  starting up?
       if (!osdmap) {
@@ -5108,6 +5095,7 @@ void OSD::handle_osd_map(MOSDMap *m)
   ObjectStore::Transaction &t = *_t;
 
   // store new maps: queue for disk and put in the osdmap cache
+  epoch_t last_marked_full = 0;
   epoch_t start = MAX(osdmap->get_epoch() + 1, first);
   for (epoch_t e = start; e <= last; e++) {
     map<epoch_t,bufferlist>::iterator p;
@@ -5118,6 +5106,8 @@ void OSD::handle_osd_map(MOSDMap *m)
       bufferlist& bl = p->second;
       
       o->decode(bl);
+      if (o->test_flag(CEPH_OSDMAP_FULL))
+	last_marked_full = e;
       pinned_maps.push_back(add_map(o));
 
       hobject_t fulloid = get_osdmap_pobject_name(e);
@@ -5150,6 +5140,8 @@ void OSD::handle_osd_map(MOSDMap *m)
 	assert(0 == "bad fsid");
       }
 
+      if (o->test_flag(CEPH_OSDMAP_FULL))
+	last_marked_full = e;
       pinned_maps.push_back(add_map(o));
 
       bufferlist fbl;
@@ -5185,6 +5177,8 @@ void OSD::handle_osd_map(MOSDMap *m)
     superblock.oldest_map = first;
   superblock.newest_map = last;
 
+  if (last_marked_full > superblock.last_map_marked_full)
+    superblock.last_map_marked_full = last_marked_full;
  
   map_lock.get_write();
 
@@ -5489,22 +5483,6 @@ void OSD::advance_map(ObjectStore::Transaction& t, C_Contexts *tfin)
       waiting_for_pg.erase(p++);
     }
   }
-  map<pg_t, list<PG::CephPeeringEvtRef> >::iterator q =
-    peering_wait_for_split.begin();
-  while (q != peering_wait_for_split.end()) {
-    pg_t pgid = q->first;
-
-    // am i still primary?
-    vector<int> acting;
-    int nrep = osdmap->pg_to_acting_osds(pgid, acting);
-    int role = osdmap->calc_pg_role(whoami, acting, nrep);
-    if (role >= 0) {
-      ++q;  // still me
-    } else {
-      dout(10) << " discarding waiting ops for " << pgid << dendl;
-      peering_wait_for_split.erase(q++);
-    }
-  }
 }
 
 void OSD::consume_map()
@@ -5772,9 +5750,9 @@ bool OSD::require_mon_peer(Message *m)
 
 bool OSD::require_osd_peer(OpRequestRef op)
 {
-  if (!op->request->get_connection()->peer_is_osd()) {
-    dout(0) << "require_osd_peer received from non-osd " << op->request->get_connection()->get_peer_addr()
-	    << " " << *op->request << dendl;
+  if (!op->get_req()->get_connection()->peer_is_osd()) {
+    dout(0) << "require_osd_peer received from non-osd " << op->get_req()->get_connection()->get_peer_addr()
+	    << " " << *op->get_req() << dendl;
     return false;
   }
   return true;
@@ -5786,7 +5764,7 @@ bool OSD::require_osd_peer(OpRequestRef op)
  */
 bool OSD::require_same_or_newer_map(OpRequestRef op, epoch_t epoch)
 {
-  Message *m = op->request;
+  Message *m = op->get_req();
   dout(15) << "require_same_or_newer_map " << epoch << " (i am " << osdmap->get_epoch() << ") " << m << dendl;
 
   assert(osd_lock.is_locked());
@@ -5877,22 +5855,11 @@ void OSD::split_pgs(
     dout(10) << "m_seed " << i->ps() << dendl;
     dout(10) << "split_bits is " << split_bits << dendl;
 
-    rctx->transaction->create_collection(
-      coll_t(*i));
-    rctx->transaction->split_collection(
-      coll_t(parent->info.pgid),
+    parent->split_colls(
+      *i,
       split_bits,
       i->m_seed,
-      coll_t(*i));
-    if (parent->have_temp_coll()) {
-      rctx->transaction->create_collection(
-	coll_t::make_temp_coll(*i));
-      rctx->transaction->split_collection(
-	coll_t::make_temp_coll(parent->info.pgid),
-	split_bits,
-	i->m_seed,
-	coll_t::make_temp_coll(*i));
-    }
+      rctx->transaction);
     parent->split_into(
       *i,
       child,
@@ -5909,7 +5876,7 @@ void OSD::split_pgs(
  */
 void OSD::handle_pg_create(OpRequestRef op)
 {
-  MOSDPGCreate *m = (MOSDPGCreate*)op->request;
+  MOSDPGCreate *m = (MOSDPGCreate*)op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_CREATE);
 
   dout(10) << "handle_pg_create " << *m << dendl;
@@ -5929,11 +5896,16 @@ void OSD::handle_pg_create(OpRequestRef op)
     }
   }
 
-  if (!require_mon_peer(op->request)) {
-    // we have to hack around require_mon_peer's interface limits
-    op->request = NULL;
+  /* we have to hack around require_mon_peer's interface limits, so
+   * grab an extra reference before going in. If the peer isn't
+   * a Monitor, the reference is put for us (and then cleared
+   * up automatically by our OpTracker infrastructure). Otherwise,
+   * we put the extra ref ourself.
+   */
+  if (!require_mon_peer(op->get_req()->get())) {
     return;
   }
+  op->get_req()->put();
 
   if (!require_same_or_newer_map(op, m->epoch)) return;
 
@@ -5989,7 +5961,12 @@ void OSD::handle_pg_create(OpRequestRef op)
     utime_t now = ceph_clock_now(NULL);
     history.last_scrub_stamp = now;
     history.last_deep_scrub_stamp = now;
-    project_pg_history(pgid, history, created, up, acting);
+    bool valid_history =
+      project_pg_history(pgid, history, created, up, acting);
+    /* the pg creation message must have come from a mon and therefore
+     * cannot be on the other side of a map gap
+     */
+    assert(valid_history);
     
     // register.
     creating_pgs[pgid].history = history;
@@ -6053,13 +6030,15 @@ PG::RecoveryCtx OSD::create_context()
   return rctx;
 }
 
-void OSD::dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg)
+void OSD::dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg,
+                                       ThreadPool::TPHandle *handle)
 {
   if (!ctx.transaction->empty()) {
     ctx.on_applied->add(new ObjectStore::C_DeleteTransaction(ctx.transaction));
     int tr = store->queue_transaction(
       pg->osr.get(),
-      ctx.transaction, ctx.on_applied, ctx.on_safe);
+      ctx.transaction, ctx.on_applied, ctx.on_safe, NULL,
+      TrackedOpRef(), handle);
     assert(tr == 0);
     ctx.transaction = new ObjectStore::Transaction;
     ctx.on_applied = new C_Contexts(cct);
@@ -6070,8 +6049,11 @@ void OSD::dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg)
 bool OSD::compat_must_dispatch_immediately(PG *pg)
 {
   assert(pg->is_locked());
-  for (vector<int>::iterator i = pg->acting.begin();
-       i != pg->acting.end();
+  vector<int> *tmpacting = &pg->acting;
+  if (pg->actingbackfill.size() > 0)
+    tmpacting = &pg->actingbackfill;
+  for (vector<int>::iterator i = tmpacting->begin();
+       i != tmpacting->end();
        ++i) {
     if (*i == whoami)
       continue;
@@ -6084,7 +6066,8 @@ bool OSD::compat_must_dispatch_immediately(PG *pg)
   return false;
 }
 
-void OSD::dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap)
+void OSD::dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap,
+                           ThreadPool::TPHandle *handle)
 {
   if (service.get_osdmap()->is_up(whoami)) {
     do_notifies(*ctx.notify_list, curmap);
@@ -6104,7 +6087,8 @@ void OSD::dispatch_context(PG::RecoveryCtx &ctx, PG *pg, OSDMapRef curmap)
     ctx.on_applied->add(new ObjectStore::C_DeleteTransaction(ctx.transaction));
     int tr = store->queue_transaction(
       pg->osr.get(),
-      ctx.transaction, ctx.on_applied, ctx.on_safe);
+      ctx.transaction, ctx.on_applied, ctx.on_safe, NULL, TrackedOpRef(),
+      handle);
     assert(tr == 0);
   }
 }
@@ -6238,7 +6222,7 @@ void OSD::do_infos(map<int,vector<pair<pg_notify_t, pg_interval_map_t> > >& info
  */
 void OSD::handle_pg_notify(OpRequestRef op)
 {
-  MOSDPGNotify *m = (MOSDPGNotify*)op->request;
+  MOSDPGNotify *m = (MOSDPGNotify*)op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_NOTIFY);
 
   dout(7) << "handle_pg_notify from " << m->get_source() << dendl;
@@ -6273,7 +6257,7 @@ void OSD::handle_pg_notify(OpRequestRef op)
 
 void OSD::handle_pg_log(OpRequestRef op)
 {
-  MOSDPGLog *m = (MOSDPGLog*) op->request;
+  MOSDPGLog *m = (MOSDPGLog*) op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_LOG);
   dout(7) << "handle_pg_log " << *m << " from " << m->get_source() << dendl;
 
@@ -6301,7 +6285,7 @@ void OSD::handle_pg_log(OpRequestRef op)
 
 void OSD::handle_pg_info(OpRequestRef op)
 {
-  MOSDPGInfo *m = static_cast<MOSDPGInfo *>(op->request);
+  MOSDPGInfo *m = static_cast<MOSDPGInfo *>(op->get_req());
   assert(m->get_header().type == MSG_OSD_PG_INFO);
   dout(7) << "handle_pg_info " << *m << " from " << m->get_source() << dendl;
 
@@ -6334,7 +6318,7 @@ void OSD::handle_pg_info(OpRequestRef op)
 
 void OSD::handle_pg_trim(OpRequestRef op)
 {
-  MOSDPGTrim *m = (MOSDPGTrim *)op->request;
+  MOSDPGTrim *m = (MOSDPGTrim *)op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_TRIM);
 
   dout(7) << "handle_pg_trim " << *m << " from " << m->get_source() << dendl;
@@ -6387,7 +6371,7 @@ void OSD::handle_pg_trim(OpRequestRef op)
 
 void OSD::handle_pg_scan(OpRequestRef op)
 {
-  MOSDPGScan *m = static_cast<MOSDPGScan*>(op->request);
+  MOSDPGScan *m = static_cast<MOSDPGScan*>(op->get_req());
   assert(m->get_header().type == MSG_OSD_PG_SCAN);
   dout(10) << "handle_pg_scan " << *m << " from " << m->get_source() << dendl;
   
@@ -6415,7 +6399,7 @@ void OSD::handle_pg_scan(OpRequestRef op)
 
 void OSD::handle_pg_backfill(OpRequestRef op)
 {
-  MOSDPGBackfill *m = static_cast<MOSDPGBackfill*>(op->request);
+  MOSDPGBackfill *m = static_cast<MOSDPGBackfill*>(op->get_req());
   assert(m->get_header().type == MSG_OSD_PG_BACKFILL);
   dout(10) << "handle_pg_backfill " << *m << " from " << m->get_source() << dendl;
   
@@ -6443,13 +6427,41 @@ void OSD::handle_pg_backfill(OpRequestRef op)
 
 void OSD::handle_pg_backfill_reserve(OpRequestRef op)
 {
-  MBackfillReserve *m = static_cast<MBackfillReserve*>(op->request);
+  MBackfillReserve *m = static_cast<MBackfillReserve*>(op->get_req());
   assert(m->get_header().type == MSG_OSD_BACKFILL_RESERVE);
 
   if (!require_osd_peer(op))
     return;
   if (!require_same_or_newer_map(op, m->query_epoch))
     return;
+
+  PG::CephPeeringEvtRef evt;
+  if (m->type == MBackfillReserve::REQUEST) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RequestBackfillPrio(m->priority)));
+  } else if (m->type == MBackfillReserve::GRANT) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RemoteBackfillReserved()));
+  } else if (m->type == MBackfillReserve::REJECT) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RemoteReservationRejected()));
+  } else {
+    assert(0);
+  }
+
+  if (service.splitting(m->pgid)) {
+    peering_wait_for_split[m->pgid].push_back(evt);
+    return;
+  }
 
   PG *pg = 0;
   if (!_have_pg(m->pgid))
@@ -6458,36 +6470,13 @@ void OSD::handle_pg_backfill_reserve(OpRequestRef op)
   pg = _lookup_lock_pg(m->pgid);
   assert(pg);
 
-  if (m->type == MBackfillReserve::REQUEST) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RequestBackfillPrio(m->priority))));
-  } else if (m->type == MBackfillReserve::GRANT) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RemoteBackfillReserved())));
-  } else if (m->type == MBackfillReserve::REJECT) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RemoteReservationRejected())));
-  } else {
-    assert(0);
-  }
+  pg->queue_peering_event(evt);
   pg->unlock();
 }
 
 void OSD::handle_pg_recovery_reserve(OpRequestRef op)
 {
-  MRecoveryReserve *m = static_cast<MRecoveryReserve*>(op->request);
+  MRecoveryReserve *m = static_cast<MRecoveryReserve*>(op->get_req());
   assert(m->get_header().type == MSG_OSD_RECOVERY_RESERVE);
 
   if (!require_osd_peer(op))
@@ -6495,38 +6484,42 @@ void OSD::handle_pg_recovery_reserve(OpRequestRef op)
   if (!require_same_or_newer_map(op, m->query_epoch))
     return;
 
+  PG::CephPeeringEvtRef evt;
+  if (m->type == MRecoveryReserve::REQUEST) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RequestRecovery()));
+  } else if (m->type == MRecoveryReserve::GRANT) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RemoteRecoveryReserved()));
+  } else if (m->type == MRecoveryReserve::RELEASE) {
+    evt = PG::CephPeeringEvtRef(
+      new PG::CephPeeringEvt(
+	m->query_epoch,
+	m->query_epoch,
+	PG::RecoveryDone()));
+  } else {
+    assert(0);
+  }
+
+  if (service.splitting(m->pgid)) {
+    peering_wait_for_split[m->pgid].push_back(evt);
+    return;
+  }
+
   PG *pg = 0;
   if (!_have_pg(m->pgid))
     return;
 
   pg = _lookup_lock_pg(m->pgid);
-  if (!pg)
-    return;
+  assert(pg);
 
-  if (m->type == MRecoveryReserve::REQUEST) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RequestRecovery())));
-  } else if (m->type == MRecoveryReserve::GRANT) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RemoteRecoveryReserved())));
-  } else if (m->type == MRecoveryReserve::RELEASE) {
-    pg->queue_peering_event(
-      PG::CephPeeringEvtRef(
-	new PG::CephPeeringEvt(
-	  m->query_epoch,
-	  m->query_epoch,
-	  PG::RecoveryDone())));
-  } else {
-    assert(0);
-  }
+  pg->queue_peering_event(evt);
   pg->unlock();
 }
 
@@ -6539,7 +6532,7 @@ void OSD::handle_pg_query(OpRequestRef op)
 {
   assert(osd_lock.is_locked());
 
-  MOSDPGQuery *m = (MOSDPGQuery*)op->request;
+  MOSDPGQuery *m = (MOSDPGQuery*)op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_QUERY);
 
   if (!require_osd_peer(op))
@@ -6592,9 +6585,11 @@ void OSD::handle_pg_query(OpRequestRef op)
 
     // same primary?
     pg_history_t history = it->second.history;
-    project_pg_history(pgid, history, it->second.epoch_sent, up, acting);
+    bool valid_history =
+      project_pg_history(pgid, history, it->second.epoch_sent, up, acting);
 
-    if (it->second.epoch_sent < history.same_interval_since) {
+    if (!valid_history ||
+        it->second.epoch_sent < history.same_interval_since) {
       dout(10) << " pg " << pgid << " dne, and pg has changed in "
 	       << history.same_interval_since
 	       << " (msg from " << it->second.epoch_sent << ")" << dendl;
@@ -6626,7 +6621,7 @@ void OSD::handle_pg_query(OpRequestRef op)
 
 void OSD::handle_pg_remove(OpRequestRef op)
 {
-  MOSDPGRemove *m = (MOSDPGRemove *)op->request;
+  MOSDPGRemove *m = (MOSDPGRemove *)op->get_req();
   assert(m->get_header().type == MSG_OSD_PG_REMOVE);
   assert(osd_lock.is_locked());
 
@@ -6658,9 +6653,11 @@ void OSD::handle_pg_remove(OpRequestRef op)
     pg_history_t history = pg->info.history;
     vector<int> up, acting;
     osdmap->pg_to_up_acting_osds(pgid, up, acting);
-    project_pg_history(pg->info.pgid, history, pg->get_osdmap()->get_epoch(),
-		       up, acting);
-    if (history.same_interval_since <= m->get_epoch()) {
+    bool valid_history =
+      project_pg_history(pg->info.pgid, history, pg->get_osdmap()->get_epoch(),
+	up, acting);
+    if (valid_history &&
+        history.same_interval_since <= m->get_epoch()) {
       assert(pg->get_primary() == m->get_source().num());
       PGRef _pg(pg);
       _remove_pg(pg);
@@ -6686,6 +6683,13 @@ void OSD::_remove_pg(PG *pg)
 
   service.cancel_pending_splits_for_parent(pg->info.pgid);
 
+  store->queue_transaction(
+    pg->osr.get(), rmt,
+    new ObjectStore::C_DeleteTransactionHolder<
+      SequencerRef>(rmt, pg->osr),
+    new ContainerContext<
+      SequencerRef>(pg->osr));
+
   DeletingStateRef deleting = service.deleting_pgs.lookup_or_create(
     pg->info.pgid,
     make_pair(
@@ -6693,13 +6697,6 @@ void OSD::_remove_pg(PG *pg)
       PGRef(pg))
     );
   remove_wq.queue(make_pair(PGRef(pg), deleting));
-
-  store->queue_transaction(
-    pg->osr.get(), rmt,
-    new ObjectStore::C_DeleteTransactionHolder<
-      SequencerRef>(rmt, pg->osr),
-    new ContainerContext<
-      SequencerRef>(pg->osr));
 
   // remove from map
   pg_map.erase(pg->info.pgid);
@@ -6807,7 +6804,9 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
 #endif
     
     PG::RecoveryCtx rctx = create_context();
-    int started = pg->start_recovery_ops(max, &rctx, handle);
+
+    int started;
+    bool more = pg->start_recovery_ops(max, &rctx, handle, &started);
     dout(10) << "do_recovery started " << started << "/" << max << " on " << *pg << dendl;
 
     /*
@@ -6816,7 +6815,7 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
      * It may be that our initial locations were bad and we errored
      * out while trying to pull.
      */
-    if (!started && pg->have_unfound()) {
+    if (!more && pg->have_unfound()) {
       pg->discover_all_missing(*rctx.query_map);
       if (rctx.query_map->empty()) {
 	dout(10) << "do_recovery  no luck, giving up on this pg for now" << dendl;
@@ -6899,7 +6898,7 @@ void OSDService::reply_op_error(OpRequestRef op, int err)
 void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
                                 version_t uv)
 {
-  MOSDOp *m = static_cast<MOSDOp*>(op->request);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   assert(m->get_header().type == CEPH_MSG_OSD_OP);
   int flags;
   flags = m->get_flags() & (CEPH_OSD_FLAG_ACK|CEPH_OSD_FLAG_ONDISK);
@@ -6911,7 +6910,7 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 
 void OSDService::handle_misdirected_op(PG *pg, OpRequestRef op)
 {
-  MOSDOp *m = static_cast<MOSDOp*>(op->request);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   assert(m->get_header().type == CEPH_MSG_OSD_OP);
 
   if (m->get_map_epoch() < pg->info.history.same_primary_since) {
@@ -6930,7 +6929,7 @@ void OSDService::handle_misdirected_op(PG *pg, OpRequestRef op)
 
 void OSD::handle_op(OpRequestRef op)
 {
-  MOSDOp *m = static_cast<MOSDOp*>(op->request);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   assert(m->get_header().type == CEPH_MSG_OSD_OP);
   if (op_is_discardable(m)) {
     dout(10) << " discardable " << *m << dendl;
@@ -6981,9 +6980,11 @@ void OSD::handle_op(OpRequestRef op)
   if (op->may_write()) {
     // full?
     if ((service.check_failsafe_full() ||
-		  osdmap->test_flag(CEPH_OSDMAP_FULL)) &&
+	 osdmap->test_flag(CEPH_OSDMAP_FULL) ||
+	 m->get_map_epoch() < superblock.last_map_marked_full) &&
 	!m->get_source().is_mds()) {  // FIXME: we'll exclude mds writes for now.
-      service.reply_op_error(op, -ENOSPC);
+      // Drop the request, since the client will retry when the full
+      // flag is unset.
       return;
     }
 
@@ -7065,10 +7066,10 @@ void OSD::handle_op(OpRequestRef op)
 template<typename T, int MSGTYPE>
 void OSD::handle_replica_op(OpRequestRef op)
 {
-  T *m = static_cast<T *>(op->request);
+  T *m = static_cast<T *>(op->get_req());
   assert(m->get_header().type == MSGTYPE);
 
-  dout(10) << __func__ << *m << " epoch " << m->map_epoch << dendl;
+  dout(10) << __func__ << " " << *m << " epoch " << m->map_epoch << dendl;
   if (m->map_epoch < up_epoch) {
     dout(3) << "replica op from before up" << dendl;
     return;
@@ -7119,24 +7120,24 @@ bool OSD::op_is_discardable(MOSDOp *op)
  */
 void OSD::enqueue_op(PG *pg, OpRequestRef op)
 {
-  utime_t latency = ceph_clock_now(cct) - op->request->get_recv_stamp();
-  dout(15) << "enqueue_op " << op << " prio " << op->request->get_priority()
-	   << " cost " << op->request->get_cost()
+  utime_t latency = ceph_clock_now(cct) - op->get_req()->get_recv_stamp();
+  dout(15) << "enqueue_op " << op << " prio " << op->get_req()->get_priority()
+	   << " cost " << op->get_req()->get_cost()
 	   << " latency " << latency
-	   << " " << *(op->request) << dendl;
+	   << " " << *(op->get_req()) << dendl;
   pg->queue_op(op);
 }
 
 void OSD::OpWQ::_enqueue(pair<PGRef, OpRequestRef> item)
 {
-  unsigned priority = item.second->request->get_priority();
-  unsigned cost = item.second->request->get_cost();
+  unsigned priority = item.second->get_req()->get_priority();
+  unsigned cost = item.second->get_req()->get_cost();
   if (priority >= CEPH_MSG_PRIO_LOW)
     pqueue.enqueue_strict(
-      item.second->request->get_source_inst(),
+      item.second->get_req()->get_source_inst(),
       priority, item);
   else
-    pqueue.enqueue(item.second->request->get_source_inst(),
+    pqueue.enqueue(item.second->get_req()->get_source_inst(),
       priority, cost, item);
   osd->logger->set(l_osd_opq, pqueue.length());
 }
@@ -7151,14 +7152,14 @@ void OSD::OpWQ::_enqueue_front(pair<PGRef, OpRequestRef> item)
       pg_for_processing[&*(item.first)].pop_back();
     }
   }
-  unsigned priority = item.second->request->get_priority();
-  unsigned cost = item.second->request->get_cost();
+  unsigned priority = item.second->get_req()->get_priority();
+  unsigned cost = item.second->get_req()->get_cost();
   if (priority >= CEPH_MSG_PRIO_LOW)
     pqueue.enqueue_strict_front(
-      item.second->request->get_source_inst(),
+      item.second->get_req()->get_source_inst(),
       priority, item);
   else
-    pqueue.enqueue_front(item.second->request->get_source_inst(),
+    pqueue.enqueue_front(item.second->get_req()->get_source_inst(),
       priority, cost, item);
   osd->logger->set(l_osd_opq, pqueue.length());
 }
@@ -7210,11 +7211,11 @@ void OSD::dequeue_op(
   PGRef pg, OpRequestRef op,
   ThreadPool::TPHandle &handle)
 {
-  utime_t latency = ceph_clock_now(cct) - op->request->get_recv_stamp();
-  dout(10) << "dequeue_op " << op << " prio " << op->request->get_priority()
-	   << " cost " << op->request->get_cost()
+  utime_t latency = ceph_clock_now(cct) - op->get_req()->get_recv_stamp();
+  dout(10) << "dequeue_op " << op << " prio " << op->get_req()->get_priority()
+	   << " cost " << op->get_req()->get_cost()
 	   << " latency " << latency
-	   << " " << *(op->request)
+	   << " " << *(op->get_req())
 	   << " pg " << *pg << dendl;
   if (pg->deleting)
     return;
@@ -7294,17 +7295,17 @@ void OSD::process_peering_events(
       split_pgs.clear();
     }
     if (compat_must_dispatch_immediately(pg)) {
-      dispatch_context(rctx, pg, curmap);
+      dispatch_context(rctx, pg, curmap, &handle);
       rctx = create_context();
     } else {
-      dispatch_context_transaction(rctx, pg);
+      dispatch_context_transaction(rctx, pg, &handle);
     }
     pg->unlock();
     handle.reset_tp_timeout();
   }
   if (need_up_thru)
     queue_want_up_thru(same_interval_since);
-  dispatch_context(rctx, 0, curmap);
+  dispatch_context(rctx, 0, curmap, &handle);
 
   service.send_pg_temp();
 }
@@ -7315,6 +7316,8 @@ const char** OSD::get_tracked_conf_keys() const
 {
   static const char* KEYS[] = {
     "osd_max_backfills",
+    "osd_op_complaint_time", "osd_op_log_threshold",
+    "osd_op_history_size", "osd_op_history_duration",
     NULL
   };
   return KEYS;
@@ -7327,13 +7330,23 @@ void OSD::handle_conf_change(const struct md_config_t *conf,
     service.local_reserver.set_max(cct->_conf->osd_max_backfills);
     service.remote_reserver.set_max(cct->_conf->osd_max_backfills);
   }
+  if (changed.count("osd_op_complaint_time") ||
+      changed.count("osd_op_log_threshold")) {
+    op_tracker.set_complaint_and_threshold(cct->_conf->osd_op_complaint_time,
+                                           cct->_conf->osd_op_log_threshold);
+  }
+  if (changed.count("osd_op_history_size") ||
+      changed.count("osd_op_history_duration")) {
+    op_tracker.set_history_size_and_duration(cct->_conf->osd_op_history_size,
+                                             cct->_conf->osd_op_history_duration);
+  }
 }
 
 // --------------------------------
 
 int OSD::init_op_flags(OpRequestRef op)
 {
-  MOSDOp *m = static_cast<MOSDOp*>(op->request);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   vector<OSDOp>::iterator iter;
 
   // client flags have no bearing on whether an op is a read, write, etc.

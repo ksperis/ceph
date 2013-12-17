@@ -1,71 +1,69 @@
-==============
- Installation
-==============
+=======================
+ Installation (Manual)
+=======================
 
-The Ceph Object Store is the foundation of all Ceph clusters, and it consists
-primarily of two types of daemons: Object Storage Daemons (OSDs) and monitors.
-The Ceph Object Store is based upon the concept of 
-:abbr:`RADOS (Reliable Autonomic Distributed Object Store)`, which eliminates
-single points of failure and delivers infinite scalability. For details on 
-the architecture of Ceph and RADOS, refer to `Ceph Architecture`_. All Ceph
-deployments have OSDs and monitors, so you should prepare your Ceph cluster
-by focusing first on the object storage cluster.
 
-.. raw:: html
+Get Software
+============
 
-	<table cellpadding="10"><colgroup><col width="33%"><col width="33%"><col width="33%"></colgroup><tbody valign="top"><tr><td><h3>Recommendations</h3>
-	
-To begin using Ceph in production, you should review our hardware
-recommendations and operating system recommendations. Many of the
-frequently-asked questions in our mailing list involve hardware-related
-questions and how to install Ceph on various distributions. 
+There are several methods for getting Ceph software. The easiest and most common
+method is to `get packages`_ by adding repositories for use with package
+management tools such as the Advanced Package Tool (APT) or Yellowdog Updater,
+Modified (YUM). You may also retrieve pre-compiled packages from the Ceph
+repository. Finally, you can retrieve tarballs or clone the Ceph source code
+repository and build Ceph yourself.
+
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1 
 
-   Hardware Recommendations <hardware-recommendations>
-   OS Recommendations <os-recommendations>
+	Get Packages <get-packages>
+	Get Tarballs <get-tarballs>
+	Clone Source <clone-source>
+	Build Ceph <build-ceph>
 
-.. raw:: html 
 
-	</td><td><h3>Installation</h3>
+Install Software
+================
 
-If you are deploying a Ceph cluster (that is, not developing Ceph),
-install Ceph using our stable release packages. For testing, you 
-may install development release and testing packages.
+Once you have the Ceph software (or added repositories), installing the software
+is easy. To install packages on each :term:`Ceph Node` in your cluster. You may
+use  ``ceph-deploy`` to install Ceph for your storage cluster, or use package
+management tools. You should install Yum Priorities for RHEL/CentOS and other
+distributions that use Yum if you intend to install the Ceph Object Gateway or
+QEMU.
 
-.. toctree::
-   :maxdepth: 2
-
-   Installing Debian/Ubuntu Packages <debian>
-   Installing RPM Packages <rpm>
-   Installing on Calxeda <calxeda>
-   Upgrading Ceph <upgrading-ceph>
-
-.. raw:: html 
-
-	</td><td><h3>Building Ceph from Source</h3>
-
-You can build Ceph from source by downloading a release or cloning the ``ceph``
-repository at github. If you intend to build Ceph from source, please see the
-build pre-requisites first. Making sure you have all the pre-requisites
-will save you time.
-
-.. toctree::
+.. toctree:: 
    :maxdepth: 1
 
-	Prerequisites <build-prerequisites>
-	Get a Tarball <get-tarballs>
-	Set Up Git <git>
-	Clone the Source <clone-source>
-	Build the Source <building-ceph>
-	Install CPU Profiler <cpu-profiler>
-	Build a Package <build-packages>
-	Contributing Code <contributing>
+	Install ceph-deploy <install-ceph-deploy>
+   Install Ceph Storage Cluster <install-storage-cluster>
+	Install Ceph Object Gateway <install-ceph-gateway>
+	Install Virtualization for Block <install-vm-cloud>	
 
 
-.. raw:: html
+Deploy a Cluster Manually
+=========================
 
-	</td></tr></tbody></table>
+Once you have Ceph installed on your nodes, you can deploy a cluster manually. 
+The manual procedure is primarily for exemplary purposes for those developing
+deployment scripts with Chef, Juju, Puppet, etc.
 
-.. _Ceph Architecture: ../architecture/
+.. toctree:: 
+   
+   Manual Deployment <manual-deployment>
+
+Upgrade Software	
+================
+
+As new versions of Ceph become available, you may upgrade your cluster to take
+advantage of new functionality. Read the upgrade documentation before you
+upgrade your cluster. Sometimes upgrading Ceph requires you to follow an upgrade
+sequence.
+
+.. toctree::
+   :maxdepth: 2
+
+   Upgrading Ceph <upgrading-ceph>
+   
+.. _get packages: ../install/get-packages
